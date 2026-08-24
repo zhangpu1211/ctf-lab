@@ -396,7 +396,7 @@ qemu-img create -f qcow2 -F qcow2 \
 - [ ] 生成 SBOM、许可证说明、SHA-256 和版本信息。
 - [ ] 完成 macOS 签名、公证和干净账户测试。
 - [ ] 构建 `smoke-1.0.0.ctflab` 与 `basic-pentesting-2-1.0.0.ctflab`。
-- [ ] 建立只含 CTFLab 源码、配置模板与文档的 GitHub 源码镜像，不上传虚拟磁盘、凭据或课程数据。
+- [x] 建立私有 GitHub 源码镜像 `zhangpu1211/ctf-lab`，仅同步 CTFLab 源码、配置模板与文档，不上传虚拟磁盘、凭据或课程数据。
 
 **验收：** 在一台未安装开发依赖的 Mac M 上，用户可以安装 CTFLab、导入两份内容包并完成实验；不需要手工编辑 QEMU 参数。
 
