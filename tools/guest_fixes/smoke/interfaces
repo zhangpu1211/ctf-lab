@@ -1,0 +1,10 @@
+auto lo
+iface lo inet loopback
+
+# Alpine 关闭了 predictable interface names，保留 eth0/eth1 命名。
+# eth0 是隔离实验网，eth1 是仅供宿主机端口转发的管理网。
+auto eth0
+iface eth0 inet dhcp
+
+auto eth1
+iface eth1 inet dhcp

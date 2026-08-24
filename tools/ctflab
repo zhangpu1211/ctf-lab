@@ -1,0 +1,10 @@
+#!/bin/sh
+set -eu
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+if [ -x /opt/miniconda3/bin/python3 ]; then
+  python_bin=/opt/miniconda3/bin/python3
+else
+  python_bin=$(command -v python3)
+fi
+exec "$python_bin" "$script_dir/ctflab.py" "$@"

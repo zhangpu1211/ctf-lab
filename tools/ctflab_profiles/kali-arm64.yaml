@@ -1,0 +1,31 @@
+schema: 1
+id: kali-arm64
+name: Kali Linux ARM64 XFCE
+version: 1.0.0
+
+guest:
+  architecture: aarch64
+  firmware: uefi
+  machine: virt
+  memory_mb: 8192
+  cpus: 4
+
+disk:
+  format: qcow2
+  bus: virtio
+
+network:
+  adapter: virtio-net-pci
+  mac: "52:54:00:24:00:10"
+  lab_ip: "192.168.242.10"
+  segment: lab
+  internet: false
+  host_forwards:
+    - name: ssh
+      guest_port: 22
+      host_port: 12210
+
+readiness:
+  timeout_seconds: 240
+  checks:
+    - dhcp

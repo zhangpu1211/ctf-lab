@@ -1,0 +1,34 @@
+schema: 1
+id: smoke
+name: Smoke
+version: 1.0.0
+
+guest:
+  architecture: x86_64
+  firmware: bios
+  machine: pc
+  memory_mb: 4096
+  cpus: 2
+
+disk:
+  format: qcow2
+  bus: scsi
+  controller: lsi53c895a
+
+network:
+  adapter: pcnet
+  mac: "52:54:00:24:00:20"
+  lab_ip: "192.168.242.20"
+  segment: lab
+  internet: false
+  host_forwards:
+    - name: ssh
+      guest_port: 22
+      host_port: 12220
+
+readiness:
+  timeout_seconds: 180
+  checks:
+    - dhcp
+    - type: ssh
+      port: 22
