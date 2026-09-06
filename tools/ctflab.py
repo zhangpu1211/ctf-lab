@@ -8,6 +8,8 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
+import fcntl
 import hashlib
 import ipaddress
 import json
@@ -24,7 +26,7 @@ import tarfile
 import tempfile
 import time
 from datetime import datetime, timezone
-from typing import Any, Iterable
+from typing import Any, Iterable, Iterator, TextIO
 import urllib.error
 import urllib.request
 
@@ -306,7 +308,66 @@ class LabManager:
         self.images_dir = self.state_dir / "images"
         self.runtime_dir = self.state_dir / "runtime"
         self.logs_dir = self.state_dir / "logs"
+        self.locks_dir = self.state_dir / "locks"
+        self._operation_lock_depth = 0
+        self._operation_lock_handle: TextIO | None = None
         self.state_dir.mkdir(parents=True, exist_ok=True)
+
+    @contextmanager
+    def operation_lock(self, action: str, timeout_seconds: float = 10.0) -> Iterator[None]:
+        """串行化会修改镜像、overlay、状态或实验网络的操作。
+
+        锁文件会保留在状态目录中，但真正的所有权由内核 ``flock`` 维护；
+        因此进程崩溃后不会留下需要人工删除的“死锁文件”。同一个管理器中的
+        嵌套调用可重入，例如 ``reset --force`` 在持锁时调用 ``stop``。
+        """
+        if self._operation_lock_depth:
+            self._operation_lock_depth += 1
+            try:
+                yield
+            finally:
+                self._operation_lock_depth -= 1
+            return
+
+        self.locks_dir.mkdir(parents=True, exist_ok=True)
+        lock_path = self.locks_dir / "operations.lock"
+        handle = lock_path.open("a+", encoding="utf-8")
+        deadline = time.monotonic() + max(0.0, timeout_seconds)
+        while True:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    handle.seek(0)
+                    owner_text = handle.read().strip()
+                    handle.close()
+                    owner = "另一个 CTFLab 进程"
+                    if owner_text:
+                        try:
+                            metadata = json.loads(owner_text)
+                            owner = f"PID {metadata.get('pid', '?')} 的 {metadata.get('action', '操作')}"
+                        except json.JSONDecodeError:
+                            pass
+                    raise CTFLabError(f"等待操作锁超时：{owner}仍在执行；请稍后重试。")
+                time.sleep(0.05)
+
+        self._operation_lock_handle = handle
+        self._operation_lock_depth = 1
+        handle.seek(0)
+        handle.truncate()
+        handle.write(json.dumps({"pid": os.getpid(), "action": action, "acquired_at": now_iso()}, ensure_ascii=False))
+        handle.flush()
+        try:
+            yield
+        finally:
+            self._operation_lock_depth = 0
+            self._operation_lock_handle = None
+            handle.seek(0)
+            handle.truncate()
+            handle.flush()
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            handle.close()
 
     def image_state_path(self, profile_id: str) -> Path:
         profile_id = PROFILE_ALIASES.get(profile_id, profile_id)
@@ -351,6 +412,10 @@ class LabManager:
         return matches[0]
 
     def import_image(self, profile_id: str, source_arg: str) -> dict[str, Any]:
+        with self.operation_lock(f"导入 {profile_id}"):
+            return self._import_image_unlocked(profile_id, source_arg)
+
+    def _import_image_unlocked(self, profile_id: str, source_arg: str) -> dict[str, Any]:
         profile_id = PROFILE_ALIASES.get(profile_id, profile_id)
         profile = load_profile(profile_id)
         source = self.discover_source(Path(source_arg))
@@ -644,6 +709,10 @@ class LabManager:
         return command, host_forwards
 
     def run(self, profile_ids: list[str], headless: bool = False) -> list[dict[str, Any]]:
+        with self.operation_lock("启动 " + ",".join(profile_ids)):
+            return self._run_unlocked(profile_ids, headless=headless)
+
+    def _run_unlocked(self, profile_ids: list[str], headless: bool = False) -> list[dict[str, Any]]:
         profile_ids = list(dict.fromkeys(PROFILE_ALIASES.get(profile_id, profile_id) for profile_id in profile_ids))
         for profile_id in profile_ids:
             load_profile(profile_id)
@@ -698,6 +767,11 @@ class LabManager:
         return started
 
     def stop(self, profile_ids: list[str], stop_all: bool = False) -> list[str]:
+        description = "停止全部实例" if stop_all else "停止 " + ",".join(profile_ids)
+        with self.operation_lock(description):
+            return self._stop_unlocked(profile_ids, stop_all=stop_all)
+
+    def _stop_unlocked(self, profile_ids: list[str], stop_all: bool = False) -> list[str]:
         targets = available_profiles() if stop_all else [PROFILE_ALIASES.get(profile_id, profile_id) for profile_id in profile_ids]
         stopped: list[str] = []
         stopped_ports: set[int] = set()
@@ -751,15 +825,16 @@ class LabManager:
         return stopped
 
     def reset(self, profile_id: str, force: bool = False) -> None:
-        profile_id = PROFILE_ALIASES.get(profile_id, profile_id)
-        state = self.runtime_state(profile_id)
-        if state and bool_pid_alive(int(state.get("pid", 0))):
-            if not force:
-                raise CTFLabError(f"{profile_id} 正在运行，请先 stop，或使用 reset --force。")
-            self.stop([profile_id])
-        instance_dir = self.runtime_dir / profile_id
-        if instance_dir.exists():
-            shutil.rmtree(instance_dir)
+        with self.operation_lock(f"重置 {profile_id}"):
+            profile_id = PROFILE_ALIASES.get(profile_id, profile_id)
+            state = self.runtime_state(profile_id)
+            if state and bool_pid_alive(int(state.get("pid", 0))):
+                if not force:
+                    raise CTFLabError(f"{profile_id} 正在运行，请先 stop，或使用 reset --force。")
+                self.stop([profile_id])
+            instance_dir = self.runtime_dir / profile_id
+            if instance_dir.exists():
+                shutil.rmtree(instance_dir)
 
     def health(self, profile_id: str) -> list[dict[str, Any]]:
         profile_id = PROFILE_ALIASES.get(profile_id, profile_id)
@@ -1221,6 +1296,11 @@ def main(argv: list[str] | None = None) -> int:
             unknown = sorted({profile_id for profile_id in args.profiles if PROFILE_ALIASES.get(profile_id, profile_id) not in available_profiles()})
             if unknown:
                 raise CTFLabError(f"未知配置：{', '.join(unknown)}。可用配置：{', '.join(available_profiles())}")
+        if args.command == "onboard":
+            # onboard 会同时分配 IP、写入 profile、保存探测报告并可能导入镜像，
+            # 整体持锁才能避免两个终端生成重复地址或覆盖中间状态。
+            with manager.operation_lock(f"接入 {args.id}"):
+                return handlers[args.command](manager, args)
         return handlers[args.command](manager, args)
     except CTFLabError as exc:
         print(f"错误：{exc}", file=sys.stderr)
