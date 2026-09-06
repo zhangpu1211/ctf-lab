@@ -13,7 +13,7 @@ CTFLab 是面向 Apple Silicon Mac 的本地虚拟靶场运行器。它使用 QE
 - x86_64 在 Mac M 上使用 QEMU TCG，ARM64 使用 HVF；
 - 不覆盖原始镜像，运行时写入独立 QCOW2 overlay；
 - 跨进程文件锁保护导入、启动、停止、重置和候选配置生成，避免多终端竞争；
-- 回环 TCP 二层交换机提供固定 DHCP，默认不把脆弱靶机接入物理局域网。
+- 回环 TCP 二层交换机提供固定 DHCP、MAC 学习、逐连接限速和可选 PCAP，默认不把脆弱靶机接入物理局域网。
 
 ## 快速开始
 
@@ -24,7 +24,7 @@ CTFLab 是面向 Apple Silicon Mac 的本地虚拟靶场运行器。它使用 QE
 
 # 已知配置
 ./tools/ctflab import smoke /path/to/smoke.qcow2
-./tools/ctflab run smoke
+./tools/ctflab run smoke --pcap
 ./tools/ctflab health smoke
 
 # 未知镜像候选适配
@@ -49,6 +49,7 @@ python3 -m py_compile tools/ctflab.py tools/ctflab_inspect.py tools/ctflab_netwo
 
 - [第一阶段快速使用](docs/ctflab-phase1-quickstart.md)
 - [完整实施计划与路线图](docs/ctflab-mac-mvp-implementation-plan.md)
+- [2026-09-06 Mac M 回归验证](docs/verification-2026-09-06.md)
 
 ## 安全边界
 

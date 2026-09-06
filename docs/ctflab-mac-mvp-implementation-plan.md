@@ -1,6 +1,6 @@
 # CTFLab Mac M 跨架构靶场实施方案
 
-> 状态：Phase 1 MVP 已开始实现。当前已落地 Mac M 本地 QEMU 运行器的 manifest、镜像导入、qcow2 overlay、启动/状态/停止/重置、基础健康检查和跨进程操作锁；ARM64 Kali 镜像、完整二层交换机、主机直连和签名打包仍按后续任务推进。本文是后续开发、测试、打包和验收的范围基线。
+> 状态：Phase 1 MVP 已开始实现。当前已落地 Mac M 本地 QEMU 运行器的 manifest、镜像导入、qcow2 overlay、启动/状态/停止/重置、基础健康检查、跨进程操作锁，以及带 MAC 学习、限速和 PCAP 的 Python 实验交换机；ARM64 Kali 镜像、Go 交换机、主机直连和签名打包仍按后续任务推进。本文是后续开发、测试、打包和验收的范围基线。
 
 ## 1. 目标与边界
 
@@ -369,7 +369,8 @@ qemu-img create -f qcow2 -F qcow2 \
 ### Task 4：实验网与 Kali 互通
 
 - [x] 用回环 TCP socket 实现无 root 的 MVP 二层转发与最小 DHCP。
-- [ ] 将 MVP 交换机迁移为带 MAC 学习、限速与 PCAP 的 `ctflab-switch`。
+- [x] 为 Python MVP 交换机增加 MAC 学习、逐连接限速、状态计数与可选 PCAP。
+- [ ] 将已验证的交换机能力迁移为独立 Go `ctflab-switch`。
 - [ ] 制作可复现的 ARM64 路由器镜像及 DHCP、防火墙规则。
 - [x] 固定 Kali、Smoke、Basic 的 DHCP 租约和 IP。
 - [ ] 实现 Kali 到两个靶机的 ICMP、TCP 和全端口扫描验证。

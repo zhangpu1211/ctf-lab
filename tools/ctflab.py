@@ -308,6 +308,7 @@ class LabManager:
         self.images_dir = self.state_dir / "images"
         self.runtime_dir = self.state_dir / "runtime"
         self.logs_dir = self.state_dir / "logs"
+        self.pcap_dir = self.state_dir / "pcap"
         self.locks_dir = self.state_dir / "locks"
         self._operation_lock_depth = 0
         self._operation_lock_handle: TextIO | None = None
@@ -533,12 +534,21 @@ class LabManager:
                 return candidate
         raise CTFLabError("192.168.242.0/24 中没有可分配的候选地址。")
 
-    def ensure_network(self, profile_ids: list[str], lab_port: int) -> dict[str, Any]:
+    def ensure_network(
+        self,
+        profile_ids: list[str],
+        lab_port: int,
+        *,
+        pcap_path: Path | None = None,
+        max_frames_per_second: int = 10000,
+    ) -> dict[str, Any]:
         """启动当前实验网的无 root 二层交换机/DHCP 服务，并返回网络状态。"""
         profile_ids = list(dict.fromkeys(PROFILE_ALIASES.get(profile_id, profile_id) for profile_id in profile_ids))
         state_path = self.network_state_path(lab_port)
         old = self.network_state(lab_port)
         if old and bool_pid_alive(int(old.get("pid", 0))):
+            if pcap_path and not old.get("pcap_path"):
+                raise CTFLabError("实验网已在未抓包模式下运行；请先 stop --all，再使用 run --pcap 重新启动。")
             return old
         leases: list[str] = []
         # 服务器启动后还会有新节点接入，因此一次注册全部内置配置的固定租约。
@@ -548,6 +558,9 @@ class LabManager:
             if lab_ip:
                 leases.append(f"{profile['network']['mac']}={lab_ip}")
         command = [sys.executable, str(NETWORK_SCRIPT), "--port", str(lab_port), "--state", str(state_path)]
+        command += ["--max-frames-per-second", str(max_frames_per_second)]
+        if pcap_path:
+            command += ["--pcap", str(pcap_path)]
         for lease in leases:
             command += ["--lease", lease]
         log_path = self.logs_dir / f"network-{lab_port}.log"
@@ -708,17 +721,26 @@ class LabManager:
         command += ["-qmp", f"unix:{qmp_path},server=on,wait=off"]
         return command, host_forwards
 
-    def run(self, profile_ids: list[str], headless: bool = False) -> list[dict[str, Any]]:
+    def run(self, profile_ids: list[str], headless: bool = False, pcap: bool = False) -> list[dict[str, Any]]:
         with self.operation_lock("启动 " + ",".join(profile_ids)):
-            return self._run_unlocked(profile_ids, headless=headless)
+            return self._run_unlocked(profile_ids, headless=headless, pcap=pcap)
 
-    def _run_unlocked(self, profile_ids: list[str], headless: bool = False) -> list[dict[str, Any]]:
+    def _run_unlocked(self, profile_ids: list[str], headless: bool = False, pcap: bool = False) -> list[dict[str, Any]]:
         profile_ids = list(dict.fromkeys(PROFILE_ALIASES.get(profile_id, profile_id) for profile_id in profile_ids))
         for profile_id in profile_ids:
             load_profile(profile_id)
         running = self.running_states()
         lab_port = int(running[0]["lab_port"]) if running else self.allocate_lab_port()
-        self.ensure_network([state["profile_id"] for state in running] + profile_ids, lab_port)
+        pcap_path: Path | None = None
+        if pcap:
+            self.pcap_dir.mkdir(parents=True, exist_ok=True)
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            pcap_path = self.pcap_dir / f"lab-{lab_port}-{stamp}.pcap"
+        network_state = self.ensure_network(
+            [state["profile_id"] for state in running] + profile_ids,
+            lab_port,
+            pcap_path=pcap_path,
+        )
         started: list[dict[str, Any]] = []
         for profile_id in profile_ids:
             old = self.runtime_state(profile_id)
@@ -759,6 +781,7 @@ class LabManager:
                 "log_path": str(log_path),
                 "lab_port": lab_port,
                 "host_forwards": host_forwards,
+                "pcap_path": network_state.get("pcap_path"),
                 "started_at": now_iso(),
                 "headless": headless,
             }
@@ -1155,15 +1178,19 @@ def cmd_import(manager: LabManager, args: argparse.Namespace) -> int:
 
 
 def cmd_run(manager: LabManager, args: argparse.Namespace) -> int:
-    states = manager.run(args.profiles, headless=args.headless)
+    states = manager.run(args.profiles, headless=args.headless, pcap=args.pcap)
     for state in states:
         forwards = ", ".join(f"{name}=127.0.0.1:{port}" for name, port in state.get("host_forwards", {}).items()) or "无主机端口映射"
         print(f"已启动 {state['profile_id']}（PID {state['pid']}，实验网 TCP {state['lab_port']}；{forwards}）")
+    pcap_paths = {str(state.get("pcap_path")) for state in states if state.get("pcap_path")}
+    for pcap_path in sorted(pcap_paths):
+        print(f"PCAP：{pcap_path}")
     return 0
 
 
 def cmd_status(manager: LabManager, _args: argparse.Namespace) -> int:
     running = {state["profile_id"]: state for state in manager.running_states()}
+    shown_networks: set[int] = set()
     for profile_id in available_profiles():
         state = running.get(profile_id)
         if not state:
@@ -1171,6 +1198,21 @@ def cmd_status(manager: LabManager, _args: argparse.Namespace) -> int:
         print(f"{profile_id}: running PID={state['pid']} lab=tcp://127.0.0.1:{state['lab_port']} log={state['log_path']}")
         if state.get("host_forwards"):
             print("  端口：" + ", ".join(f"{key}=127.0.0.1:{value}" for key, value in state["host_forwards"].items()))
+        lab_port = int(state.get("lab_port", 0))
+        if lab_port and lab_port not in shown_networks:
+            shown_networks.add(lab_port)
+            network = manager.network_state(lab_port) or {}
+            counters = network.get("counters", {})
+            print(
+                "  交换机："
+                f"clients={network.get('client_count', '?')} "
+                f"macs={len(network.get('learned_macs', []))} "
+                f"rx={counters.get('received', 0)} "
+                f"forwarded={counters.get('forwarded', 0)} "
+                f"dropped={counters.get('dropped_rate_limit', 0)}"
+            )
+            if network.get("pcap_path"):
+                print(f"  PCAP：{network['pcap_path']}")
     if not running:
         print("没有正在运行的 CTFLab 实例。")
     return 0
@@ -1249,6 +1291,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser = subparsers.add_parser("run", help="启动一个或多个实验节点")
     run_parser.add_argument("profiles", nargs="+", choices=profile_choices)
     run_parser.add_argument("--headless", action="store_true", help="不打开图形窗口，日志写入 logs/")
+    run_parser.add_argument("--pcap", action="store_true", help="记录隔离实验网的 Ethernet PCAP")
 
     subparsers.add_parser("status", help="查看运行状态")
 

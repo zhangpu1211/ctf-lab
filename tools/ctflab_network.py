@@ -19,6 +19,7 @@ import struct
 import sys
 import time
 from datetime import datetime, timezone
+from typing import Any, BinaryIO, Iterable
 
 
 HUB_HOST = "127.0.0.1"
@@ -26,6 +27,7 @@ SERVER_IP = "192.168.242.1"
 SUBNET_MASK = "255.255.255.0"
 LEASE_SECONDS = 86400
 MAGIC_COOKIE = b"\x63\x82\x53\x63"
+PCAP_SNAPLEN = 65535
 
 
 def now_iso() -> str:
@@ -71,6 +73,89 @@ def mac_bytes(text: str) -> bytes:
     if len(parts) != 6:
         raise ValueError(f"MAC 地址格式错误：{text}")
     return bytes(int(part, 16) for part in parts)
+
+
+class LearningSwitch:
+    """为本地实验网提供最小的二层 MAC 学习与转发决策。"""
+
+    def __init__(self) -> None:
+        self.mac_table: dict[bytes, Any] = {}
+
+    def forwarding_targets(self, ingress: Any, frame: bytes, peers: Iterable[Any]) -> list[Any]:
+        if len(frame) < 14:
+            return []
+        destination = frame[:6]
+        source = frame[6:12]
+        peer_list = list(peers)
+        if source != b"\x00" * 6 and not source[0] & 1:
+            self.mac_table[source] = ingress
+
+        if destination[0] & 1:  # 广播或组播
+            return [peer for peer in peer_list if peer is not ingress]
+        target = self.mac_table.get(destination)
+        if target is None:
+            return [peer for peer in peer_list if peer is not ingress]
+        if target is ingress:
+            return []
+        if target not in peer_list:
+            self.mac_table.pop(destination, None)
+            return [peer for peer in peer_list if peer is not ingress]
+        return [target]
+
+    def forget(self, peer: Any) -> None:
+        for address, owner in list(self.mac_table.items()):
+            if owner is peer:
+                self.mac_table.pop(address, None)
+
+    def learned_macs(self) -> list[str]:
+        return sorted(mac_text(address) for address in self.mac_table)
+
+
+class FrameRateLimiter:
+    """按连接限制每秒接收帧数，避免单个来宾形成广播风暴。"""
+
+    def __init__(self, max_frames_per_second: int):
+        if max_frames_per_second <= 0:
+            raise ValueError("每秒帧数上限必须为正整数")
+        self.max_frames_per_second = max_frames_per_second
+        self.windows: dict[Any, tuple[float, int]] = {}
+
+    def allow(self, peer: Any, now: float | None = None) -> bool:
+        current = time.monotonic() if now is None else now
+        window_start, count = self.windows.get(peer, (current, 0))
+        if current - window_start >= 1.0:
+            window_start, count = current, 0
+        if count >= self.max_frames_per_second:
+            self.windows[peer] = (window_start, count)
+            return False
+        self.windows[peer] = (window_start, count + 1)
+        return True
+
+    def forget(self, peer: Any) -> None:
+        self.windows.pop(peer, None)
+
+
+class PcapWriter:
+    """写入标准 Ethernet PCAP，供 Wireshark/tcpdump 离线分析。"""
+
+    def __init__(self, path: Path):
+        self.path = path.expanduser().resolve()
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.handle: BinaryIO = self.path.open("wb")
+        self.handle.write(struct.pack("<IHHIIII", 0xA1B2C3D4, 2, 4, 0, 0, PCAP_SNAPLEN, 1))
+        self.handle.flush()
+
+    def write(self, frame: bytes, timestamp: float | None = None) -> None:
+        moment = time.time() if timestamp is None else timestamp
+        seconds = int(moment)
+        microseconds = int((moment - seconds) * 1_000_000)
+        captured = frame[:PCAP_SNAPLEN]
+        self.handle.write(struct.pack("<IIII", seconds, microseconds, len(captured), len(frame)))
+        self.handle.write(captured)
+        self.handle.flush()
+
+    def close(self) -> None:
+        self.handle.close()
 
 
 def dhcp_request_from_frame(frame: bytes) -> tuple[str, bytes, int, int, int, dict[int, bytes]] | None:
@@ -175,7 +260,15 @@ def build_dhcp_frame(
 
 
 class DHCPServer:
-    def __init__(self, port: int, static_leases: dict[str, str], state_path: Path):
+    def __init__(
+        self,
+        port: int,
+        static_leases: dict[str, str],
+        state_path: Path,
+        *,
+        pcap_path: Path | None = None,
+        max_frames_per_second: int = 10000,
+    ):
         self.port = port
         self.static_leases = {key.lower(): value for key, value in static_leases.items()}
         self.state_path = state_path
@@ -183,6 +276,14 @@ class DHCPServer:
         self.next_dynamic = 100
         self.running = True
         self.client_count = 0
+        self.switch = LearningSwitch()
+        self.rate_limiter = FrameRateLimiter(max_frames_per_second)
+        self.pcap = PcapWriter(pcap_path) if pcap_path else None
+        self.frames_received = 0
+        self.frames_forwarded = 0
+        self.frames_generated = 0
+        self.frames_dropped_rate_limit = 0
+        self.last_state_write = 0.0
 
     def write_state(self) -> None:
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
@@ -194,11 +295,29 @@ class DHCPServer:
             "server_ip": SERVER_IP,
             "client_count": self.client_count,
             "leases": self.leases,
+            "learned_macs": self.switch.learned_macs(),
+            "rate_limit_frames_per_second": self.rate_limiter.max_frames_per_second,
+            "pcap_path": str(self.pcap.path) if self.pcap else None,
+            "counters": {
+                "received": self.frames_received,
+                "forwarded": self.frames_forwarded,
+                "generated": self.frames_generated,
+                "dropped_rate_limit": self.frames_dropped_rate_limit,
+            },
             "updated_at": now_iso(),
         }
         temporary = self.state_path.with_suffix(self.state_path.suffix + ".tmp")
         temporary.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
         temporary.replace(self.state_path)
+        self.last_state_write = time.monotonic()
+
+    def maybe_write_state(self) -> None:
+        if time.monotonic() - self.last_state_write >= 1.0:
+            self.write_state()
+
+    def forget_client(self, peer: socket.socket) -> None:
+        self.switch.forget(peer)
+        self.rate_limiter.forget(peer)
 
     def allocate(self, mac: str, requested: str | None = None) -> str:
         if mac in self.static_leases:
@@ -262,6 +381,7 @@ class DHCPServer:
                     if not chunk:
                         current.close()
                         clients.pop(current, None)
+                        self.forget_client(current)
                         self.client_count = len(clients)
                         self.write_state()
                         print(f"L2 client disconnected ({self.client_count})", flush=True)
@@ -278,14 +398,22 @@ class DHCPServer:
                         frame = bytes(buffer[4:4 + frame_length])
                         del buffer[:4 + frame_length]
 
-                        for other in list(clients):
-                            if other is current:
-                                continue
+                        self.frames_received += 1
+                        if not self.rate_limiter.allow(current):
+                            self.frames_dropped_rate_limit += 1
+                            self.maybe_write_state()
+                            continue
+                        if self.pcap:
+                            self.pcap.write(frame)
+
+                        for other in self.switch.forwarding_targets(current, frame, clients):
                             try:
                                 self.send_frame(other, frame)
+                                self.frames_forwarded += 1
                             except (ConnectionError, OSError):
                                 other.close()
                                 clients.pop(other, None)
+                                self.forget_client(other)
 
                         request = dhcp_request_from_frame(frame)
                         if request is None:
@@ -298,14 +426,20 @@ class DHCPServer:
                         assigned = self.allocate(mac, requested)
                         response_type = 2 if message_type == 1 else 5
                         response = build_dhcp_frame(frame, chaddr, xid, flags, response_type, assigned)
+                        if self.pcap:
+                            self.pcap.write(response)
                         self.send_frame(current, response)
+                        self.frames_generated += 1
                         self.write_state()
                         print(f"DHCP {'OFFER' if response_type == 2 else 'ACK'} {mac} -> {assigned}", flush=True)
+                    self.maybe_write_state()
         finally:
             for peer in clients:
                 peer.close()
             listener.close()
             self.client_count = 0
+            if self.pcap:
+                self.pcap.close()
             self.write_state()
         return 0
 
@@ -315,6 +449,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--port", type=int, required=True)
     parser.add_argument("--state", type=Path, required=True)
     parser.add_argument("--lease", action="append", default=[], metavar="MAC=IP")
+    parser.add_argument("--pcap", type=Path, help="可选的 Ethernet PCAP 输出路径")
+    parser.add_argument("--max-frames-per-second", type=int, default=10000, help="每个来宾的帧速率上限")
     return parser.parse_args()
 
 
@@ -328,7 +464,15 @@ def main() -> int:
         mac_bytes(mac)
         ipaddress.IPv4Address(address)
         static_leases[mac.lower()] = address
-    server = DHCPServer(args.port, static_leases, args.state)
+    if args.max_frames_per_second <= 0:
+        raise SystemExit("--max-frames-per-second 必须为正整数")
+    server = DHCPServer(
+        args.port,
+        static_leases,
+        args.state,
+        pcap_path=args.pcap,
+        max_frames_per_second=args.max_frames_per_second,
+    )
     signal.signal(signal.SIGTERM, lambda _signum, _frame: setattr(server, "running", False))
     signal.signal(signal.SIGINT, lambda _signum, _frame: setattr(server, "running", False))
     return server.serve()

@@ -65,6 +65,8 @@ Kali 配置已经预置，但需要用户提供 ARM64 Kali 磁盘后再导入：
 
 ```bash
 ./tools/ctflab run smoke basic-pentesting-2
+# 需要用 Wireshark/tcpdump 分析实验流量时：
+./tools/ctflab run smoke basic-pentesting-2 --pcap
 ./tools/ctflab status
 ./tools/ctflab health basic-pentesting-2
 ./tools/ctflab health smoke
@@ -89,6 +91,8 @@ Kali ARM64 镜像导入后，会与两台靶机处于同一二层网络，可直
 
 Kali 图形窗口由 `qemu-system-aarch64` 打开；x86 靶机也会各自打开 QEMU 窗口，但它们的主要用途是提供网络服务。若只做后台验证，可以使用 `--headless`，日志在 `~/Library/Application Support/CTFLab/logs/`。
 
+实验网会学习来宾 MAC，仅把已知单播发往目标端口；广播、组播和未知单播仍按二层交换规则转发。每个来宾默认限制为每秒 10000 帧，超出部分会丢弃并显示在 `status` 的 `dropped` 计数中。使用 `run --pcap` 后，抓包写入 `~/Library/Application Support/CTFLab/pcap/`；PCAP 可能包含实验口令或利用流量，不应直接公开分发。
+
 Basic Pentesting 2 会等待原镜像中一个失效磁盘 UUID 的 90 秒启动超时，冷启动约需两分钟；这属于来宾历史配置，不代表 QEMU 卡死。以 `health` 出现 `HTTP 200` 为可用标准。
 
 ## 4. 停止、重置和排错
@@ -100,7 +104,7 @@ Basic Pentesting 2 会等待原镜像中一个失效磁盘 UUID 的 90 秒启动
 tail -f "$HOME/Library/Application Support/CTFLab/logs/basic-pentesting-2.log"
 ```
 
-`reset` 只删除运行 overlay，不删除导入的基础镜像，也不会触碰原始下载目录。第一阶段暂不创建 macOS 的 host-only 网卡，因此 Mac 侧采用端口映射；Kali 与靶机通过回环 TCP 二层交换机互通。后续阶段再补充可选的 Mac 主机直连模式，以及带 MAC 学习、限速和 PCAP 的正式交换机实现。
+`reset` 只删除运行 overlay，不删除导入的基础镜像，也不会触碰原始下载目录。第一阶段暂不创建 macOS 的 host-only 网卡，因此 Mac 侧采用端口映射；Kali 与靶机通过回环 TCP 二层交换机互通。当前 Python 交换机已具备 MAC 学习、限速和 PCAP，后续仍会迁移为独立的 Go `ctflab-switch`，并补充可选的 Mac 主机直连模式。
 
 导入、候选配置生成、启动、停止和重置由状态目录中的内核文件锁串行化。两个终端同时修改运行状态时，后发命令最多等待 10 秒；仍未取得锁会显示当前占用进程和操作，且不会删除或覆盖对方的中间文件。锁由操作系统随进程退出自动释放，不需要手工清理锁文件。
 
