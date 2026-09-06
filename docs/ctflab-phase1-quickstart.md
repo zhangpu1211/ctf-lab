@@ -59,7 +59,14 @@ Kali 配置已经预置，但需要用户提供 ARM64 Kali 磁盘后再导入：
 ./tools/ctflab probe new-machine --timeout 180
 ```
 
-`probe` 会后台启动 QEMU，采集 QMP 状态、非全黑截图、DHCP 和已配置的 HTTP/SSH 协议证据，报告与截图保存在 `~/Library/Application Support/CTFLab/logs/probes/`。非全黑画面仍可能是 UEFI Shell 或内核错误；候选配置必须人工查看截图，确认登录或目标服务后才能标记为已验证。
+`probe` 会后台启动 QEMU，采集 QMP 状态、截图、DHCP 和已配置的 HTTP/SSH 协议证据，报告与截图保存在 `~/Library/Application Support/CTFLab/logs/probes/`。若本机装有 Tesseract，还会通过 OCR 将最终画面分类为登录就绪、UEFI Shell、内核/根文件系统错误、无启动设备、启动中或未知：
+
+```bash
+brew install tesseract
+./tools/ctflab probe new-machine --timeout 180
+```
+
+OCR 结果会记录置信度、命中信号、识别文本和局部服务失败警告。字体、语言和分辨率仍可能造成误识别；候选配置即使出现登录界面也必须人工查看截图，确认登录或目标服务后才能标记为已验证。若识别到 UEFI Shell、内核错误或无启动设备，且没有协议级服务证据，`probe` 会返回失败结论。
 
 ## 3. 启动和访问
 

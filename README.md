@@ -9,7 +9,7 @@ CTFLab 是面向 Apple Silicon Mac 的本地虚拟靶场运行器。它使用 QE
 - 导入 QCOW2、VMDK、VDI、VHD/VHDX、RAW、OVA；
 - `inspect` 只读识别 VMDK/OVF、MBR/GPT/EFI 和候选虚拟硬件；
 - `onboard` 生成带置信度、警告和人工复核状态的白名单配置；
-- `probe` 收集 QMP 状态、截图、DHCP 与 HTTP/SSH 协议证据；
+- `probe` 收集 QMP、截图 OCR/画面分类、DHCP 与 HTTP/SSH 协议证据；
 - x86_64 在 Mac M 上使用 QEMU TCG，ARM64 使用 HVF；
 - 不覆盖原始镜像，运行时写入独立 QCOW2 overlay；
 - 跨进程文件锁保护导入、启动、停止、重置和候选配置生成，避免多终端竞争；
@@ -17,7 +17,7 @@ CTFLab 是面向 Apple Silicon Mac 的本地虚拟靶场运行器。它使用 QE
 
 ## 快速开始
 
-环境要求：macOS Apple Silicon、Python 3.10+、PyYAML、Homebrew QEMU。
+环境要求：macOS Apple Silicon、Python 3.10+、PyYAML、Homebrew QEMU。推荐安装 Tesseract 以自动区分登录界面、UEFI Shell、内核错误和无启动盘；未安装时会安全降级为人工复核。
 
 ```bash
 ./tools/ctflab doctor

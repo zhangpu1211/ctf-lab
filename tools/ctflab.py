@@ -302,6 +302,140 @@ def ppm_display_activity(path: Path) -> dict[str, Any]:
     }
 
 
+SCREEN_PATTERNS: dict[str, tuple[tuple[str, str], ...]] = {
+    "uefi_shell": (
+        ("UEFI Interactive Shell", r"uefi\s+interactive\s+shell"),
+        ("Shell 提示符", r"(?:^|\s)shell\s*>"),
+        ("startup.nsh", r"startup\.nsh"),
+        ("UEFI Mapping Table", r"mapping\s+table"),
+    ),
+    "no_boot_device": (
+        ("No bootable device", r"no\s+bootable\s+device"),
+        ("No boot device", r"no\s+boot\s+device"),
+        ("Boot failed", r"boot\s+failed"),
+        ("Not a bootable disk", r"not\s+a\s+bootable\s+disk"),
+        ("Operating system not found", r"operating\s+system\s+not\s+found"),
+        ("Select proper boot device", r"select\s+proper\s+boot\s+device"),
+    ),
+    "kernel_error": (
+        ("Kernel panic", r"kernel\s+panic"),
+        ("Kernel not syncing", r"not\s+syncing"),
+        ("Unable to mount root", r"unable\s+to\s+mount\s+root"),
+        ("Cannot open root device", r"cannot\s+open\s+root\s+device"),
+        ("Waiting for root device failed", r"gave\s+up\s+waiting\s+for\s+root"),
+        ("Emergency mode", r"emergency\s+mode"),
+    ),
+    "login_ready": (
+        ("Login prompt", r"(?:^|\n)[^\n]{0,80}\blogin\s*[:>]"),
+        ("Login Prompts target", r"reached\s+target\s+login\s+prompts"),
+        ("Graphical Interface target", r"reached\s+target\s+graphical\s+interface"),
+        ("Display manager", r"(?:started|starting)\s+[^\n]{0,80}display\s+manager"),
+    ),
+    "boot_progress": (
+        ("Starting services", r"(?:^|\n)\s*(?:\[[^\]]+\]\s*)?starting\s+"),
+        ("Started services", r"(?:^|\n)\s*(?:\[[^\]]+\]\s*)?started\s+"),
+        ("Mounting filesystems", r"(?:mounting|mounted|remounting)\s+"),
+        ("Loading components", r"(?:loading|loaded)\s+"),
+        ("Reached target", r"reached\s+target\s+"),
+    ),
+}
+
+SCREEN_FAILURE_CLASSES = {"uefi_shell", "no_boot_device", "kernel_error"}
+SCREEN_CLASS_LABELS = {
+    "uefi_shell": "UEFI Shell",
+    "no_boot_device": "未找到可启动设备",
+    "kernel_error": "内核/根文件系统错误",
+    "login_ready": "登录界面已就绪",
+    "boot_progress": "系统仍在启动",
+    "unknown": "无法确定",
+}
+
+
+def classify_screen_text(text: str) -> dict[str, Any]:
+    """将 OCR 文本归类为启动状态，并保留可审计的命中信号。"""
+    normalized = text.lower().replace("\r", "\n")
+    matched: dict[str, list[str]] = {}
+    for classification, patterns in SCREEN_PATTERNS.items():
+        signals = [label for label, pattern in patterns if re.search(pattern, normalized, re.MULTILINE)]
+        if signals:
+            matched[classification] = signals
+
+    warnings: list[str] = []
+    if re.search(r"(?:\[\s*failed\s*\]|failed\s+to\s+start|dependency\s+failed)", normalized):
+        warnings.append("检测到服务启动失败文字")
+
+    classification = "unknown"
+    for candidate in ("uefi_shell", "no_boot_device", "kernel_error", "login_ready", "boot_progress"):
+        if candidate in matched:
+            classification = candidate
+            break
+    signal_count = len(matched.get(classification, []))
+    if classification in SCREEN_FAILURE_CLASSES:
+        confidence = "high" if signal_count >= 2 else "medium"
+    elif classification == "login_ready":
+        confidence = "high" if signal_count >= 2 else "medium"
+    elif classification == "boot_progress":
+        confidence = "medium" if signal_count >= 2 else "low"
+    else:
+        confidence = "low"
+    return {
+        "classification": classification,
+        "confidence": confidence,
+        "matched_signals": matched.get(classification, []),
+        "all_signals": matched,
+        "warnings": warnings,
+    }
+
+
+def classify_screenshot(path: Path) -> dict[str, Any]:
+    """使用本机 Tesseract 分析截图；缺少依赖时返回明确的安全降级结果。"""
+    tesseract = shutil.which("tesseract")
+    if not tesseract:
+        return {
+            "available": False,
+            "engine": None,
+            "classification": "unknown",
+            "confidence": "low",
+            "matched_signals": [],
+            "all_signals": {},
+            "warnings": ["未安装 Tesseract，未执行截图 OCR"],
+            "text": "",
+        }
+    try:
+        result = subprocess.run(
+            [tesseract, str(path), "stdout", "-l", "eng", "--psm", "6"],
+            check=False,
+            text=True,
+            capture_output=True,
+            timeout=20,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {
+            "available": False,
+            "engine": "tesseract",
+            "classification": "unknown",
+            "confidence": "low",
+            "matched_signals": [],
+            "all_signals": {},
+            "warnings": [f"Tesseract 执行失败：{exc}"],
+            "text": "",
+        }
+    text = result.stdout.strip()
+    classified = classify_screen_text(text)
+    warnings = list(classified["warnings"])
+    if result.returncode != 0:
+        warnings.append(f"Tesseract 退出码 {result.returncode}：{result.stderr.strip()[:300]}")
+    classified.update(
+        {
+            "available": result.returncode == 0,
+            "engine": "tesseract",
+            "warnings": warnings,
+            "text": text[:12000],
+        }
+    )
+    return classified
+
+
 class LabManager:
     def __init__(self, state_dir: Path):
         self.state_dir = state_dir.expanduser().resolve()
@@ -1023,6 +1157,23 @@ class LabManager:
                     screenshot_path = str(png_path)
                     ppm_path.unlink()
 
+            if screenshot_path:
+                screen = classify_screenshot(Path(screenshot_path))
+            else:
+                screen = {
+                    "available": False,
+                    "engine": None,
+                    "classification": "unknown",
+                    "confidence": "low",
+                    "matched_signals": [],
+                    "all_signals": {},
+                    "warnings": ["没有可供 OCR 的截图"],
+                    "text": "",
+                }
+            screen_failure = screen.get("classification") in SCREEN_FAILURE_CLASSES
+            if screen_failure and not protocol_ready:
+                verdict = str(screen["classification"])
+
             candidate_profile = profile.get("detection", {}).get("status") == "candidate"
             report = {
                 "schema": 1,
@@ -1036,17 +1187,19 @@ class LabManager:
                 "process_running_at_verdict": process_running,
                 "display": display,
                 "screenshot_path": screenshot_path,
+                "screen": screen,
                 "health": health,
                 "verdict": verdict,
-                "requires_human_review": candidate_profile or verdict != "service_ready",
+                "requires_human_review": candidate_profile or verdict != "service_ready" or screen_failure,
                 "errors": list(dict.fromkeys(errors))[-20:],
                 "verification": {
                     "boot_process": process_running,
                     "display_activity": bool(display.get("active")),
+                    "screen_classification": screen.get("classification"),
                     "network": network_ready,
                     "service": protocol_ready,
                 },
-                "note": "非全黑截图可能是 UEFI Shell 或错误画面；候选配置需人工查看截图后才能标记已验证。",
+                "note": "OCR 分类用于快速排障，仍可能受字体、分辨率和语言影响；候选配置需人工查看截图后才能标记已验证。",
             }
             write_json(report_path, report)
             report["report_path"] = str(report_path)
@@ -1058,20 +1211,22 @@ class LabManager:
 
 def cmd_doctor(manager: LabManager, _args: argparse.Namespace) -> int:
     checks = [
-        ("宿主系统", f"{platform.system()} {platform.machine()}" if platform.system() == "Darwin" and platform.machine() in {"arm64", "aarch64"} else None),
-        ("python", sys.executable),
-        ("qemu-img", shutil.which("qemu-img")),
-        ("qemu-system-x86_64", which_any(QEMU_X86_NAMES)),
-        ("qemu-system-aarch64", which_any(QEMU_ARM_NAMES)),
-        ("utmctl", shutil.which("utmctl")),
-        ("PyYAML", "available" if yaml is not None else None),
-        ("ARM64 UEFI", str(find_firmware("edk2-aarch64-code.fd")) if find_firmware("edk2-aarch64-code.fd") else None),
+        ("宿主系统", f"{platform.system()} {platform.machine()}" if platform.system() == "Darwin" and platform.machine() in {"arm64", "aarch64"} else None, True),
+        ("python", sys.executable, True),
+        ("qemu-img", shutil.which("qemu-img"), True),
+        ("qemu-system-x86_64", which_any(QEMU_X86_NAMES), True),
+        ("qemu-system-aarch64", which_any(QEMU_ARM_NAMES), True),
+        ("utmctl", shutil.which("utmctl"), True),
+        ("PyYAML", "available" if yaml is not None else None, True),
+        ("ARM64 UEFI", str(find_firmware("edk2-aarch64-code.fd")) if find_firmware("edk2-aarch64-code.fd") else None, True),
+        ("Tesseract OCR", shutil.which("tesseract"), False),
     ]
     failed = False
-    for name, value in checks:
+    for name, value, required in checks:
         ok = bool(value)
-        print(f"{'OK  ' if ok else 'MISS'} {name}: {value or '未找到'}")
-        failed |= not ok
+        marker = "OK  " if ok else "MISS" if required else "OPT "
+        print(f"{marker} {name}: {value or '未找到（可选，截图将保留人工复核）'}")
+        failed |= required and not ok
     print(f"状态目录：{manager.state_dir}")
     return 1 if failed else 0
 
@@ -1245,6 +1400,15 @@ def cmd_probe(manager: LabManager, args: argparse.Namespace) -> int:
     print(f"探测结论：{report['verdict']}")
     display = report.get("display", {})
     print(f"显示活动：{'是' if display.get('active') else '否'}（{display.get('detail')}）")
+    screen = report.get("screen", {})
+    classification = str(screen.get("classification", "unknown"))
+    print(
+        "画面分类："
+        f"{SCREEN_CLASS_LABELS.get(classification, classification)} "
+        f"（置信度 {screen.get('confidence', 'low')}，OCR {'可用' if screen.get('available') else '不可用'}）"
+    )
+    for warning in screen.get("warnings", []):
+        print(f"画面警告：{warning}")
     for result in report.get("health", []):
         status = "OK" if result["ok"] is True else "WAIT" if result["ok"] is None else "FAIL"
         print(f"{status:4} {result['name']}: {result['detail']}")

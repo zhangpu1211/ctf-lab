@@ -1,6 +1,6 @@
 # CTFLab Mac M 跨架构靶场实施方案
 
-> 状态：Phase 1 MVP 已开始实现。当前已落地 Mac M 本地 QEMU 运行器的 manifest、镜像导入、qcow2 overlay、启动/状态/停止/重置、基础健康检查、跨进程操作锁，以及带 MAC 学习、限速和 PCAP 的 Python 实验交换机；ARM64 Kali 镜像、Go 交换机、主机直连和签名打包仍按后续任务推进。本文是后续开发、测试、打包和验收的范围基线。
+> 状态：Phase 1 MVP 已开始实现。当前已落地 Mac M 本地 QEMU 运行器的 manifest、镜像导入、qcow2 overlay、启动/状态/停止/重置、OCR 画面分类、基础健康检查、跨进程操作锁，以及带 MAC 学习、限速和 PCAP 的 Python 实验交换机；ARM64 Kali 镜像、受控启动回退、Go 交换机、主机直连和签名打包仍按后续任务推进。本文是后续开发、测试、打包和验收的范围基线。
 
 ## 1. 目标与边界
 
@@ -341,7 +341,7 @@ qemu-img create -f qcow2 -F qcow2 \
 - [x] 实现 `inspect`：读取格式、VMDK/OVF、MBR/GPT/EFI，并输出逐字段置信度。
 - [x] 实现 `onboard`：生成不覆盖已有配置的候选 manifest、固定 IP/MAC 和派生 QCOW2。
 - [x] 实现 `probe`：采集 QMP 状态、非全黑截图、DHCP 与 HTTP/SSH 协议证据。
-- [ ] 实现截图 OCR/画面分类，区分登录界面、UEFI Shell、内核错误和无启动盘。
+- [x] 实现截图 OCR/画面分类，区分登录界面、UEFI Shell、内核错误和无启动盘；缺少 OCR 时安全降级。
 - [ ] 实现受控的 BIOS/UEFI、IDE/SATA/SCSI/VirtIO 启动回退矩阵。
 
 **验收：** 使用 manifest 启动两台靶机；无效 manifest 或缺失镜像被清晰拒绝；未知镜像能生成带证据、置信度和人工复核状态的候选配置。

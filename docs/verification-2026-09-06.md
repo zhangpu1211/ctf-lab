@@ -33,6 +33,13 @@ Basic Pentesting 2 仍存在原镜像内失效磁盘 UUID 导致的约 90 秒等
 
 执行 `ctflab stop --all` 后，两台 QEMU、交换机进程和 TCP 23400 监听均已清理。PCAP 作为用户生成的验证证据保留在状态目录，不提交到源码仓库。
 
+## OCR 画面分类
+
+- Smoke 的真实截图识别为 `boot_progress`，中等置信度；同时 SSH 与 DHCP 已就绪，因此最终仍为 `service_ready`；
+- Basic Pentesting 2 的真实截图识别为 `login_ready`，高置信度，并单独记录 Tomcat9 启动失败文字；
+- UEFI Shell、无启动设备和内核/根文件系统错误已通过确定性分类测试覆盖；
+- 新版 `probe` 已对 Smoke 完成一次实际冷启动集成验证，报告包含 OCR 引擎、分类、置信度和命中信号，结束后自动清理进程。
+
 ## 尚未完成的验收
 
 - Kali ARM64 镜像尚未导入，因此 Kali 图形桌面、对两台靶机扫描和反向连接仍待验证；
