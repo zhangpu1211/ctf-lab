@@ -8,6 +8,7 @@
 /docs/*
 !/docs/ctflab-mac-mvp-implementation-plan.md
 !/docs/ctflab-phase1-quickstart.md
+!/docs/verification-2026-09-06.md
 
 /tools/*
 !/tools/ctflab
