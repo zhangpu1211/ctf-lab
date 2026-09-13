@@ -97,6 +97,21 @@ class IsoValidationTests(unittest.TestCase):
 
 
 class InstallerCommandTests(unittest.TestCase):
+    def test_clipboard_is_scoped_to_graphical_kali(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manager = LabManager(root)
+            for profile, headless in (("smoke", False), ("kali-arm64", True)):
+                with self.assertRaises(CTFLabError):
+                    manager.qemu_command(profile, {}, root / "disk", 23400, headless, clipboard=True)
+            with mock.patch.object(manager, "ensure_uefi_vars", return_value=(root / "code", root / "vars")), mock.patch("ctflab.which_any", return_value="qemu"):
+                profile = {"guest": {"architecture": "aarch64"}, "network": {}}
+                default, _ = manager.qemu_command("kali-arm64", profile, root / "disk", 23400, False)
+                shared, _ = manager.qemu_command("kali-arm64", profile, root / "disk", 23400, False, clipboard=True)
+            self.assertNotIn("qemu-vdagent", " ".join(default))
+            self.assertIn("clipboard=on,mouse=off", " ".join(shared))
+            self.assertIn("cocoa,zoom-to-fit=on", shared)
+
     def test_arm64_command_uses_hvf_pflash_and_input_devices(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

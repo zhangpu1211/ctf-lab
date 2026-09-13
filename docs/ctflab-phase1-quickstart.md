@@ -146,6 +146,12 @@ Basic Pentesting 2 会等待原镜像中一个失效磁盘 UUID 的 90 秒启动
 
 ## 4. 停止、重置和排错
 
+### 图形体验增量（2026-09-13）
+
+`run` 的 Cocoa 窗口默认启用 `zoom-to-fit`，将画面适配窗口大小；这不是来宾自动改变分辨率。可显式使用 `run kali-arm64 --clipboard` 接通 Mac 与 Kali 的文本剪贴板，依赖来宾 `spice-vdagent` 与已登录的图形会话。默认关闭，仅对 Kali 生效，不为靶机创建剪贴板通道，不能与 `--headless` 同用；切换需先停止再启动。
+
+共享剪贴板会让 Kali 读取复制的文本，请勿在开启期间复制个人密码或其他敏感内容。当前已验证参数启动、来宾通道识别、图形登录及代理自动激活，双向复制粘贴仍需验收。窗口关闭策略、真正动态分辨率以及 Ghidra 帮助功能继续待办。
+
 ```bash
 ./tools/ctflab stop --all
 ./tools/ctflab reset smoke

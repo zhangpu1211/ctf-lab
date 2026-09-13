@@ -1318,7 +1318,9 @@ class LabManager:
         profile = load_profile(profile_id)
         return leases.get(profile.get("network", {}).get("mac"))
 
-    def qemu_command(self, profile_id: str, profile: dict[str, Any], overlay: Path, lab_port: int, headless: bool, allow_internet: bool = False) -> tuple[list[str], dict[str, int]]:
+    def qemu_command(self, profile_id: str, profile: dict[str, Any], overlay: Path, lab_port: int, headless: bool, allow_internet: bool = False, clipboard: bool = False) -> tuple[list[str], dict[str, int]]:
+        if clipboard and (profile_id != "kali-arm64" or headless):
+            raise CTFLabError("剪贴板仅支持 Kali 图形模式。")
         guest = profile.get("guest", {})
         disk = profile.get("disk", {})
         network = profile.get("network", {})
@@ -1410,24 +1412,35 @@ class LabManager:
         if headless:
             command += ["-display", "none", "-serial", "mon:stdio"]
         else:
-            command += ["-display", "cocoa"]
+            command += ["-display", "cocoa,zoom-to-fit=on"]
+        if clipboard:
+            command += [
+                "-device", "virtio-serial-pci",
+                "-chardev", "qemu-vdagent,id=ctflab_clipboard,clipboard=on,mouse=off",
+                "-device", "virtserialport,chardev=ctflab_clipboard,name=com.redhat.spice.0",
+            ]
         qmp_path = self.runtime_dir / profile_id / "qmp.sock"
         if qmp_path.exists():
             qmp_path.unlink()
         command += ["-qmp", f"unix:{qmp_path},server=on,wait=off"]
         return command, host_forwards
 
-    def run(self, profile_ids: list[str], headless: bool = False, pcap: bool = False, allow_internet: bool = False) -> list[dict[str, Any]]:
+    def run(self, profile_ids: list[str], headless: bool = False, pcap: bool = False, allow_internet: bool = False, clipboard: bool = False) -> list[dict[str, Any]]:
         with self.operation_lock("启动 " + ",".join(profile_ids)):
-            return self._run_unlocked(profile_ids, headless=headless, pcap=pcap, allow_internet=allow_internet)
+            return self._run_unlocked(profile_ids, headless=headless, pcap=pcap, allow_internet=allow_internet, clipboard=clipboard)
 
-    def _run_unlocked(self, profile_ids: list[str], headless: bool = False, pcap: bool = False, allow_internet: bool = False) -> list[dict[str, Any]]:
+    def _run_unlocked(self, profile_ids: list[str], headless: bool = False, pcap: bool = False, allow_internet: bool = False, clipboard: bool = False) -> list[dict[str, Any]]:
         profile_ids = list(dict.fromkeys(PROFILE_ALIASES.get(profile_id, profile_id) for profile_id in profile_ids))
+        if clipboard and (headless or "kali-arm64" not in profile_ids):
+            raise CTFLabError("--clipboard 需要启动 Kali 图形窗口。")
         if allow_internet and profile_ids != ["kali-arm64"]:
             raise CTFLabError("--internet 只能单独启动 kali-arm64。")
         for profile_id in profile_ids:
             load_profile(profile_id)
         running = self.running_states()
+        for state in running:
+            if state["profile_id"] == "kali-arm64" and "kali-arm64" in profile_ids and bool(state.get("clipboard_enabled")) != clipboard:
+                raise CTFLabError("切换剪贴板模式需要先 stop，再 run。")
         if allow_internet and any(state["profile_id"] != "kali-arm64" for state in running):
             raise CTFLabError("Kali 联网维护前请先停止其他靶机。")
         if any(state.get("internet_enabled") for state in running) and profile_ids != ["kali-arm64"]:
@@ -1454,7 +1467,7 @@ class LabManager:
                 continue
             profile = load_profile(profile_id)
             overlay = self.ensure_overlay(profile_id)
-            command, host_forwards = self.qemu_command(profile_id, profile, overlay, lab_port, headless, allow_internet=allow_internet)
+            command, host_forwards = self.qemu_command(profile_id, profile, overlay, lab_port, headless, allow_internet=allow_internet, clipboard=clipboard and profile_id == "kali-arm64")
             log_path = self.logs_dir / f"{profile_id}.log"
             log_path.parent.mkdir(parents=True, exist_ok=True)
             log_handle = log_path.open("a", encoding="utf-8")
@@ -1490,6 +1503,7 @@ class LabManager:
                 "started_at": now_iso(),
                 "headless": headless,
                 "internet_enabled": allow_internet,
+                "clipboard_enabled": clipboard and profile_id == "kali-arm64",
             }
             write_json(self.runtime_state_path(profile_id), state)
             started.append(state)
@@ -1964,7 +1978,7 @@ def cmd_finalize_install(manager: LabManager, args: argparse.Namespace) -> int:
 
 
 def cmd_run(manager: LabManager, args: argparse.Namespace) -> int:
-    states = manager.run(args.profiles, headless=args.headless, pcap=args.pcap, allow_internet=args.internet)
+    states = manager.run(args.profiles, headless=args.headless, pcap=args.pcap, allow_internet=args.internet, clipboard=args.clipboard)
     for state in states:
         forwards = ", ".join(f"{name}=127.0.0.1:{port}" for name, port in state.get("host_forwards", {}).items()) or "无主机端口映射"
         print(f"已启动 {state['profile_id']}（PID {state['pid']}，实验网 TCP {state['lab_port']}；{forwards}）")
@@ -2111,6 +2125,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser = subparsers.add_parser("run", help="启动一个或多个实验节点")
     run_parser.add_argument("profiles", nargs="+", choices=profile_choices)
     run_parser.add_argument("--headless", action="store_true", help="不打开图形窗口，日志写入 logs/")
+    run_parser.add_argument("--clipboard", action="store_true", help="显式允许 Mac 与 Kali 图形桌面双向共享文本剪贴板")
     run_parser.add_argument("--pcap", action="store_true", help="记录隔离实验网的 Ethernet PCAP")
     run_parser.add_argument("--internet", action="store_true", help="仅为单独启动的 Kali 临时联网维护")
 
