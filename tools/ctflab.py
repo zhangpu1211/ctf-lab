@@ -1509,12 +1509,12 @@ class LabManager:
             started.append(state)
         return started
 
-    def stop(self, profile_ids: list[str], stop_all: bool = False) -> list[str]:
+    def stop(self, profile_ids: list[str], stop_all: bool = False, graceful: bool = False) -> list[str]:
         description = "停止全部实例" if stop_all else "停止 " + ",".join(profile_ids)
         with self.operation_lock(description):
-            return self._stop_unlocked(profile_ids, stop_all=stop_all)
+            return self._stop_unlocked(profile_ids, stop_all=stop_all, graceful=graceful)
 
-    def _stop_unlocked(self, profile_ids: list[str], stop_all: bool = False) -> list[str]:
+    def _stop_unlocked(self, profile_ids: list[str], stop_all: bool = False, graceful: bool = False) -> list[str]:
         targets = available_profiles() if stop_all else [PROFILE_ALIASES.get(profile_id, profile_id) for profile_id in profile_ids]
         stopped: list[str] = []
         stopped_ports: set[int] = set()
@@ -1532,9 +1532,11 @@ class LabManager:
                         qmp_command(qmp_path, "system_powerdown")
                 except (OSError, CTFLabError):
                     pass
-                deadline = time.monotonic() + 3
+                deadline = time.monotonic() + (30 if graceful else 3)
                 while bool_pid_alive(pid) and time.monotonic() < deadline:
                     time.sleep(0.25)
+                if graceful and bool_pid_alive(pid):
+                    raise CTFLabError(f"{profile_id} 未完成正常关机；已保留进程、磁盘和网络。请在来宾中保存工作并关机，再重试。")
                 if bool_pid_alive(pid):
                     # 某些旧靶机没有响应 ACPI 关机，优先通过 QMP quit 结束 QEMU，
                     # 再退回 SIGTERM/SIGKILL，避免 stop 命令长时间悬挂。
@@ -2023,7 +2025,7 @@ def cmd_status(manager: LabManager, _args: argparse.Namespace) -> int:
 
 
 def cmd_stop(manager: LabManager, args: argparse.Namespace) -> int:
-    stopped = manager.stop(args.profiles, stop_all=args.all)
+    stopped = manager.stop(args.profiles, stop_all=args.all, graceful=args.graceful)
     print("已停止：" + (", ".join(stopped) if stopped else "没有运行中的实例"))
     return 0
 
@@ -2131,7 +2133,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     subparsers.add_parser("status", help="查看运行状态")
 
-    stop_parser = subparsers.add_parser("stop", help="优雅停止实例")
+    stop_parser = subparsers.add_parser("stop", help="停止实例，默认超时会强制退出；桌面建议 --graceful")
+    stop_parser.add_argument("--graceful", action="store_true", help="只请求正常关机，30 秒超时后保留实例，不强制断电")
     # 这里不在 argparse 层设置 choices，否则 Python 3.10 在“空位置参数 + --all”时
     # 会把空列表本身当成一个候选值；具体配置名在执行阶段校验。
     stop_parser.add_argument("profiles", nargs="*", metavar="PROFILE")

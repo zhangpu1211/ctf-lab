@@ -97,6 +97,22 @@ class IsoValidationTests(unittest.TestCase):
 
 
 class InstallerCommandTests(unittest.TestCase):
+    def test_graceful_stop_never_forces_or_removes_live_state(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = LabManager(Path(directory))
+            runtime = manager.runtime_dir / "kali-arm64"
+            runtime.mkdir(parents=True)
+            qmp = runtime / "qmp.sock"
+            qmp.touch()
+            write_json(manager.runtime_state_path("kali-arm64"), {"pid": 123, "qmp_path": str(qmp), "lab_port": 23400})
+            with mock.patch("ctflab.bool_pid_alive", return_value=True), mock.patch("ctflab.qmp_command") as command, mock.patch("ctflab.os.kill") as kill, mock.patch("ctflab.time.monotonic", side_effect=[0, 31]):
+                with self.assertRaises(CTFLabError):
+                    manager._stop_unlocked(["kali-arm64"], graceful=True)
+            command.assert_called_once_with(qmp, "system_powerdown")
+            kill.assert_not_called()
+            self.assertTrue(qmp.exists())
+            self.assertTrue(manager.runtime_state_path("kali-arm64").exists())
+
     def test_clipboard_is_scoped_to_graphical_kali(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
