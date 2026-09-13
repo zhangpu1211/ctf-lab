@@ -28,6 +28,12 @@ SUBNET_MASK = "255.255.255.0"
 LEASE_SECONDS = 86400
 MAGIC_COOKIE = b"\x63\x82\x53\x63"
 PCAP_SNAPLEN = 65535
+ETHERNET_MIN_FRAME_SIZE = 60  # 不含由虚拟网卡处理的 4 字节 FCS。
+
+
+def pad_ethernet_frame(frame: bytes) -> bytes:
+    """补齐 VirtIO 发出的短帧，兼容会丢弃 runt 帧的 PCnet 网卡。"""
+    return frame.ljust(ETHERNET_MIN_FRAME_SIZE, b"\x00")
 
 
 def now_iso() -> str:
@@ -230,7 +236,7 @@ def build_dhcp_frame(
             make_option(54, ipaddress.IPv4Address(SERVER_IP).packed),
             make_option(51, struct.pack("!I", LEASE_SECONDS)),
             make_option(1, ipaddress.IPv4Address(SUBNET_MASK).packed),
-            make_option(3, ipaddress.IPv4Address(SERVER_IP).packed),
+            # 这里只提供二层交换和 DHCP，并未实现路由器，不下发默认网关。
             make_option(28, ipaddress.IPv4Address("192.168.242.255").packed),
             b"\xff",
         )
@@ -336,6 +342,7 @@ class DHCPServer:
 
     @staticmethod
     def send_frame(peer: socket.socket, frame: bytes) -> None:
+        frame = pad_ethernet_frame(frame)
         packet = memoryview(struct.pack("!I", len(frame)) + frame)
         while packet:
             try:

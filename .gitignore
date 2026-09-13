@@ -9,6 +9,7 @@
 !/docs/ctflab-mac-mvp-implementation-plan.md
 !/docs/ctflab-phase1-quickstart.md
 !/docs/verification-2026-09-06.md
+!/docs/verification-2026-09-07.md
 
 /tools/*
 !/tools/ctflab
@@ -24,6 +25,10 @@
 /tools/guest_fixes/*
 !/tools/guest_fixes/basic-pentesting-2/
 !/tools/guest_fixes/smoke/
+!/tools/guest_fixes/kali-arm64/
+/tools/guest_fixes/kali-arm64/*
+!/tools/guest_fixes/kali-arm64/configure.sh
+!/tools/guest_fixes/kali-arm64/kali.sources
 /tools/guest_fixes/basic-pentesting-2/*
 !/tools/guest_fixes/basic-pentesting-2/interfaces
 /tools/guest_fixes/smoke/*

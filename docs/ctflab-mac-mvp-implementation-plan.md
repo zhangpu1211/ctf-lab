@@ -358,11 +358,14 @@ qemu-img create -f qcow2 -F qcow2 \
 
 ### Task 3：Kali 图形桌面
 
-- [ ] 准备合法来源的 Kali ARM64 基础镜像。
-- [ ] 配置 HVF、VirtIO 磁盘、网卡和显示设备。
+- [x] 支持从用户提供的 Kali ARM64 ISO 自动安装，记录源哈希；发行方签名仍需独立核验。
+- [x] 配置 HVF、VirtIO 磁盘、双网卡、显示设备及独立可写 UEFI NVRAM。
+- [x] 验证 XFCE 登录、键盘、鼠标、1920×1080 手动显示及 Firefox/Burp/Wireshark 主界面。
 - [ ] 验证 XFCE 登录、窗口缩放、键盘、鼠标和至少 1920×1080 显示。
 - [ ] 安装/验证 guest agent 的文本剪贴板与动态分辨率。
 - [ ] 实现 `--headless` 和显示窗口关闭后的行为选择。
+
+2026-09-07：`--headless` 已实现，窗口关闭策略、动态缩放和剪贴板仍未验收。新增 `install/install-status/stop-install/finalize-install`，以及只允许 Kali 独占运行的 `--internet` 维护模式；`--from-runtime` 可保留旧盘并固化维护成果。独立重装实例已验证无需手工修复即可 DHCP/SSH 登录。Ghidra 已安装并出现项目窗口，但首次帮助页报错，不能列为完整工具验收通过。
 
 **验收：** Kali 能稳定运行 Firefox、Burp Suite、Wireshark 和终端；图形窗口无持续高 CPU 占用或明显输入延迟。
 
@@ -373,9 +376,10 @@ qemu-img create -f qcow2 -F qcow2 \
 - [ ] 将已验证的交换机能力迁移为独立 Go `ctflab-switch`。
 - [ ] 制作可复现的 ARM64 路由器镜像及 DHCP、防火墙规则。
 - [x] 固定 Kali、Smoke、Basic 的 DHCP 租约和 IP。
+- [x] 修复 PCnet 对不足 60 字节以太帧的兼容问题；实验 DHCP 不再下发不存在的默认网关。
 - [ ] 实现 Kali 到两个靶机的 ICMP、TCP 和全端口扫描验证。
 - [ ] 验证靶机对 Kali 的回连；验证靶机无法访问互联网。
-- [ ] 输出可选 PCAP。
+- [x] 输出可选 PCAP（回环交换机已有实现与回归测试）。
 
 **验收：** Kali 能对 `192.168.242.20` 与 `192.168.242.21` 执行 Nmap；Basic 的 HTTP 服务可达；反向 Shell 可回连 Kali；靶机无法访问公网。
 
@@ -405,16 +409,16 @@ qemu-img create -f qcow2 -F qcow2 \
 
 以下项目必须全部通过，第一阶段才可以宣布完成；已完成的 MVP 子项先标记，带有“待 Kali/网络”字样的项目仍未宣称完成：
 
-- [x] `ctflab run kali-arm64 smoke basic-pentesting-2` 的运行器可以一次启动已导入的组件（Kali 需先提供 ARM64 镜像）。
-- [ ] Kali 显示完整图形桌面，可使用图形化安全软件。
-- [ ] Kali 能扫描并访问两台靶机（待完整实验交换机/ARM64 Kali 验证）。
+- [x] `ctflab run kali-arm64 smoke basic-pentesting-2` 可以一次启动三个已导入组件。
+- [x] Kali 显示完整 XFCE 图形桌面，Firefox/Burp/Wireshark 实际打开；深层工具功能和性能基准另行验收。
+- [ ] Kali 能扫描并访问两台靶机（ICMP、HTTP/SSH 已实测，全端口结果待记录）。
 - [x] Smoke 地址固定为 `192.168.242.20`，Basic 地址固定为 `192.168.242.21`。
 - [x] Mac 能通过无权限端口映射访问 Basic；直连模式仍待实现。
 - [ ] 靶机可按配置回连 Kali，但不能访问公网。
 - [ ] 运行、停止、重置连续 20 次无残留进程或网络规则。
 - [x] `reset` 后靶机从基础镜像重新创建 overlay，基础镜像哈希未变化。
 - [x] 新镜像可通过 `inspect → onboard → probe` 进入候选适配流程，并明确区分候选与已验证交付。
-- [ ] Kali 与两个靶机的可用性都有自动健康检查结果（两个靶机已通过 DHCP、HTTP/SSH 协议检查，Kali 待导入）。
+- [x] Kali 与两个靶机均通过 DHCP 和已配置的 SSH/HTTP 协议健康检查。
 - [ ] 在干净的 Mac M 用户环境可完成安装、导入和运行。
 
 ## 8. 工期、风险与决策

@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 from contextlib import contextmanager
 import fcntl
+import gzip
 import hashlib
 import ipaddress
 import json
@@ -45,6 +46,7 @@ QEMU_X86_NAMES = ("qemu-system-x86_64",)
 QEMU_ARM_NAMES = ("qemu-system-aarch64",)
 PROFILE_ALIASES = {"kali": "kali-arm64"}
 NETWORK_SCRIPT = PROJECT_ROOT / "tools" / "ctflab_network.py"
+KALI_SETUP_SCRIPT = PROJECT_ROOT / "tools" / "guest_fixes" / "kali-arm64" / "configure.sh"
 
 
 class CTFLabError(RuntimeError):
@@ -112,12 +114,181 @@ def qemu_img_path() -> str:
     return path
 
 
-def qemu_info(path: Path) -> dict[str, Any]:
-    result = run_command([qemu_img_path(), "info", "--output=json", str(path)])
+def qemu_info(path: Path, *, force_share: bool = False) -> dict[str, Any]:
+    command = [qemu_img_path(), "info"]
+    if force_share:
+        command.append("--force-share")
+    command += ["--output=json", str(path)]
+    result = run_command(command)
     try:
         return json.loads(result.stdout)
     except json.JSONDecodeError as exc:
         raise CTFLabError(f"qemu-img info 返回了无法解析的内容：{path}") from exc
+
+
+def validate_arm64_installer_iso(path: Path) -> dict[str, Any]:
+    """验证 ISO9660 签名和 Kali/Debian ARM64 安装器所需成员。"""
+    path = path.expanduser().resolve()
+    if not path.is_file():
+        raise CTFLabError(f"安装 ISO 不存在：{path}")
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0x8001)
+            iso_signature = handle.read(5)
+    except OSError as exc:
+        raise CTFLabError(f"无法读取安装 ISO：{path}\n{exc}") from exc
+    if iso_signature != b"CD001":
+        raise CTFLabError(f"文件不是有效的 ISO9660 镜像：{path}")
+    bsdtar = shutil.which("bsdtar") or shutil.which("tar")
+    if not bsdtar:
+        raise CTFLabError("未找到 bsdtar，无法读取 ARM64 安装器文件。")
+    required_members = ("install.a64/vmlinuz", "install.a64/gtk/initrd.gz")
+    result = subprocess.run(
+        [bsdtar, "-tf", str(path), *required_members],
+        check=False,
+        text=True,
+        capture_output=True,
+    )
+    listed = set(result.stdout.splitlines())
+    missing = [member for member in required_members if member not in listed]
+    if result.returncode != 0 or missing:
+        detail = result.stderr.strip() or ", ".join(missing)
+        raise CTFLabError(f"ISO 不含完整的 ARM64 图形安装器：{detail}")
+    return {
+        "path": str(path),
+        "size": path.stat().st_size,
+        "sha256": sha256_file(path),
+        "kernel_member": required_members[0],
+        "initrd_member": required_members[1],
+    }
+
+
+def build_unattended_preseed(username: str = "kali", hostname: str = "kali", *, password: str | None = None) -> str:
+    """生成仅用于本地隔离实验机的 Kali XFCE 无人值守安装回答。"""
+    if not re.fullmatch(r"[a-z_][a-z0-9_-]{0,30}", username):
+        raise CTFLabError(f"安装用户名不合法：{username}")
+    if not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", hostname):
+        raise CTFLabError(f"安装主机名不合法：{hostname}")
+    password = password if password is not None else os.environ.get("CTFLAB_INSTALL_PASSWORD", "")
+    if not password or any(char.isspace() or ord(char) < 32 for char in password):
+        raise CTFLabError("自动安装需要 CTFLAB_INSTALL_PASSWORD，且不能含空白或控制字符；口令仅写入本地安装资产。")
+    return f"""# CTFLab 本地隔离靶场无人值守安装配置
+d-i debian-installer/locale string en_US.UTF-8
+d-i keyboard-configuration/xkb-keymap select us
+d-i netcfg/choose_interface select auto
+d-i netcfg/get_hostname string {hostname}
+d-i netcfg/get_domain string local
+d-i netcfg/get_nameservers string 10.0.2.3
+d-i clock-setup/utc boolean true
+d-i time/zone string Asia/Shanghai
+d-i passwd/root-login boolean false
+d-i passwd/user-fullname string Kali User
+d-i passwd/username string {username}
+d-i passwd/user-password password {password}
+d-i passwd/user-password-again password {password}
+d-i user-setup/allow-password-weak boolean true
+d-i user-setup/encrypt-home boolean false
+d-i partman-auto/disk string /dev/vda
+d-i partman-auto/method string regular
+d-i partman-auto/choose_recipe select atomic
+d-i partman-partitioning/confirm_write_new_label boolean true
+d-i partman/choose_partition select finish
+d-i partman/confirm boolean true
+d-i partman/confirm_nooverwrite boolean true
+d-i apt-setup/use_mirror boolean false
+d-i apt-setup/services-select multiselect
+d-i pkgsel/upgrade select none
+d-i pkgsel/update-policy select none
+tasksel tasksel/first multiselect standard
+d-i pkgsel/include string kali-desktop-xfce kali-linux-default openssh-server qemu-guest-agent spice-vdagent
+popularity-contest popularity-contest/participate boolean false
+wireshark-common wireshark-common/install-setuid boolean false
+kismet-capture-common kismet-capture-common/install-setuid boolean false
+macchanger macchanger/automatically_run boolean false
+d-i grub-installer/only_debian boolean true
+d-i cdrom-detect/eject boolean false
+d-i preseed/late_command string cp /ctflab-guest-setup.sh /target/tmp/ctflab-guest-setup.sh && in-target /bin/sh /tmp/ctflab-guest-setup.sh && rm -f /target/tmp/ctflab-guest-setup.sh
+d-i finish-install/reboot_in_progress note
+"""
+
+
+def extract_iso_member(iso_path: Path, member: str, destination: Path) -> None:
+    bsdtar = shutil.which("bsdtar") or shutil.which("tar")
+    if not bsdtar:
+        raise CTFLabError("未找到 bsdtar，无法提取 ARM64 安装器。")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_suffix(destination.suffix + ".tmp")
+    with temporary.open("wb") as output:
+        result = subprocess.run(
+            [bsdtar, "-xOf", str(iso_path), member],
+            check=False,
+            stdout=output,
+            stderr=subprocess.PIPE,
+        )
+    if result.returncode != 0 or temporary.stat().st_size == 0:
+        temporary.unlink(missing_ok=True)
+        detail = result.stderr.decode("utf-8", errors="replace").strip()
+        raise CTFLabError(f"无法从 ISO 提取 {member}：{detail}")
+    temporary.replace(destination)
+
+
+def prepare_unattended_installer_assets(iso_path: Path, iso_hash: str, destination: Path) -> tuple[Path, Path]:
+    """提取内核，并向安装 initrd 追加本地 preseed.cfg。"""
+    destination.mkdir(parents=True, exist_ok=True)
+    destination.chmod(0o700)
+    preseed = build_unattended_preseed()
+    setup_script = KALI_SETUP_SCRIPT.read_bytes()
+    preseed_hash = hashlib.sha256(preseed.encode("utf-8") + setup_script).hexdigest()[:8]
+    suffix = f"{iso_hash[:12]}-{preseed_hash}"
+    kernel_path = destination / f"vmlinuz-{suffix}"
+    initrd_path = destination / f"initrd-unattended-{suffix}.gz"
+    if kernel_path.exists() and initrd_path.exists():
+        return kernel_path, initrd_path
+
+    with tempfile.TemporaryDirectory(prefix="ctflab-initrd-", dir=destination) as directory:
+        work = Path(directory)
+        original_initrd = work / "initrd-original.gz"
+        raw_initrd = work / "initrd.raw"
+        preseed_path = work / "preseed.cfg"
+        staged_kernel = work / "vmlinuz"
+        staged_initrd = work / "initrd-unattended.gz"
+        extract_iso_member(iso_path, "install.a64/vmlinuz", staged_kernel)
+        extract_iso_member(iso_path, "install.a64/gtk/initrd.gz", original_initrd)
+        with gzip.open(original_initrd, "rb") as source, raw_initrd.open("wb") as target:
+            shutil.copyfileobj(source, target)
+        preseed_path.write_text(preseed, encoding="utf-8")
+        preseed_path.chmod(0o600)
+        (work / "ctflab-guest-setup.sh").write_bytes(setup_script)
+        cpio = shutil.which("cpio")
+        if not cpio:
+            raise CTFLabError("未找到 cpio，无法生成无人值守安装 initrd。")
+        # macOS 自带 bsdtar/cpio 不支持 GNU cpio 的原地追加模式。Linux
+        # initramfs 本身允许由多个按 4 字节对齐的 newc 归档串联，因此先生成
+        # 只含 preseed.cfg 的归档，再拼接到 Debian 安装器 initrd 末尾。
+        preseed_archive = work / "preseed.cpio"
+        with preseed_archive.open("wb") as output:
+            result = subprocess.run(
+                [cpio, "-o", "-H", "newc"],
+                cwd=work,
+                input=b"preseed.cfg\nctflab-guest-setup.sh\n",
+                stdout=output,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+        if result.returncode != 0:
+            detail = result.stderr.decode("utf-8", errors="replace").strip()
+            raise CTFLabError(f"无法生成 preseed initramfs 归档：{detail}")
+        with raw_initrd.open("ab") as target, preseed_archive.open("rb") as source:
+            padding = (-target.tell()) % 4
+            if padding:
+                target.write(b"\0" * padding)
+            shutil.copyfileobj(source, target)
+        with raw_initrd.open("rb") as source, gzip.open(staged_initrd, "wb", compresslevel=6) as target:
+            shutil.copyfileobj(source, target)
+        staged_kernel.replace(kernel_path)
+        staged_initrd.chmod(0o600)
+        staged_initrd.replace(initrd_path)
+    return kernel_path, initrd_path
 
 
 def profile_path(profile_id: str) -> Path:
@@ -443,6 +614,7 @@ class LabManager:
         self.runtime_dir = self.state_dir / "runtime"
         self.logs_dir = self.state_dir / "logs"
         self.pcap_dir = self.state_dir / "pcap"
+        self.install_dir = self.state_dir / "install"
         self.locks_dir = self.state_dir / "locks"
         self._operation_lock_depth = 0
         self._operation_lock_handle: TextIO | None = None
@@ -515,6 +687,10 @@ class LabManager:
     def network_state_path(self, lab_port: int) -> Path:
         return self.runtime_dir / f"network-{lab_port}.json"
 
+    def installer_state_path(self, profile_id: str) -> Path:
+        profile_id = PROFILE_ALIASES.get(profile_id, profile_id)
+        return self.install_dir / profile_id / "install.json"
+
     def image_state(self, profile_id: str) -> dict[str, Any] | None:
         return read_json(self.image_state_path(profile_id))
 
@@ -523,6 +699,9 @@ class LabManager:
 
     def network_state(self, lab_port: int) -> dict[str, Any] | None:
         return read_json(self.network_state_path(lab_port))
+
+    def installer_state(self, profile_id: str) -> dict[str, Any] | None:
+        return read_json(self.installer_state_path(profile_id))
 
     def imported_profiles(self) -> list[str]:
         return [profile_id for profile_id in available_profiles() if self.image_state(profile_id)]
@@ -607,6 +786,367 @@ class LabManager:
             if temporary_dir is not None:
                 temporary_dir.cleanup()
 
+    def installer_command(
+        self,
+        profile_id: str,
+        profile: dict[str, Any],
+        iso_path: Path,
+        target_path: Path,
+        vars_path: Path,
+        qmp_path: Path,
+        *,
+        unattended: bool,
+        headless: bool,
+        kernel_path: Path | None = None,
+        initrd_path: Path | None = None,
+    ) -> list[str]:
+        qemu = which_any(QEMU_ARM_NAMES)
+        code_path = find_firmware("edk2-aarch64-code.fd")
+        if not qemu or not code_path:
+            raise CTFLabError("缺少 qemu-system-aarch64 或 ARM64 UEFI 固件。")
+        guest = profile.get("guest", {})
+        command = [
+            qemu,
+            "-name", f"CTFLab-{profile_id}-Installer",
+            "-machine", str(guest.get("machine", "virt")),
+            "-accel", "hvf",
+            "-cpu", "host",
+            "-smp", str(guest.get("cpus", 4)),
+            "-m", str(guest.get("memory_mb", 5120)),
+            "-drive", f"if=pflash,format=raw,unit=0,file={code_path},readonly=on",
+            "-drive", f"if=pflash,format=raw,unit=1,file={vars_path}",
+            "-drive", f"file={target_path},if=none,format=qcow2,id=disk0,discard=unmap",
+            "-device", "virtio-blk-pci,drive=disk0",
+            "-device", "virtio-scsi-pci,id=scsi0",
+            "-drive", f"file={iso_path},if=none,format=raw,media=cdrom,readonly=on,id=cd0",
+            "-device", "scsi-cd,drive=cd0,bus=scsi0.0",
+            "-device", "virtio-gpu-pci",
+            "-device", "ramfb",
+            "-device", "qemu-xhci",
+            "-device", "usb-kbd",
+            "-device", "usb-tablet",
+            "-netdev", "user,id=installnet,restrict=on",
+            "-device", "virtio-net-pci,netdev=installnet",
+        ]
+        if unattended:
+            if not kernel_path or not initrd_path:
+                raise CTFLabError("无人值守安装缺少内核或 initrd。")
+            command += [
+                "-kernel", str(kernel_path),
+                "-initrd", str(initrd_path),
+                "-append",
+                (
+                    "auto=true priority=critical locale=en_US.UTF-8 keymap=us "
+                    "hostname=kali domain=local net.ifnames=0 "
+                    "DEBIAN_FRONTEND=noninteractive console=tty0 console=ttyAMA0,115200 "
+                    "preseed/file=/preseed.cfg simple-cdd/profiles=kali,offline "
+                    "desktop=xfce --- quiet"
+                ),
+            ]
+        else:
+            command += ["-boot", "order=d,menu=on"]
+        command += [
+            "-display", "none" if headless else "cocoa",
+            "-serial", "stdio",
+            "-qmp", f"unix:{qmp_path},server=on,wait=off",
+            "-no-reboot",
+        ]
+        return command
+
+    def start_install(
+        self,
+        profile_id: str,
+        iso_arg: str,
+        *,
+        disk_size_gb: int = 64,
+        unattended: bool = False,
+        headless: bool = False,
+        resume: bool = False,
+        confirm_reinstall: bool = False,
+    ) -> dict[str, Any]:
+        with self.operation_lock(f"安装 {profile_id}"):
+            profile_id = PROFILE_ALIASES.get(profile_id, profile_id)
+            profile = load_profile(profile_id)
+            if profile.get("guest", {}).get("architecture") != "aarch64":
+                raise CTFLabError("ISO 安装流程当前只允许 ARM64 配置。")
+            if self.image_state(profile_id):
+                raise CTFLabError(f"{profile_id} 已有基础镜像，无需再次安装。")
+            if not 20 <= disk_size_gb <= 256:
+                raise CTFLabError("安装磁盘容量必须位于 20～256 GiB。")
+            if headless and not unattended:
+                raise CTFLabError("后台安装必须同时使用 --unattended，否则无法操作安装界面。")
+            running = self.runtime_state(profile_id)
+            if running and bool_pid_alive(int(running.get("pid", 0))):
+                raise CTFLabError(f"{profile_id} 正在正常运行，请先 stop。")
+
+            old = self.installer_state(profile_id)
+            if old and bool_pid_alive(int(old.get("pid", 0))):
+                return old
+            if old and not resume:
+                raise CTFLabError(
+                    f"{profile_id} 已有停止的安装目标；使用 install --resume 重新启动安装器，"
+                    "确认完成后使用 finalize-install。"
+                )
+            if old and unattended and not confirm_reinstall:
+                raise CTFLabError("自动安装重新启动会重新分区已有安装目标；如确需重装，增加 --confirm-reinstall。")
+
+            if unattended:
+                build_unattended_preseed()
+            iso_path = Path(iso_arg).expanduser().resolve()
+            iso = validate_arm64_installer_iso(iso_path)
+            install_root = self.install_dir / profile_id
+            install_root.mkdir(parents=True, exist_ok=True)
+            if old:
+                if old.get("iso_sha256") != iso["sha256"]:
+                    raise CTFLabError("--resume 指定的 ISO 与原安装任务 SHA-256 不一致。")
+                target_path = Path(str(old["target_path"]))
+                vars_path = Path(str(old["uefi_vars_path"]))
+                if not target_path.is_file() or not vars_path.is_file():
+                    raise CTFLabError("已有安装目标或 UEFI NVRAM 缺失，拒绝重新启动。")
+            else:
+                target_path = install_root / f"target-{iso['sha256'][:12]}.qcow2"
+                vars_path = install_root / f"uefi-vars-{iso['sha256'][:12]}.fd"
+                if target_path.exists():
+                    raise CTFLabError(f"发现未登记的安装目标，拒绝覆盖：{target_path}")
+                vars_template = find_firmware("edk2-arm-vars.fd")
+                if not vars_template:
+                    raise CTFLabError("未找到 ARM64 UEFI NVRAM 模板 edk2-arm-vars.fd。")
+                run_command([qemu_img_path(), "create", "-f", "qcow2", str(target_path), f"{disk_size_gb}G"])
+                shutil.copy2(vars_template, vars_path)
+
+            qmp_path = install_root / "installer-qmp.sock"
+            qmp_path.unlink(missing_ok=True)
+            log_path = self.logs_dir / f"{profile_id}-installer.log"
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            log_offset = log_path.stat().st_size if log_path.is_file() else 0
+            state = {
+                "schema": 1,
+                "profile_id": profile_id,
+                "pid": 0,
+                "iso_path": str(iso_path),
+                "iso_sha256": iso["sha256"],
+                "target_path": str(target_path),
+                "uefi_vars_path": str(vars_path),
+                "qmp_path": str(qmp_path),
+                "log_path": str(log_path),
+                "log_offset": log_offset,
+                "disk_size_gb": disk_size_gb if not old else old.get("disk_size_gb", disk_size_gb),
+                "unattended": unattended,
+                "headless": headless,
+                "started_at": now_iso(),
+                "status": "preparing",
+            }
+            write_json(self.installer_state_path(profile_id), state)
+
+            kernel_path: Path | None = None
+            initrd_path: Path | None = None
+            if unattended:
+                kernel_path, initrd_path = prepare_unattended_installer_assets(
+                    iso_path,
+                    str(iso["sha256"]),
+                    install_root / "assets",
+                )
+            command = self.installer_command(
+                profile_id,
+                profile,
+                iso_path,
+                target_path,
+                vars_path,
+                qmp_path,
+                unattended=unattended,
+                headless=headless,
+                kernel_path=kernel_path,
+                initrd_path=initrd_path,
+            )
+            log_handle = log_path.open("a", encoding="utf-8")
+            try:
+                process = subprocess.Popen(
+                    command,
+                    stdin=subprocess.DEVNULL,
+                    stdout=log_handle,
+                    stderr=subprocess.STDOUT,
+                    env={key: value for key, value in os.environ.items() if key != "CTFLAB_INSTALL_PASSWORD"},
+                    start_new_session=True,
+                    text=True,
+                )
+            except OSError as exc:
+                raise CTFLabError(f"无法启动 {profile_id} 安装器：{exc}") from exc
+            finally:
+                log_handle.close()
+            time.sleep(0.5)
+            if process.poll() is not None:
+                state["status"] = "failed"
+                state["exit_code"] = process.returncode
+                write_json(self.installer_state_path(profile_id), state)
+                detail = log_path.read_text(encoding="utf-8", errors="replace")[-4000:]
+                raise CTFLabError(f"安装器启动失败（退出码 {process.returncode}）：\n{detail}")
+            state.update({
+                "pid": process.pid,
+                "status": "installing",
+            })
+            write_json(self.installer_state_path(profile_id), state)
+            return state
+
+    def install_status(self, profile_id: str) -> dict[str, Any]:
+        profile_id = PROFILE_ALIASES.get(profile_id, profile_id)
+        state = self.installer_state(profile_id)
+        if not state:
+            raise CTFLabError(f"{profile_id} 没有安装任务。")
+        result = dict(state)
+        running = bool_pid_alive(int(state.get("pid", 0)))
+        result["running"] = running
+        qmp_value = str(state.get("qmp_path") or "")
+        qmp_path = Path(qmp_value) if qmp_value else None
+        if running and qmp_path and qmp_path.exists():
+            try:
+                result["qmp_status"] = qmp_execute(qmp_path, "query-status")
+                blocks = qmp_execute(qmp_path, "query-blockstats")
+                result["disk_io"] = {
+                    item["device"]: {key: item.get("stats", {}).get(key, 0) for key in ("rd_bytes", "wr_bytes", "failed_wr_operations")}
+                    for item in blocks if item.get("device") in {"disk0", "cd0"}
+                }
+            except (OSError, CTFLabError, json.JSONDecodeError) as exc:
+                result["qmp_error"] = str(exc)
+        target_value = str(state.get("target_path") or "")
+        target_path = Path(target_value) if target_value else None
+        if target_path and target_path.is_file():
+            info = qemu_info(target_path, force_share=running)
+            result["target_actual_size"] = info.get("actual-size")
+            result["target_virtual_size"] = info.get("virtual-size")
+        log_value = str(state.get("log_path") or "")
+        log_path = Path(log_value) if log_value else None
+        log_tail = ""
+        if log_path and log_path.is_file():
+            with log_path.open("rb") as handle:
+                handle.seek(int(state.get("log_offset") or 0))
+                log_tail = handle.read()[-12000:].decode("utf-8", errors="replace")
+        result["completion_hint"] = bool(
+            re.search(r"installation\s+(?:is\s+)?complete|rebooting\s+the\s+system|restarting\s+system", log_tail, re.IGNORECASE)
+        )
+        result["status"] = "installing" if running else (
+            "finalized" if state.get("status") == "finalized" else
+            "completed_candidate" if result["completion_hint"] else state.get("status", "stopped")
+        )
+        result["log_tail"] = log_tail[-2000:]
+        return result
+
+    def stop_install(self, profile_id: str) -> bool:
+        with self.operation_lock(f"停止安装 {profile_id}"):
+            state = self.installer_state(profile_id)
+            if not state:
+                return False
+            pid = int(state.get("pid", 0))
+            qmp_path = Path(str(state.get("qmp_path", "")))
+            if bool_pid_alive(pid):
+                try:
+                    if qmp_path.exists():
+                        qmp_command(qmp_path, "quit")
+                except (OSError, CTFLabError):
+                    pass
+                deadline = time.monotonic() + 3
+                while bool_pid_alive(pid) and time.monotonic() < deadline:
+                    time.sleep(0.1)
+                if bool_pid_alive(pid):
+                    try:
+                        os.kill(pid, signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
+                deadline = time.monotonic() + 3
+                while bool_pid_alive(pid) and time.monotonic() < deadline:
+                    time.sleep(0.1)
+                if bool_pid_alive(pid):
+                    raise CTFLabError("安装器仍未退出，保留运行状态；请检查进程后重试。")
+            state["status"] = "stopped"
+            state["stopped_at"] = now_iso()
+            write_json(self.installer_state_path(profile_id), state)
+            return True
+
+    def finalize_install(self, profile_id: str, *, confirmed: bool = False, from_runtime: bool = False) -> dict[str, Any]:
+        with self.operation_lock(f"完成安装 {profile_id}"):
+            profile_id = PROFILE_ALIASES.get(profile_id, profile_id)
+            if not confirmed:
+                raise CTFLabError("完成登记需要 --confirm，确认安装器已经正常结束。")
+            previous = self.image_state(profile_id)
+            if previous and not from_runtime:
+                raise CTFLabError(f"{profile_id} 已存在基础镜像。")
+            install = self.install_status(profile_id)
+            if install["running"]:
+                raise CTFLabError("安装器仍在运行；请等待自动重启退出，或先执行 stop-install。")
+            target_path = Path(str(install["target_path"]))
+            vars_source = Path(str(install["uefi_vars_path"]))
+            actual_size = int(install.get("target_actual_size") or 0)
+            runtime_dir = self.runtime_dir / profile_id
+            if from_runtime:
+                if not previous or previous.get("source_format") != "iso-installer":
+                    raise CTFLabError("--from-runtime 仅用于固化通过 install 创建的 Kali 后续配置。")
+                runtime = self.runtime_state(profile_id) or {}
+                if bool_pid_alive(int(runtime.get("pid", 0))):
+                    raise CTFLabError("固化前请正常关闭 Kali 并执行 stop。")
+                target_path = runtime_dir / "overlay.qcow2"
+                vars_source = runtime_dir / "uefi-vars.fd"
+                if not target_path.is_file() or not vars_source.is_file():
+                    raise CTFLabError("未找到可固化的运行磁盘或 UEFI NVRAM。")
+                # overlay 的物理尺寸可以很小；验收的是完整 backing 链的容量。
+                if qemu_info(target_path).get("full-backing-filename") != previous["base_path"]:
+                    raise CTFLabError("运行磁盘与当前基础镜像不匹配，拒绝固化。")
+            elif install.get("unattended") and not install.get("completion_hint"):
+                raise CTFLabError("没有检测到自动安装正常结束的日志，不能把半成品登记为基盘。")
+            if actual_size < 512 * 1024 * 1024:
+                raise CTFLabError("安装目标写入量不足 512MiB，拒绝把空盘登记为基础镜像。")
+            run_command([qemu_img_path(), "check", "-q", str(target_path)])
+            target_hash = sha256_file(target_path)
+            image_dir = self.images_dir / profile_id
+            image_dir.mkdir(parents=True, exist_ok=True)
+            base_path = image_dir / f"base-{target_hash[:12]}-installed.qcow2"
+            if not base_path.exists():
+                temporary_base = base_path.with_suffix(".partial.qcow2")
+                run_command([qemu_img_path(), "convert", "-O", "qcow2", str(target_path), str(temporary_base)])
+                run_command([qemu_img_path(), "check", "-q", str(temporary_base)])
+                temporary_base.replace(base_path)
+            base_path.chmod(0o444)
+            vars_path = image_dir / f"uefi-vars-{target_hash[:12]}.fd"
+            if not vars_path.exists():
+                shutil.copy2(vars_source, vars_path)
+            profile = load_profile(profile_id)
+            destination_info = qemu_info(base_path)
+            state = {
+                "schema": 1,
+                "profile_id": profile_id,
+                "profile_path": str(profile_path(profile_id)),
+                "source_path": install["iso_path"],
+                "source_sha256": install["iso_sha256"],
+                "source_format": "iso-installer",
+                "installed_disk_sha256": target_hash,
+                "base_path": str(base_path),
+                "base_sha256": sha256_file(base_path),
+                "uefi_vars_path": str(vars_path),
+                "uefi_vars_sha256": sha256_file(vars_path),
+                "virtual_size": destination_info.get("virtual-size"),
+                "imported_at": now_iso(),
+                "verification_status": "candidate",
+                "guest": profile.get("guest", {}),
+            }
+            if from_runtime:
+                stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+                archive = self.install_dir / profile_id / f"runtime-before-finalize-{stamp}"
+                state["previous_base_path"] = previous["base_path"]
+                state["archived_runtime_path"] = str(archive)
+                runtime_dir.rename(archive)
+                try:
+                    write_json(archive / "previous-image.json", previous)
+                    write_json(self.image_state_path(profile_id), state)
+                except Exception:
+                    archive.rename(runtime_dir)
+                    raise
+            else:
+                write_json(self.image_state_path(profile_id), state)
+            install_state = self.installer_state(profile_id) or {}
+            install_state["status"] = "finalized"
+            install_state["finalized_at"] = now_iso()
+            install_state["base_path"] = str(base_path)
+            write_json(self.installer_state_path(profile_id), install_state)
+            return state
+
     def ensure_overlay(self, profile_id: str) -> Path:
         profile_id = PROFILE_ALIASES.get(profile_id, profile_id)
         image = self.image_state(profile_id)
@@ -628,6 +1168,23 @@ class LabManager:
                     f"{profile_id} 的 overlay 指向旧基础镜像，请先执行：ctflab reset {profile_id}"
                 )
         return overlay
+
+    def ensure_uefi_vars(self, profile_id: str) -> tuple[Path, Path]:
+        """为 ARM64 实例创建可重置的 UEFI NVRAM 副本。"""
+        profile_id = PROFILE_ALIASES.get(profile_id, profile_id)
+        code_path = find_firmware("edk2-aarch64-code.fd")
+        if not code_path:
+            raise CTFLabError("未找到 ARM64 UEFI 固件代码。")
+        image = self.image_state(profile_id) or {}
+        configured_vars = image.get("uefi_vars_path")
+        vars_source = Path(str(configured_vars)) if configured_vars else find_firmware("edk2-arm-vars.fd")
+        if not vars_source or not vars_source.exists():
+            raise CTFLabError("未找到 ARM64 UEFI NVRAM 模板 edk2-arm-vars.fd。")
+        runtime_vars = self.runtime_dir / profile_id / "uefi-vars.fd"
+        runtime_vars.parent.mkdir(parents=True, exist_ok=True)
+        if not runtime_vars.exists():
+            shutil.copy2(vars_source, runtime_vars)
+        return code_path, runtime_vars
 
     def running_states(self) -> list[dict[str, Any]]:
         result = []
@@ -761,7 +1318,7 @@ class LabManager:
         profile = load_profile(profile_id)
         return leases.get(profile.get("network", {}).get("mac"))
 
-    def qemu_command(self, profile_id: str, profile: dict[str, Any], overlay: Path, lab_port: int, headless: bool) -> tuple[list[str], dict[str, int]]:
+    def qemu_command(self, profile_id: str, profile: dict[str, Any], overlay: Path, lab_port: int, headless: bool, allow_internet: bool = False) -> tuple[list[str], dict[str, int]]:
         guest = profile.get("guest", {})
         disk = profile.get("disk", {})
         network = profile.get("network", {})
@@ -770,6 +1327,7 @@ class LabManager:
             qemu = which_any(QEMU_ARM_NAMES)
             if not qemu:
                 raise CTFLabError("未找到 qemu-system-aarch64，请先安装 QEMU。")
+            code_path, vars_path = self.ensure_uefi_vars(profile_id)
             command = [
                 qemu,
                 "-name", f"CTFLab-{profile_id}",
@@ -778,13 +1336,15 @@ class LabManager:
                 "-cpu", "host",
                 "-smp", str(guest.get("cpus", 2)),
                 "-m", str(guest.get("memory_mb", 4096)),
+                "-drive", f"if=pflash,format=raw,unit=0,file={code_path},readonly=on",
+                "-drive", f"if=pflash,format=raw,unit=1,file={vars_path}",
                 "-drive", f"file={overlay},if=none,format=qcow2,id=disk0",
                 "-device", "virtio-blk-pci,drive=disk0",
                 "-device", "virtio-gpu-pci",
+                "-device", "qemu-xhci",
+                "-device", "usb-kbd",
+                "-device", "usb-tablet",
             ]
-            firmware = find_firmware("edk2-aarch64-code.fd")
-            if guest.get("firmware") == "uefi" and firmware:
-                command += ["-bios", str(firmware)]
             primary_adapter = "virtio-net-pci"
         else:
             qemu = which_any(QEMU_X86_NAMES)
@@ -832,7 +1392,9 @@ class LabManager:
             label = str(item.get("name", guest_port))
             host_forwards[label] = host_port
             forward_parts.append(f"hostfwd=tcp:127.0.0.1:{host_port}-:{guest_port}")
-        mgmt_netdev = "user,id=mgmt,restrict=on"
+        if allow_internet and profile_id != "kali-arm64":
+            raise CTFLabError("只有 Kali 可以临时联网。")
+        mgmt_netdev = "user,id=mgmt" + ("" if allow_internet else ",restrict=on")
         if forward_parts:
             mgmt_netdev += "," + ",".join(forward_parts)
         # 将实验网卡放在第一块，并使用原始 OVF 的模型/MAC：各 QEMU 实例通过
@@ -855,15 +1417,24 @@ class LabManager:
         command += ["-qmp", f"unix:{qmp_path},server=on,wait=off"]
         return command, host_forwards
 
-    def run(self, profile_ids: list[str], headless: bool = False, pcap: bool = False) -> list[dict[str, Any]]:
+    def run(self, profile_ids: list[str], headless: bool = False, pcap: bool = False, allow_internet: bool = False) -> list[dict[str, Any]]:
         with self.operation_lock("启动 " + ",".join(profile_ids)):
-            return self._run_unlocked(profile_ids, headless=headless, pcap=pcap)
+            return self._run_unlocked(profile_ids, headless=headless, pcap=pcap, allow_internet=allow_internet)
 
-    def _run_unlocked(self, profile_ids: list[str], headless: bool = False, pcap: bool = False) -> list[dict[str, Any]]:
+    def _run_unlocked(self, profile_ids: list[str], headless: bool = False, pcap: bool = False, allow_internet: bool = False) -> list[dict[str, Any]]:
         profile_ids = list(dict.fromkeys(PROFILE_ALIASES.get(profile_id, profile_id) for profile_id in profile_ids))
+        if allow_internet and profile_ids != ["kali-arm64"]:
+            raise CTFLabError("--internet 只能单独启动 kali-arm64。")
         for profile_id in profile_ids:
             load_profile(profile_id)
         running = self.running_states()
+        if allow_internet and any(state["profile_id"] != "kali-arm64" for state in running):
+            raise CTFLabError("Kali 联网维护前请先停止其他靶机。")
+        if any(state.get("internet_enabled") for state in running) and profile_ids != ["kali-arm64"]:
+            raise CTFLabError("Kali 正在联网维护；请先停止它并以默认隔离模式重启，再启动靶机。")
+        for state in running:
+            if state["profile_id"] in profile_ids and bool(state.get("internet_enabled")) != allow_internet:
+                raise CTFLabError("切换联网模式需要先 stop，再 run。")
         lab_port = int(running[0]["lab_port"]) if running else self.allocate_lab_port()
         pcap_path: Path | None = None
         if pcap:
@@ -883,7 +1454,7 @@ class LabManager:
                 continue
             profile = load_profile(profile_id)
             overlay = self.ensure_overlay(profile_id)
-            command, host_forwards = self.qemu_command(profile_id, profile, overlay, lab_port, headless)
+            command, host_forwards = self.qemu_command(profile_id, profile, overlay, lab_port, headless, allow_internet=allow_internet)
             log_path = self.logs_dir / f"{profile_id}.log"
             log_path.parent.mkdir(parents=True, exist_ok=True)
             log_handle = log_path.open("a", encoding="utf-8")
@@ -918,6 +1489,7 @@ class LabManager:
                 "pcap_path": network_state.get("pcap_path"),
                 "started_at": now_iso(),
                 "headless": headless,
+                "internet_enabled": allow_internet,
             }
             write_json(self.runtime_state_path(profile_id), state)
             started.append(state)
@@ -1219,6 +1791,9 @@ def cmd_doctor(manager: LabManager, _args: argparse.Namespace) -> int:
         ("utmctl", shutil.which("utmctl"), True),
         ("PyYAML", "available" if yaml is not None else None, True),
         ("ARM64 UEFI", str(find_firmware("edk2-aarch64-code.fd")) if find_firmware("edk2-aarch64-code.fd") else None, True),
+        ("ARM64 UEFI NVRAM", str(find_firmware("edk2-arm-vars.fd")) if find_firmware("edk2-arm-vars.fd") else None, True),
+        ("bsdtar", shutil.which("bsdtar") or shutil.which("tar"), True),
+        ("cpio", shutil.which("cpio"), True),
         ("Tesseract OCR", shutil.which("tesseract"), False),
     ]
     failed = False
@@ -1332,11 +1907,69 @@ def cmd_import(manager: LabManager, args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_install(manager: LabManager, args: argparse.Namespace) -> int:
+    state = manager.start_install(
+        args.profile,
+        args.iso,
+        disk_size_gb=args.disk_size_gb,
+        unattended=args.unattended,
+        headless=args.headless,
+        resume=args.resume,
+        confirm_reinstall=args.confirm_reinstall,
+    )
+    print(f"Kali ARM64 安装器已启动（PID {state['pid']}）。")
+    print(f"目标磁盘：{state['target_path']}")
+    print(f"ISO SHA-256：{state['iso_sha256']}")
+    if state.get("unattended"):
+        print("无人值守安装：XFCE + kali-linux-default；用户名 kali，使用本次提供的本地口令。")
+        print("安装完成时 QEMU 会因 -no-reboot 自动退出。")
+    else:
+        print("请在 QEMU 窗口选择 Graphical install 并完成安装。")
+    print(f"查看进度：./tools/ctflab install-status {state['profile_id']} --log-tail")
+    print(f"完成登记：./tools/ctflab finalize-install {state['profile_id']} --confirm")
+    return 0
+
+
+def cmd_install_status(manager: LabManager, args: argparse.Namespace) -> int:
+    state = manager.install_status(args.profile)
+    print(f"{state['profile_id']} 安装器：{'运行中' if state['running'] else '已停止'}")
+    print(f"目标磁盘：{state['target_path']}")
+    actual = int(state.get("target_actual_size") or 0)
+    virtual = int(state.get("target_virtual_size") or 0)
+    print(f"磁盘写入：{actual / 1024 ** 3:.2f} GiB / 虚拟容量 {virtual / 1024 ** 3:.0f} GiB")
+    disk_io = state.get("disk_io", {}).get("disk0", {})
+    if disk_io:
+        print(f"本轮累计写入：{disk_io.get('wr_bytes', 0) / 1024 ** 3:.2f} GiB；写入错误：{disk_io.get('failed_wr_operations', 0)}")
+    print(f"完成提示：{'已在日志中检测到' if state.get('completion_hint') else '尚未检测到'}")
+    if args.log_tail and state.get("log_tail"):
+        print("日志末尾：")
+        print(state["log_tail"])
+    return 0
+
+
+def cmd_stop_install(manager: LabManager, args: argparse.Namespace) -> int:
+    stopped = manager.stop_install(args.profile)
+    print("安装器已停止。" if stopped else "没有安装任务。")
+    return 0
+
+
+def cmd_finalize_install(manager: LabManager, args: argparse.Namespace) -> int:
+    state = manager.finalize_install(args.profile, confirmed=args.confirm, from_runtime=args.from_runtime)
+    print(f"安装磁盘已登记为候选基础镜像：{state['base_path']}")
+    print(f"基础镜像 SHA-256：{state['base_sha256']}")
+    if state.get("archived_runtime_path"):
+        print(f"固化前的运行盘已归档：{state['archived_runtime_path']}")
+    print(f"下一步：./tools/ctflab probe {state['profile_id']} --timeout 300")
+    return 0
+
+
 def cmd_run(manager: LabManager, args: argparse.Namespace) -> int:
-    states = manager.run(args.profiles, headless=args.headless, pcap=args.pcap)
+    states = manager.run(args.profiles, headless=args.headless, pcap=args.pcap, allow_internet=args.internet)
     for state in states:
         forwards = ", ".join(f"{name}=127.0.0.1:{port}" for name, port in state.get("host_forwards", {}).items()) or "无主机端口映射"
         print(f"已启动 {state['profile_id']}（PID {state['pid']}，实验网 TCP {state['lab_port']}；{forwards}）")
+        if state.get("internet_enabled"):
+            print("  Kali 联网维护模式已开启；先 stop，再默认 run 才会恢复隔离。")
     pcap_paths = {str(state.get("pcap_path")) for state in states if state.get("pcap_path")}
     for pcap_path in sorted(pcap_paths):
         print(f"PCAP：{pcap_path}")
@@ -1351,6 +1984,8 @@ def cmd_status(manager: LabManager, _args: argparse.Namespace) -> int:
         if not state:
             continue
         print(f"{profile_id}: running PID={state['pid']} lab=tcp://127.0.0.1:{state['lab_port']} log={state['log_path']}")
+        if state.get("internet_enabled"):
+            print("  网络：Kali 联网维护模式")
         if state.get("host_forwards"):
             print("  端口：" + ", ".join(f"{key}=127.0.0.1:{value}" for key, value in state["host_forwards"].items()))
         lab_port = int(state.get("lab_port", 0))
@@ -1452,10 +2087,32 @@ def build_parser() -> argparse.ArgumentParser:
     import_parser.add_argument("profile", choices=profile_choices)
     import_parser.add_argument("source", help="磁盘文件或包含单个磁盘的目录")
 
+    install_parser = subparsers.add_parser("install", help="从 ARM64 安装 ISO 创建 Kali 基础镜像")
+    install_parser.add_argument("profile", choices=profile_choices)
+    install_parser.add_argument("iso", help="ARM64 Kali/Debian 安装 ISO")
+    install_parser.add_argument("--disk-size-gb", type=int, default=64, help="目标磁盘虚拟容量，默认 64GiB")
+    install_parser.add_argument("--unattended", action="store_true", help="自动安装 XFCE；用户名 kali，口令从 CTFLAB_INSTALL_PASSWORD 读取")
+    install_parser.add_argument("--headless", action="store_true", help="后台安装，不打开 QEMU 窗口")
+    install_parser.add_argument("--resume", action="store_true", help="使用相同 ISO 重新启动已有安装目标")
+    install_parser.add_argument("--confirm-reinstall", action="store_true", help="确认自动安装重启会重新分区已有安装目标")
+
+    install_status_parser = subparsers.add_parser("install-status", help="查看 ISO 安装任务状态")
+    install_status_parser.add_argument("profile", choices=profile_choices)
+    install_status_parser.add_argument("--log-tail", action="store_true", help="显示安装日志末尾")
+
+    stop_install_parser = subparsers.add_parser("stop-install", help="停止 ISO 安装任务但保留目标盘")
+    stop_install_parser.add_argument("profile", choices=profile_choices)
+
+    finalize_install_parser = subparsers.add_parser("finalize-install", help="把已完成的安装目标登记为候选基础镜像")
+    finalize_install_parser.add_argument("profile", choices=profile_choices)
+    finalize_install_parser.add_argument("--confirm", action="store_true", help="确认安装器已正常完成并停止")
+    finalize_install_parser.add_argument("--from-runtime", action="store_true", help="正常关机后固化 Kali 运行盘中的配置；保留原基盘和运行盘归档")
+
     run_parser = subparsers.add_parser("run", help="启动一个或多个实验节点")
     run_parser.add_argument("profiles", nargs="+", choices=profile_choices)
     run_parser.add_argument("--headless", action="store_true", help="不打开图形窗口，日志写入 logs/")
     run_parser.add_argument("--pcap", action="store_true", help="记录隔离实验网的 Ethernet PCAP")
+    run_parser.add_argument("--internet", action="store_true", help="仅为单独启动的 Kali 临时联网维护")
 
     subparsers.add_parser("status", help="查看运行状态")
 
@@ -1489,6 +2146,10 @@ def main(argv: list[str] | None = None) -> int:
         "inspect": cmd_inspect,
         "onboard": cmd_onboard,
         "import": cmd_import,
+        "install": cmd_install,
+        "install-status": cmd_install_status,
+        "stop-install": cmd_stop_install,
+        "finalize-install": cmd_finalize_install,
         "run": cmd_run,
         "status": cmd_status,
         "stop": cmd_stop,

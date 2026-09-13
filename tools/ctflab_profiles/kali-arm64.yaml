@@ -7,7 +7,7 @@ guest:
   architecture: aarch64
   firmware: uefi
   machine: virt
-  memory_mb: 8192
+  memory_mb: 5120
   cpus: 4
 
 disk:
@@ -29,3 +29,5 @@ readiness:
   timeout_seconds: 240
   checks:
     - dhcp
+    - type: ssh
+      port: 22

@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import struct
+import socket
 import sys
 import tempfile
 import unittest
@@ -20,6 +21,9 @@ from ctflab_network import (  # noqa: E402
     LearningSwitch,
     PcapWriter,
     mac_bytes,
+    pad_ethernet_frame,
+    build_dhcp_frame,
+    parse_options,
 )
 
 
@@ -28,6 +32,31 @@ def ethernet_frame(destination: str, source: str, payload: bytes = b"test") -> b
 
 
 class LearningSwitchTests(unittest.TestCase):
+    def test_short_arp_is_padded_for_pcnet(self) -> None:
+        frame = ethernet_frame("ff:ff:ff:ff:ff:ff", "52:54:00:00:00:01", bytes(28))
+        self.assertEqual(len(frame), 42)
+        padded = pad_ethernet_frame(frame)
+        self.assertEqual(len(padded), 60)
+        self.assertEqual(padded[:42], frame)
+        long_frame = frame + bytes(100)
+        self.assertEqual(pad_ethernet_frame(long_frame), long_frame)
+        sender, receiver = socket.socketpair()
+        try:
+            DHCPServer.send_frame(sender, frame)
+            packet = receiver.recv(4096)
+            self.assertEqual(struct.unpack("!I", packet[:4])[0], 60)
+            self.assertEqual(packet[4:], padded)
+        finally:
+            sender.close()
+            receiver.close()
+
+    def test_dhcp_does_not_advertise_nonexistent_gateway(self) -> None:
+        request = bytes(14) + b"\x45" + bytes(19 + 8 + 240)
+        response = build_dhcp_frame(request, mac_bytes("52:54:00:24:00:10"), 7, 0, 5, "192.168.242.10")
+        options = parse_options(response[14 + 20 + 8 + 240:])
+        self.assertEqual(options[1], bytes([255, 255, 255, 0]))
+        self.assertNotIn(3, options)
+
     def test_broadcast_and_unknown_unicast_are_flooded(self) -> None:
         switch = LearningSwitch()
         first, second, third = object(), object(), object()

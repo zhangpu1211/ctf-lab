@@ -11,6 +11,8 @@ CTFLab 是面向 Apple Silicon Mac 的本地虚拟靶场运行器。它使用 QE
 - `onboard` 生成带置信度、警告和人工复核状态的白名单配置；
 - `probe` 收集 QMP、截图 OCR/画面分类、DHCP 与 HTTP/SSH 协议证据；
 - x86_64 在 Mac M 上使用 QEMU TCG，ARM64 使用 HVF；
+- 从 Kali ARM64 安装 ISO 无人值守安装 XFCE，支持安装状态查询、UEFI NVRAM 与运行盘固化；
+- Kali 默认隔离运行；独占联网维护模式可补装软件，并禁止同时启动脆弱靶机；
 - 不覆盖原始镜像，运行时写入独立 QCOW2 overlay；
 - 跨进程文件锁保护导入、启动、停止、重置和候选配置生成，避免多终端竞争；
 - 回环 TCP 二层交换机提供固定 DHCP、MAC 学习、逐连接限速和可选 PCAP，默认不把脆弱靶机接入物理局域网。
@@ -50,6 +52,7 @@ python3 -m py_compile tools/ctflab.py tools/ctflab_inspect.py tools/ctflab_netwo
 - [第一阶段快速使用](docs/ctflab-phase1-quickstart.md)
 - [完整实施计划与路线图](docs/ctflab-mac-mvp-implementation-plan.md)
 - [2026-09-06 Mac M 回归验证](docs/verification-2026-09-06.md)
+- [2026-09-07 Kali 安装、图形与互通验证](docs/verification-2026-09-07.md)
 
 ## 安全边界
 

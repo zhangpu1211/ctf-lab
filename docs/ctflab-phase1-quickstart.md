@@ -21,11 +21,53 @@ cd /path/to/ctf-lab
 
 基础镜像保存在 `~/Library/Application Support/CTFLab/images/`，不会覆盖源文件。VMDK、QCOW2 和 OVA 均会先经 `qemu-img` 转成独立 QCOW2。
 
-Kali 配置已经预置，但需要用户提供 ARM64 Kali 磁盘后再导入：
+Kali 可以导入现有 ARM64 磁盘，也可以从 ARM64 安装 ISO 创建：
 
 ```bash
 ./tools/ctflab import kali /path/to/kali-arm64.qcow2
 ```
+
+### 从 Kali ARM64 ISO 安装
+
+安装器要求含 `install.a64/vmlinuz` 与图形安装 initrd 的 Kali/Debian 风格 ARM64 ISO；不是任意 Live ISO。原 ISO 只读，目标盘默认虚拟容量 64GiB；默认配置 4 核、5120MiB、HVF、VirtIO 和独立 UEFI NVRAM。
+
+在 macOS 默认 zsh 中，先交互读取本地安装口令（不进入命令历史）：
+
+```zsh
+read -rs 'CTFLAB_INSTALL_PASSWORD?设置 Kali 本地口令：'; echo
+export CTFLAB_INSTALL_PASSWORD
+./tools/ctflab install kali-arm64 /path/to/kali-installer-arm64.iso --unattended --headless
+unset CTFLAB_INSTALL_PASSWORD
+./tools/ctflab install-status kali-arm64 --log-tail
+# 等安装正常完成并自动退出后：
+./tools/ctflab finalize-install kali-arm64 --confirm
+./tools/ctflab probe kali-arm64 --timeout 180
+./tools/ctflab run kali-arm64
+```
+
+登录用户名是 `kali`，口令使用安装时输入的值。安装资产含本地口令，仅保存在权限受限的状态目录，不能公开分发。ISO 的 SHA-256 被记录，但这不等同于验证发行方签名。现有本机验收实例不受新安装口令参数影响。
+
+`stop-install` 保留安装盘；`install --resume` 重新启动安装器，并非断点恢复。无人值守重新启动会重新分区，必须再传 `--confirm-reinstall`；不要对需要保留的安装成果执行此操作。`finalize-install` 只登记候选基盘，仍需实际登录与网络验收。
+
+### 软件维护与固化
+
+离线 ISO 已提供 XFCE、Firefox、Wireshark、Nmap、Metasploit 等；Burp/Ghidra 是否包含取决于 ISO。本机测试另行通过 Kali 官方仓库安装了 Burp Community 与 Ghidra。
+
+```bash
+./tools/ctflab stop --all
+./tools/ctflab run kali-arm64 --internet
+# 在 Kali 中维护软件；需要 apt 源时参考 tools/guest_fixes/kali-arm64/kali.sources
+# 维护完成后先在 Kali 内正常关机，再执行：
+./tools/ctflab stop kali-arm64
+./tools/ctflab finalize-install kali-arm64 --from-runtime --confirm
+./tools/ctflab run kali-arm64 smoke basic-pentesting-2
+```
+
+联网维护仅允许单独 Kali，不能同时启动靶机。默认运行不允许公网访问；实验 DHCP 不下发不存在的网关，Kali 禁用 IP 转发。联网模式仅用于可信软件维护，不能连接未知靶机。
+
+`--from-runtime` 展平当前 overlay 为新只读基盘，归档原运行目录并保留旧基盘；这样后续 `reset` 不会丢失已固化的软件。务必先正常关机，不能把强制停止等同于文件系统已干净卸载。归档会额外占用磁盘空间。
+
+图形界面由 QEMU 独立窗口提供，`--headless` 不打开窗口。已验证 1920×1080 手动分辨率、键鼠和 XFCE；剪贴板、动态分辨率、关闭窗口行为与 3D 加速仍未完整验收，不能承诺与商业虚拟机相同体验。Ghidra 当前发行包首次帮助页有 `view is invalid` 异常，项目窗口可显示，逆向工作流尚未验收。
 
 ### 2.1 接收新的未知镜像
 
