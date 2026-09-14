@@ -66,6 +66,47 @@ class GracefulStopTests(unittest.TestCase):
             self.assertEqual(alive["pid"], 4242)
             self.assertTrue(manager.runtime_state_path("kali-arm64").exists())
 
+    def test_graceful_stop_continues_after_one_instance_is_preserved(self) -> None:
+        # kali 不响应 ACPI（保留），smoke 的 QEMU 已经退出（清态）——两种结果要同时汇报
+        alive = {"kali": 4242}
+
+        def fake_alive(pid: int) -> bool:
+            return pid in alive.values()
+
+        def fake_kill(pid: int, signum: int) -> None:
+            for name, value in list(alive.items()):
+                if pid == value:
+                    alive[name] = -1
+
+        with tempfile.TemporaryDirectory() as directory:
+            manager = LabManager(Path(directory))
+            for profile_id, pid in (("kali-arm64", 4242), ("smoke", 5252)):
+                log = manager.logs_dir / f"{profile_id}.log"
+                log.parent.mkdir(parents=True, exist_ok=True)
+                log.write_text("boot\n", encoding="utf-8")
+                write_json(
+                    manager.runtime_state_path(profile_id),
+                    {
+                        "schema": 1,
+                        "profile_id": profile_id,
+                        "pid": pid,
+                        "qmp_path": str(manager.runtime_dir / profile_id / "qmp.sock"),
+                        "log_path": str(log),
+                        "started_at": "2026-09-14T00:00:00+00:00",
+                    },
+                )
+            with mock.patch.object(ctflab, "bool_pid_alive", side_effect=fake_alive), \
+                    mock.patch.object(ctflab.os, "kill", side_effect=fake_kill), \
+                    mock.patch.object(ctflab, "qmp_command", side_effect=FileNotFoundError), \
+                    mock.patch.object(ctflab, "GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS", 0.2):
+                with self.assertRaises(CTFLabError) as raised:
+                    manager.stop(["kali-arm64", "smoke"], graceful=True)
+            message = str(raised.exception)
+            self.assertIn("kali-arm64", message)      # 未完成关机的实例被保留并报告
+            self.assertNotIn("smoke", message)        # 已完成关机的实例不应出现在错误里
+            self.assertTrue(manager.runtime_state_path("kali-arm64").exists())
+            self.assertFalse(manager.runtime_state_path("smoke").exists())
+
     def test_plain_stop_force_exits_when_guest_ignores_powerdown(self) -> None:
         alive = {"pid": 4242}
 
@@ -147,6 +188,32 @@ class ResidualNetworkTests(unittest.TestCase):
             finally:
                 sleeper.kill()
                 sleeper.wait()
+
+
+class DoctorOutputTests(unittest.TestCase):
+    def test_required_and_optional_hints(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = LabManager(Path(directory))
+            real_which = ctflab.shutil.which
+
+            def fake_which(name: str):
+                if name in {"utmctl", "tesseract"}:
+                    return None
+                return real_which(name)
+
+            output = io.StringIO()
+            with mock.patch.object(ctflab.shutil, "which", side_effect=fake_which), \
+                    mock.patch.object(ctflab, "yaml", None), \
+                    redirect_stdout(output):
+                code = ctflab.cmd_doctor(manager, None)
+            text = output.getvalue()
+        self.assertEqual(code, 1, "缺少必选 PyYAML 时 doctor 必须返回失败")
+        self.assertIn("MISS PyYAML", text)
+        self.assertIn("pip install pyyaml", text)
+        self.assertNotIn("PyYAML: 未找到（可选", text)
+        self.assertIn("OPT  utmctl", text)
+        self.assertIn("OPT  Tesseract OCR", text)
+        self.assertIn("未安装时截图分类降级为人工复核", text)
 
 
 if __name__ == "__main__":

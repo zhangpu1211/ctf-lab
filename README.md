@@ -51,9 +51,11 @@ python3 -m py_compile tools/ctflab.py tools/ctflab_inspect.py tools/ctflab_netwo
 
 - [第一阶段快速使用](docs/ctflab-phase1-quickstart.md)
 - [完整实施计划与路线图](docs/ctflab-mac-mvp-implementation-plan.md)
+- [动态分辨率设计：UTM 导出与 SPICE 路径对比（未实现）](docs/ctflab-dynamic-resolution-design.md)
 - [2026-09-06 Mac M 回归验证](docs/verification-2026-09-06.md)
 - [2026-09-07 Kali 安装、图形与互通验证](docs/verification-2026-09-07.md)
 - [2026-09-13 Kali 图形体验验证（剪贴板、分辨率、关闭策略、Ghidra 帮助）](docs/verification-2026-09-13.md)
+- [2026-09-14 三节点网络、生命周期、干净环境与启动回退矩阵验证](docs/verification-2026-09-14.md)
 
 ## 安全边界
 

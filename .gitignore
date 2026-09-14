@@ -8,9 +8,11 @@
 /docs/*
 !/docs/ctflab-mac-mvp-implementation-plan.md
 !/docs/ctflab-phase1-quickstart.md
+!/docs/ctflab-dynamic-resolution-design.md
 !/docs/verification-2026-09-06.md
 !/docs/verification-2026-09-07.md
 !/docs/verification-2026-09-13.md
+!/docs/verification-2026-09-14.md
 
 /tools/*
 !/tools/ctflab

@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 from contextlib import contextmanager
 import fcntl
 import gzip
@@ -476,6 +477,37 @@ def ppm_display_activity(path: Path) -> dict[str, Any]:
         "unique_colors": unique_colors,
         "detail": "检测到非全黑画面" if active else "画面仍接近全黑或无变化",
     }
+
+
+# 受控启动回退矩阵：只使用白名单里的固件、磁盘总线与控制器组合，按顺序尝试。
+# x86 先试传统 BIOS + LSI SCSI（多数老靶机），再依次尝试 IDE/SATA/VirtIO，最后才是 UEFI。
+BOOT_MATRIX_SUCCESS_VERDICTS = {"service_ready", "network_and_display_candidate"}
+BOOT_MATRIX_SUCCESS_SCREENS = {"login_ready"}
+X86_BOOT_MATRIX: tuple[dict[str, str], ...] = (
+    {"firmware": "bios", "bus": "scsi", "controller": "lsi53c895a"},
+    {"firmware": "bios", "bus": "ide"},
+    {"firmware": "bios", "bus": "sata", "controller": "ich9-ahci"},
+    {"firmware": "bios", "bus": "virtio"},
+    {"firmware": "uefi", "bus": "scsi", "controller": "lsi53c895a"},
+    {"firmware": "uefi", "bus": "ide"},
+    {"firmware": "uefi", "bus": "sata", "controller": "ich9-ahci"},
+    {"firmware": "uefi", "bus": "virtio"},
+)
+AARCH64_BOOT_MATRIX: tuple[dict[str, str], ...] = (
+    {"firmware": "uefi", "bus": "virtio"},
+)
+
+
+def matrix_candidates(architecture: str) -> tuple[dict[str, str], ...]:
+    """按客体架构返回白名单候选；aarch64 只支持 UEFI + VirtIO。"""
+    return AARCH64_BOOT_MATRIX if architecture == "aarch64" else X86_BOOT_MATRIX
+
+
+def candidate_label(candidate: dict[str, str]) -> str:
+    label = f"{candidate['firmware']}/{candidate['bus']}"
+    if candidate.get("controller"):
+        label += f"/{candidate['controller']}"
+    return label
 
 
 SCREEN_PATTERNS: dict[str, tuple[tuple[str, str], ...]] = {
@@ -1174,18 +1206,29 @@ class LabManager:
                 )
         return overlay
 
-    def ensure_uefi_vars(self, profile_id: str) -> tuple[Path, Path]:
-        """为 ARM64 实例创建可重置的 UEFI NVRAM 副本。"""
+    # 各架构的 UEFI 固件代码与 NVRAM 模板（受控回退矩阵只使用这里的白名单文件）。
+    UEFI_FIRMWARE = {
+        "aarch64": ("edk2-aarch64-code.fd", "edk2-arm-vars.fd"),
+        "x86_64": ("edk2-x86_64-code.fd", "edk2-i386-vars.fd"),
+    }
+
+    def ensure_uefi_vars(self, profile_id: str, architecture: str | None = None) -> tuple[Path, Path]:
+        """为实例创建可重置的 UEFI NVRAM 副本；架构决定固件与模板。"""
         profile_id = PROFILE_ALIASES.get(profile_id, profile_id)
-        code_path = find_firmware("edk2-aarch64-code.fd")
+        if architecture is None:
+            architecture = str(load_profile(profile_id).get("guest", {}).get("architecture", "aarch64"))
+        code_name, vars_name = self.UEFI_FIRMWARE.get(architecture, self.UEFI_FIRMWARE["aarch64"])
+        code_path = find_firmware(code_name)
         if not code_path:
-            raise CTFLabError("未找到 ARM64 UEFI 固件代码。")
+            raise CTFLabError(f"未找到 UEFI 固件代码 {code_name}。")
         image = self.image_state(profile_id) or {}
-        configured_vars = image.get("uefi_vars_path")
-        vars_source = Path(str(configured_vars)) if configured_vars else find_firmware("edk2-arm-vars.fd")
+        configured_vars = image.get("uefi_vars_path") if architecture == "aarch64" else None
+        vars_source = Path(str(configured_vars)) if configured_vars else find_firmware(vars_name)
         if not vars_source or not vars_source.exists():
-            raise CTFLabError("未找到 ARM64 UEFI NVRAM 模板 edk2-arm-vars.fd。")
-        runtime_vars = self.runtime_dir / profile_id / "uefi-vars.fd"
+            raise CTFLabError(f"未找到 UEFI NVRAM 模板 {vars_name}。")
+        # aarch64 沿用历史文件名，避免破坏 finalize-install --from-runtime 的既有路径。
+        file_name = "uefi-vars.fd" if architecture == "aarch64" else f"uefi-vars-{architecture}.fd"
+        runtime_vars = self.runtime_dir / profile_id / file_name
         runtime_vars.parent.mkdir(parents=True, exist_ok=True)
         if not runtime_vars.exists():
             shutil.copy2(vars_source, runtime_vars)
@@ -1366,6 +1409,13 @@ class LabManager:
                 "-smp", str(guest.get("cpus", 1)),
                 "-m", str(guest.get("memory_mb", 1024)),
             ]
+            if str(guest.get("firmware", "bios")) == "uefi":
+                # 受控回退矩阵会尝试 x86_64 + UEFI：使用 OVMF 白名单固件与独立 NVRAM。
+                code_path, vars_path = self.ensure_uefi_vars(profile_id, "x86_64")
+                command += [
+                    "-drive", f"if=pflash,format=raw,unit=0,file={code_path},readonly=on",
+                    "-drive", f"if=pflash,format=raw,unit=1,file={vars_path}",
+                ]
             bus = str(disk.get("bus", "ide"))
             if bus == "scsi":
                 command += [
@@ -1430,11 +1480,12 @@ class LabManager:
         command += ["-qmp", f"unix:{qmp_path},server=on,wait=off"]
         return command, host_forwards
 
-    def run(self, profile_ids: list[str], headless: bool = False, pcap: bool = False, allow_internet: bool = False, clipboard: bool = False) -> list[dict[str, Any]]:
+    def run(self, profile_ids: list[str], headless: bool = False, pcap: bool = False, allow_internet: bool = False, clipboard: bool = False, profile_overrides: dict[str, dict[str, Any]] | None = None) -> list[dict[str, Any]]:
         with self.operation_lock("启动 " + ",".join(profile_ids)):
-            return self._run_unlocked(profile_ids, headless=headless, pcap=pcap, allow_internet=allow_internet, clipboard=clipboard)
+            return self._run_unlocked(profile_ids, headless=headless, pcap=pcap, allow_internet=allow_internet, clipboard=clipboard, profile_overrides=profile_overrides)
 
-    def _run_unlocked(self, profile_ids: list[str], headless: bool = False, pcap: bool = False, allow_internet: bool = False, clipboard: bool = False) -> list[dict[str, Any]]:
+    def _run_unlocked(self, profile_ids: list[str], headless: bool = False, pcap: bool = False, allow_internet: bool = False, clipboard: bool = False, profile_overrides: dict[str, dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+        profile_overrides = profile_overrides or {}
         profile_ids = list(dict.fromkeys(PROFILE_ALIASES.get(profile_id, profile_id) for profile_id in profile_ids))
         if clipboard and (headless or "kali-arm64" not in profile_ids):
             raise CTFLabError("--clipboard 需要启动 Kali 图形窗口。")
@@ -1470,7 +1521,7 @@ class LabManager:
             if old and bool_pid_alive(int(old.get("pid", 0))):
                 started.append(old)
                 continue
-            profile = load_profile(profile_id)
+            profile = profile_overrides.get(profile_id) or load_profile(profile_id)
             overlay = self.ensure_overlay(profile_id)
             command, host_forwards = self.qemu_command(profile_id, profile, overlay, lab_port, headless, allow_internet=allow_internet, clipboard=clipboard and profile_id == "kali-arm64")
             log_path = self.logs_dir / f"{profile_id}.log"
@@ -1506,6 +1557,11 @@ class LabManager:
                 "host_forwards": host_forwards,
                 "pcap_path": network_state.get("pcap_path"),
                 "started_at": now_iso(),
+                "boot_override": {k: v for k, v in {
+                    "firmware": profile.get("guest", {}).get("firmware"),
+                    "bus": profile.get("disk", {}).get("bus"),
+                    "controller": profile.get("disk", {}).get("controller"),
+                }.items() if v} if profile_id in profile_overrides else None,
                 "headless": headless,
                 "internet_enabled": allow_internet,
                 "clipboard_enabled": clipboard and profile_id == "kali-arm64",
@@ -1522,6 +1578,7 @@ class LabManager:
     def _stop_unlocked(self, profile_ids: list[str], stop_all: bool = False, graceful: bool = False) -> list[str]:
         targets = available_profiles() if stop_all else [PROFILE_ALIASES.get(profile_id, profile_id) for profile_id in profile_ids]
         stopped: list[str] = []
+        preserved: list[str] = []
         stopped_ports: set[int] = set()
         for profile_id in targets:
             state = self.runtime_state(profile_id)
@@ -1541,11 +1598,9 @@ class LabManager:
                 while bool_pid_alive(pid) and time.monotonic() < deadline:
                     time.sleep(0.25)
                 if graceful and bool_pid_alive(pid):
-                    raise CTFLabError(
-                        f"{profile_id} 未完成正常关机；已保留进程、磁盘和网络。"
-                        "若来宾图形会话弹出了关机确认框，请在 QEMU 窗口中确认，或先在来宾里正常关机；"
-                        "确认来宾已经关机后可用 stop（不带 --graceful）结束进程并清理状态。"
-                    )
+                    # 只保留这个实例，继续处理其余 profile；全部处理完后再统一报错。
+                    preserved.append(profile_id)
+                    continue
                 if bool_pid_alive(pid):
                     # 某些旧靶机没有响应 ACPI 关机，优先通过 QMP quit 结束 QEMU，
                     # 再退回 SIGTERM/SIGKILL，避免 stop 命令长时间悬挂。
@@ -1579,6 +1634,13 @@ class LabManager:
             for port in sorted(stopped_ports | set(self.network_ports())):
                 if port > 0:
                     self.stop_network(port)
+        if preserved:
+            raise CTFLabError(
+                "以下实例未完成正常关机，已保留进程、磁盘和网络："
+                + "、".join(preserved)
+                + "。若来宾图形会话弹出了关机确认框，请在 QEMU 窗口中确认，或先在来宾里正常关机；"
+                "确认来宾已经关机后可用 stop（不带 --graceful）结束进程并清理状态。"
+            )
         return stopped
 
     def network_ports(self) -> list[int]:
@@ -1686,19 +1748,24 @@ class LabManager:
                     results.append({"name": f"ssh:{guest_port}", "ok": ok, "detail": detail})
         return results
 
-    def probe(self, profile_id: str, *, timeout_seconds: int | None = None, keep_running: bool = False) -> dict[str, Any]:
+    def probe(self, profile_id: str, *, timeout_seconds: int | None = None, keep_running: bool = False,
+              profile_overrides: dict[str, dict[str, Any]] | None = None,
+              abort_on_failure_screen: bool = False) -> dict[str, Any]:
         """启动候选配置并收集 QMP、显示、DHCP 与协议证据。
 
         显示活动只说明画面不是全黑，不能自动区分登录界面、内核报错和 UEFI Shell。
-        因此候选配置始终保留人工复核标记。
+        因此候选配置始终保留人工复核标记。``profile_overrides`` 用于受控回退矩阵：
+        不写盘、只影响本次启动的固件/磁盘参数；``abort_on_failure_screen`` 在识别到
+        UEFI Shell、无启动盘或内核错误时提前结束本次探测，交给矩阵尝试下一个候选。
         """
         profile_id = PROFILE_ALIASES.get(profile_id, profile_id)
-        profile = load_profile(profile_id)
+        overrides = profile_overrides or {}
+        profile = overrides.get(profile_id) or load_profile(profile_id)
         existing = self.runtime_state(profile_id)
         already_running = bool(existing and bool_pid_alive(int(existing.get("pid", 0))))
         started_by_probe = not already_running
         if started_by_probe:
-            self.run([profile_id], headless=True)
+            self.run([profile_id], headless=True, profile_overrides=overrides)
         state = self.runtime_state(profile_id)
         if not state:
             raise CTFLabError(f"无法获得 {profile_id} 的运行状态。")
@@ -1722,6 +1789,17 @@ class LabManager:
         health: list[dict[str, Any]] = []
         qmp_status: Any = None
         errors: list[str] = []
+        screen: dict[str, Any] = {
+            "available": False,
+            "engine": None,
+            "classification": "unknown",
+            "confidence": "low",
+            "matched_signals": [],
+            "all_signals": {},
+            "warnings": ["没有可供 OCR 的截图"],
+            "text": "",
+        }
+        early_failure: str | None = None
         try:
             while time.monotonic() < deadline:
                 current = self.runtime_state(profile_id)
@@ -1743,6 +1821,12 @@ class LabManager:
                 )
                 if (expected_protocols and protocol_ready) or (not expected_protocols and network_ready and display.get("active")):
                     break
+                if abort_on_failure_screen and display.get("active") and ppm_path.exists():
+                    # 矩阵探测：识别到 UEFI Shell/无启动盘/内核错误就提前结束，尝试下一个候选。
+                    screen = classify_screenshot(ppm_path)
+                    if screen.get("classification") in SCREEN_FAILURE_CLASSES:
+                        early_failure = str(screen.get("classification"))
+                        break
                 time.sleep(2)
 
             process_running = bool_pid_alive(int((self.runtime_state(profile_id) or {}).get("pid", 0)))
@@ -1804,6 +1888,7 @@ class LabManager:
                 "qmp_status": qmp_status,
                 "process_running_at_verdict": process_running,
                 "display": display,
+                "early_failure": early_failure,
                 "screenshot_path": screenshot_path,
                 "screen": screen,
                 "health": health,
@@ -1827,26 +1912,124 @@ class LabManager:
                 self.stop([profile_id])
 
 
+    def boot_matrix(self, profile_id: str, *, per_candidate_timeout: int = 90,
+                    max_candidates: int | None = None, start_at: int = 1) -> dict[str, Any]:
+        """受控启动回退矩阵：按白名单顺序尝试固件/磁盘组合，用画面分类决定是否继续。
+
+        候选只作用于本次启动（不写入 profile）；识别到 UEFI Shell、无启动盘或内核错误
+        就立即换下一个候选，命中协议级就绪或登录界面即停止。
+        """
+        profile_id = PROFILE_ALIASES.get(profile_id, profile_id)
+        base = load_profile(profile_id)
+        architecture = str(base.get("guest", {}).get("architecture", "x86_64"))
+        candidates = list(matrix_candidates(architecture))
+        if max_candidates is not None:
+            candidates = candidates[: max(1, max_candidates)]
+        start_at = max(1, int(start_at))
+        candidates = candidates[max(0, start_at - 1):]
+        timeout = max(5, min(int(per_candidate_timeout), 1800))
+        attempts: list[dict[str, Any]] = []
+        selected: dict[str, Any] | None = None
+        for index, candidate in enumerate(candidates, 1):
+            override = copy.deepcopy(base)
+            override.setdefault("guest", {})["firmware"] = candidate["firmware"]
+            override.setdefault("disk", {})["bus"] = candidate["bus"]
+            if candidate.get("controller"):
+                override["disk"]["controller"] = candidate["controller"]
+            else:
+                override["disk"].pop("controller", None)
+            print(f"[{index}/{len(candidates)}] 尝试 {candidate_label(candidate)}（超时 {timeout}s）")
+            try:
+                report = self.probe(
+                    profile_id,
+                    timeout_seconds=timeout,
+                    profile_overrides={profile_id: override},
+                    abort_on_failure_screen=True,
+                )
+            except CTFLabError as exc:
+                attempts.append({"candidate": candidate, "label": candidate_label(candidate),
+                                 "error": str(exc)})
+                print(f"    无法启动：{exc}")
+                continue
+            screen = report.get("screen", {})
+            verdict = str(report.get("verdict"))
+            classification = str(screen.get("classification", "unknown"))
+            success = verdict in BOOT_MATRIX_SUCCESS_VERDICTS or classification in BOOT_MATRIX_SUCCESS_SCREENS
+            attempt = {
+                "candidate": candidate,
+                "label": candidate_label(candidate),
+                "verdict": verdict,
+                "screen": classification,
+                "confidence": screen.get("confidence"),
+                "early_failure": report.get("early_failure"),
+                "screenshot_path": report.get("screenshot_path"),
+                "report_path": report.get("report_path"),
+            }
+            attempts.append(attempt)
+            print(f"    结论：{verdict}（画面 {classification}/{screen.get('confidence', 'low')}）")
+            if success:
+                selected = attempt
+                break
+        result = {
+            "schema": 1,
+            "profile_id": profile_id,
+            "architecture": architecture,
+            "timeout_per_candidate": timeout,
+            "attempts": attempts,
+            "selected": selected,
+            "succeeded": selected is not None,
+            "note": "候选只作用于本次启动，不会写入 profile；命中结果需要人工复核截图后才能标记为已验证交付。",
+        }
+        report_root = self.logs_dir / "probes"
+        report_root.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        matrix_path = report_root / f"{profile_id}-matrix-{stamp}.json"
+        write_json(matrix_path, result)
+        result["report_path"] = str(matrix_path)
+        return result
+
+
 def cmd_doctor(manager: LabManager, _args: argparse.Namespace) -> int:
+    """检查运行依赖；每项缺失都给出可操作的安装提示，必选项缺失时返回 1。"""
     checks = [
-        ("宿主系统", f"{platform.system()} {platform.machine()}" if platform.system() == "Darwin" and platform.machine() in {"arm64", "aarch64"} else None, True),
-        ("python", sys.executable, True),
-        ("qemu-img", shutil.which("qemu-img"), True),
-        ("qemu-system-x86_64", which_any(QEMU_X86_NAMES), True),
-        ("qemu-system-aarch64", which_any(QEMU_ARM_NAMES), True),
-        ("utmctl", shutil.which("utmctl"), True),
-        ("PyYAML", "available" if yaml is not None else None, True),
-        ("ARM64 UEFI", str(find_firmware("edk2-aarch64-code.fd")) if find_firmware("edk2-aarch64-code.fd") else None, True),
-        ("ARM64 UEFI NVRAM", str(find_firmware("edk2-arm-vars.fd")) if find_firmware("edk2-arm-vars.fd") else None, True),
-        ("bsdtar", shutil.which("bsdtar") or shutil.which("tar"), True),
-        ("cpio", shutil.which("cpio"), True),
-        ("Tesseract OCR", shutil.which("tesseract"), False),
+        (
+            "宿主系统",
+            f"{platform.system()} {platform.machine()}" if platform.system() == "Darwin" and platform.machine() in {"arm64", "aarch64"} else None,
+            True,
+            "需要 macOS Apple Silicon（Darwin arm64）",
+        ),
+        ("python", sys.executable, True, "需要 Python 3.10+；推荐使用自带 PyYAML 的解释器"),
+        ("qemu-img", shutil.which("qemu-img"), True, "请安装 QEMU：brew install qemu"),
+        ("qemu-system-x86_64", which_any(QEMU_X86_NAMES), True, "请安装 QEMU：brew install qemu"),
+        ("qemu-system-aarch64", which_any(QEMU_ARM_NAMES), True, "请安装 QEMU：brew install qemu"),
+        (
+            "utmctl",
+            shutil.which("utmctl"),
+            False,
+            "可选：仅 UTM 镜像适配流程使用，运行器本身不依赖 UTM",
+        ),
+        (
+            "PyYAML",
+            "available" if yaml is not None else None,
+            True,
+            "缺少 PyYAML 时无法读写配置：python3 -m pip install pyyaml，或改用自带 PyYAML 的 Python",
+        ),
+        ("ARM64 UEFI", str(find_firmware("edk2-aarch64-code.fd")) if find_firmware("edk2-aarch64-code.fd") else None, True, "Homebrew QEMU 应自带 edk2-aarch64-code.fd"),
+        ("ARM64 UEFI NVRAM", str(find_firmware("edk2-arm-vars.fd")) if find_firmware("edk2-arm-vars.fd") else None, True, "Homebrew QEMU 应自带 edk2-arm-vars.fd"),
+        ("bsdtar", shutil.which("bsdtar") or shutil.which("tar"), True, "macOS 自带 bsdtar；缺失时请安装 libarchive"),
+        ("cpio", shutil.which("cpio"), True, "macOS 自带 cpio；缺失时请安装"),
+        (
+            "Tesseract OCR",
+            shutil.which("tesseract"),
+            False,
+            "可选：brew install tesseract；未安装时截图分类降级为人工复核",
+        ),
     ]
     failed = False
-    for name, value, required in checks:
+    for name, value, required, hint in checks:
         ok = bool(value)
         marker = "OK  " if ok else "MISS" if required else "OPT "
-        print(f"{marker} {name}: {value or '未找到（可选，截图将保留人工复核）'}")
+        print(f"{marker} {name}: {value if ok else hint}")
         failed |= required and not ok
     print(f"状态目录：{manager.state_dir}")
     return 1 if failed else 0
@@ -2091,6 +2274,27 @@ def cmd_health(manager: LabManager, args: argparse.Namespace) -> int:
 
 
 def cmd_probe(manager: LabManager, args: argparse.Namespace) -> int:
+    if args.matrix:
+        result = manager.boot_matrix(
+            args.profile,
+            per_candidate_timeout=args.matrix_timeout,
+            max_candidates=args.matrix_max,
+            start_at=args.matrix_start,
+        )
+        for attempt in result["attempts"]:
+            if attempt.get("error"):
+                print(f"  {attempt['label']}: 启动失败（{attempt['error']}）")
+            else:
+                print(f"  {attempt['label']}: {attempt['verdict']}（画面 {attempt['screen']}）")
+        if result["succeeded"]:
+            selected = result["selected"]
+            print(f"矩阵结论：{selected['label']} 可以启动（{selected['verdict']}）；"
+                  f"请人工查看截图后再修改 profile。")
+            print(f"矩阵报告：{result['report_path']}")
+            return 0
+        print("矩阵结论：所有白名单候选都没有识别到可用启动画面；请人工检查截图与日志。")
+        print(f"矩阵报告：{result['report_path']}")
+        return 1
     report = manager.probe(args.profile, timeout_seconds=args.timeout, keep_running=args.keep_running)
     print(f"探测结论：{report['verdict']}")
     display = report.get("display", {})
@@ -2195,6 +2399,10 @@ def build_parser() -> argparse.ArgumentParser:
     probe_parser.add_argument("profile", choices=profile_choices)
     probe_parser.add_argument("--timeout", type=int, help="探测超时秒数，默认使用配置 readiness 超时")
     probe_parser.add_argument("--keep-running", action="store_true", help="探测结束后保留本次启动的虚拟机")
+    probe_parser.add_argument("--matrix", action="store_true", help="受控启动回退矩阵：按白名单尝试 BIOS/UEFI × IDE/SATA/SCSI/VirtIO")
+    probe_parser.add_argument("--matrix-timeout", type=int, default=90, help="矩阵中每个候选的探测秒数，默认 90")
+    probe_parser.add_argument("--matrix-max", type=int, help="只尝试前 N 个候选（用于快速排查）")
+    probe_parser.add_argument("--matrix-start", type=int, default=1, help="跳过前 N-1 个候选，从第 N 个开始（用于验证回退路径与定位）")
     return parser
 
 

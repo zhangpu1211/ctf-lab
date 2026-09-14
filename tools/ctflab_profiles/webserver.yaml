@@ -1,0 +1,46 @@
+schema: 1
+id: webserver
+name: Webserver
+version: 0.1.0-candidate
+guest:
+  architecture: x86_64
+  firmware: uefi
+  machine: pc
+  memory_mb: 4096
+  cpus: 2
+disk:
+  format: qcow2
+  bus: scsi
+  controller: lsi53c895a
+network:
+  adapter: e1000
+  mac: 52:54:00:95:d8:e7
+  lab_ip: 192.168.242.30
+  segment: lab
+  internet: false
+  host_forwards: []
+readiness:
+  timeout_seconds: 180
+  checks:
+  - dhcp
+detection:
+  status: candidate
+  source_sha256: ee30335cfcd9712e4eaaa304010f420d87776d6e91910fff9b34fe9006ee577c
+  confidence:
+    architecture:
+      level: low
+      reason: 磁盘本身通常不记录客体 CPU 架构，按传统靶机常见的 x86_64 生成候选
+    firmware:
+      level: medium
+      reason: 发现 GPT，但未确认 EFI System Partition
+    disk:
+      level: high
+      reason: VMDK 描述符声明 adapterType=lsilogic
+    network:
+      level: high
+      reason: OVF 声明 E1000 网卡
+  warnings:
+  - 客体架构无法从磁盘可靠判定；启动前应通过来源说明确认，必要时使用 --architecture 覆盖。
+  - 尚未进行冷启动、登录、网络和目标服务验证；该报告不能作为可用性交付结论。
+  boot_verified: false
+  service_verified: false
