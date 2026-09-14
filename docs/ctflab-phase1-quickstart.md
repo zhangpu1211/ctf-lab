@@ -67,7 +67,7 @@ unset CTFLAB_INSTALL_PASSWORD
 
 `--from-runtime` 展平当前 overlay 为新只读基盘，归档原运行目录并保留旧基盘；这样后续 `reset` 不会丢失已固化的软件。务必先正常关机，不能把强制停止等同于文件系统已干净卸载。归档会额外占用磁盘空间。
 
-图形界面由 QEMU 独立窗口提供，`--headless` 不打开窗口。已验证 1920×1080 手动分辨率、键鼠和 XFCE；剪贴板、动态分辨率、关闭窗口行为与 3D 加速仍未完整验收，不能承诺与商业虚拟机相同体验。Ghidra 当前发行包首次帮助页有 `view is invalid` 异常，项目窗口可显示，逆向工作流尚未验收。
+图形界面由 QEMU 独立窗口提供，`--headless` 不打开窗口。已验证 1920×1080 手动分辨率、键鼠和 XFCE、文本剪贴板双向复制、窗口关闭/停止策略，以及 Ghidra 项目/导入/反编译工作流；动态分辨率受当前 QEMU 后端的限制（窗口只做缩放），3D 加速未验收，不能承诺与商业虚拟机相同体验。详见[2026-09-13 图形体验验证](verification-2026-09-13.md)。
 
 ### 2.1 接收新的未知镜像
 
@@ -146,15 +146,22 @@ Basic Pentesting 2 会等待原镜像中一个失效磁盘 UUID 的 90 秒启动
 
 ## 4. 停止、重置和排错
 
-桌面使用建议先保存工作，再执行 `./tools/ctflab stop kali-arm64 --graceful`。该模式只发正常关机请求，等待最多 30 秒；若来宾未退出则报错并保留运行实例，不发强制退出或进程终止信号。不带该选项的 `stop` 保持旧行为，短暂等待后可能强制退出。
+桌面使用建议先保存工作，再执行 `./tools/ctflab stop kali-arm64 --graceful`。该模式只发正常关机请求（ACPI 电源键），等待最多 30 秒；若来宾未退出则报错并保留运行实例，不发强制退出或进程终止信号。不带该选项的 `stop` 保持旧行为，短暂等待后可能强制退出。
 
-不要把 Cocoa 窗口红色关闭按钮当作“隐藏到后台”或来宾正常关机。QEMU Cocoa 的关闭路径会请求退出整个 QEMU，不能代替来宾保存工作和关机。后台使用应从一开始选择 `--headless`；可配置的窗口关闭策略尚未实现。
+Kali 图形会话处于活动状态时，ACPI 电源键会打开来宾自己的关机确认框；用户未确认时来宾不会关机，`--graceful` 因此会超时并保留实例。此时可在 QEMU 窗口中确认关机，或先在来宾里正常关机，再执行不带 `--graceful` 的 `stop` 结束进程并清理状态。
+
+不要用 Cocoa 窗口红色关闭按钮代替来宾关机：关闭窗口会先弹 “Are you sure you want to quit QEMU?” 确认框，确认后 QEMU 发送 ACPI 电源键，但仍需要来宾确认并在来宾退出后才会结束；窗口关闭后无法重新显示同一实例。后台使用应从一开始选择 `--headless`。
 
 ### 图形体验增量（2026-09-13）
 
-`run` 的 Cocoa 窗口默认启用 `zoom-to-fit`，将画面适配窗口大小；这不是来宾自动改变分辨率。可显式使用 `run kali-arm64 --clipboard` 接通 Mac 与 Kali 的文本剪贴板，依赖来宾 `spice-vdagent` 与已登录的图形会话。默认关闭，仅对 Kali 生效，不为靶机创建剪贴板通道，不能与 `--headless` 同用；切换需先停止再启动。
+`run` 的 Cocoa 窗口默认启用 `zoom-to-fit`，把画面缩放到窗口大小；这是缩放，不是来宾改变分辨率。当前 QEMU 11.1 + cocoa + virtio-gpu 没有让来宾分辨率跟随窗口的通道（QMP `display-update` 已不接受 EDID，vdagent 只支持剪贴板和鼠标）。需要在来宾内用 XFCE 显示设置或 `xrandr` 选择分辨率，窗口会按比例缩放。
 
-共享剪贴板会让 Kali 读取复制的文本，请勿在开启期间复制个人密码或其他敏感内容。当前已验证参数启动、来宾通道识别、图形登录及代理自动激活，双向复制粘贴仍需验收。窗口关闭策略、真正动态分辨率以及 Ghidra 帮助功能继续待办。
+文本剪贴板用 `run kali-arm64 --clipboard` 显式开启：默认关闭，仅对 Kali 图形模式生效，不为靶机创建通道；需要来宾已登录图形会话（`spice-vdagent` 是会话级进程），不能与 `--headless` 同用，切换需先停止再启动。已验收英文、中文和多行文本的双向复制粘贴（内容逐字节一致）、关闭通道后不共享、重启后仍可用。开启期间 Kali 能读到复制的文本，请勿复制个人密码或其他敏感内容。
+
+Ghidra 的帮助异常（JavaHelp `view is invalid`）来自 Kali `ghidra` 发行包缺少搜索索引：可用
+`sudo python3 tools/guest_fixes/kali-arm64/ghidra_help_fix.py` 修复（用 Ghidra 自带索引器生成搜索索引并补齐 Search 视图；先在临时文件里构建完整 JAR 再原子替换，中途失败不会留下半修复的 JAR；脚本可重复执行，原始 helpset 备份在 `/var/tmp/ctflab-ghidra-backup/`）。修复写在运行 overlay 中，`reset kali-arm64` 会丢弃；需要固化时先正常关机，再执行 `./tools/ctflab finalize-install kali-arm64 --from-runtime --confirm`。
+
+`status` 会报告“进程已退出但状态文件残留”的实例和没有实例的残留实验网；`stop --all` 会一并清理。
 
 ```bash
 ./tools/ctflab stop --all

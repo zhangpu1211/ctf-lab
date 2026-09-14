@@ -53,6 +53,7 @@ python3 -m py_compile tools/ctflab.py tools/ctflab_inspect.py tools/ctflab_netwo
 - [完整实施计划与路线图](docs/ctflab-mac-mvp-implementation-plan.md)
 - [2026-09-06 Mac M 回归验证](docs/verification-2026-09-06.md)
 - [2026-09-07 Kali 安装、图形与互通验证](docs/verification-2026-09-07.md)
+- [2026-09-13 Kali 图形体验验证（剪贴板、分辨率、关闭策略、Ghidra 帮助）](docs/verification-2026-09-13.md)
 
 ## 安全边界
 

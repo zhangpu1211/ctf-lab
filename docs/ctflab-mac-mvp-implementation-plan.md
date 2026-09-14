@@ -31,15 +31,15 @@ Phase 0 的成功标准不是“成功转成 qcow2”，而是“在当前 Mac M
 - 隔离实验网络、固定地址、健康检查、停止与重置；
 - Mac 主机与 Kali 对靶机的访问能力。
 
-第一阶段的主要体验如下：
+第一阶段的主要体验如下（命令与当前 CLI 一致；`.ctflab` 内容包是 Task 6 的交付物，打包完成前先按原始镜像路径导入）：
 
 ```bash
-ctflab import smoke-1.0.0.ctflab
-ctflab import basic-pentesting-2-1.0.0.ctflab
-ctflab run kali smoke basic-pentesting-2
-ctflab status
-ctflab reset smoke
-ctflab stop --all
+./tools/ctflab import smoke /path/to/smoke.qcow2
+./tools/ctflab import basic-pentesting-2 /path/to/basic_pentesting_2-disk001.vmdk
+./tools/ctflab run kali-arm64 smoke basic-pentesting-2
+./tools/ctflab status
+./tools/ctflab reset smoke
+./tools/ctflab stop --all
 ```
 
 运行后，Kali 必须出现可交互的图形桌面。用户能够在 Kali 的 Firefox、Burp Suite、Wireshark、Nmap、Metasploit、Ghidra 等图形或终端工具中操作靶机。
@@ -361,11 +361,14 @@ qemu-img create -f qcow2 -F qcow2 \
 - [x] 支持从用户提供的 Kali ARM64 ISO 自动安装，记录源哈希；发行方签名仍需独立核验。
 - [x] 配置 HVF、VirtIO 磁盘、双网卡、显示设备及独立可写 UEFI NVRAM。
 - [x] 验证 XFCE 登录、键盘、鼠标、1920×1080 手动显示及 Firefox/Burp/Wireshark 主界面。
-- [ ] 验证 XFCE 登录、窗口缩放、键盘、鼠标和至少 1920×1080 显示。
-- [ ] 安装/验证 guest agent 的文本剪贴板与动态分辨率。
-- [ ] 实现 `--headless` 和显示窗口关闭后的行为选择。
+- [x] 验证 XFCE 登录、窗口缩放、键盘、鼠标和至少 1920×1080 显示。
+- [x] 安装/验证 guest agent 的文本剪贴板：Mac↔Kali 双向（英文/中文/多行）、关闭通道不共享、重启后可用。
+- [ ] 动态分辨率：QEMU 11.1 + cocoa + virtio-gpu 没有让来宾分辨率跟随窗口的通道，限制与替代方案见 2026-09-13 验证记录。
+- [x] 明确显示窗口关闭策略：确认框 + ACPI 电源键，来宾确认后正常关机；不提供隐藏后台（需要后台请用 `--headless`）。
 
 2026-09-07：`--headless` 已实现，窗口关闭策略、动态缩放和剪贴板仍未验收。新增 `install/install-status/stop-install/finalize-install`，以及只允许 Kali 独占运行的 `--internet` 维护模式；`--from-runtime` 可保留旧盘并固化维护成果。独立重装实例已验证无需手工修复即可 DHCP/SSH 登录。Ghidra 已安装并出现项目窗口，但首次帮助页报错，不能列为完整工具验收通过。
+
+2026-09-13：剪贴板通过双向验收；窗口关闭/停止策略实测（图形会话下 ACPI 会先打开来宾确认框，未确认时 `stop --graceful` 超时保留实例，确认后来宾关机、QEMU 退出、CLI 清理状态与残留网络）。动态分辨率确认后端不支持，未冒充完成。Ghidra 帮助异常已定位为 Kali `+ds` 发行包缺少 JavaHelp 搜索索引，新增 `tools/guest_fixes/kali-arm64/ghidra_help_fix.py` 生成索引并补齐 Search 视图；连续两次启动无异常，项目/导入/反编译与帮助窗口通过。详见 `docs/verification-2026-09-13.md`。
 
 **验收：** Kali 能稳定运行 Firefox、Burp Suite、Wireshark 和终端；图形窗口无持续高 CPU 占用或明显输入延迟。
 

@@ -422,6 +422,11 @@ def qmp_command(qmp_path: Path, execute: str, arguments: dict[str, Any] | None =
     qmp_execute(qmp_path, execute, arguments)
 
 
+# stop 等待来宾关机的秒数：--graceful 超时后保留实例，普通 stop 超时后强制结束 QEMU。
+GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS = 30
+FORCED_SHUTDOWN_TIMEOUT_SECONDS = 3
+
+
 def ppm_display_activity(path: Path) -> dict[str, Any]:
     """从 QEMU PPM 截图计算显示活动；只证明画面非全黑，不等价于登录成功。"""
     try:
@@ -1532,11 +1537,15 @@ class LabManager:
                         qmp_command(qmp_path, "system_powerdown")
                 except (OSError, CTFLabError):
                     pass
-                deadline = time.monotonic() + (30 if graceful else 3)
+                deadline = time.monotonic() + (GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS if graceful else FORCED_SHUTDOWN_TIMEOUT_SECONDS)
                 while bool_pid_alive(pid) and time.monotonic() < deadline:
                     time.sleep(0.25)
                 if graceful and bool_pid_alive(pid):
-                    raise CTFLabError(f"{profile_id} 未完成正常关机；已保留进程、磁盘和网络。请在来宾中保存工作并关机，再重试。")
+                    raise CTFLabError(
+                        f"{profile_id} 未完成正常关机；已保留进程、磁盘和网络。"
+                        "若来宾图形会话弹出了关机确认框，请在 QEMU 窗口中确认，或先在来宾里正常关机；"
+                        "确认来宾已经关机后可用 stop（不带 --graceful）结束进程并清理状态。"
+                    )
                 if bool_pid_alive(pid):
                     # 某些旧靶机没有响应 ACPI 关机，优先通过 QMP quit 结束 QEMU，
                     # 再退回 SIGTERM/SIGKILL，避免 stop 命令长时间悬挂。
@@ -1565,9 +1574,30 @@ class LabManager:
             stopped.append(profile_id)
         remaining = self.running_states()
         if not remaining:
-            for port in stopped_ports:
-                self.stop_network(port)
+            # 没有实例存活时一并清理所有实验网状态文件，包括实例状态已被删除、
+            # 但交换机仍在运行的残留端口。
+            for port in sorted(stopped_ports | set(self.network_ports())):
+                if port > 0:
+                    self.stop_network(port)
         return stopped
+
+    def network_ports(self) -> list[int]:
+        """列出运行目录中登记过的实验网端口（含无实例的残留交换机）。"""
+        ports: list[int] = []
+        for path in sorted(self.runtime_dir.glob("network-*.json")):
+            suffix = path.stem.split("-", 1)[1]
+            if suffix.isdigit():
+                ports.append(int(suffix))
+        return ports
+
+    def stale_runtime_states(self) -> list[tuple[str, int]]:
+        """返回状态文件仍在、但 QEMU 进程已经退出的实例。"""
+        stale: list[tuple[str, int]] = []
+        for profile_id in available_profiles():
+            state = self.runtime_state(profile_id)
+            if state and not bool_pid_alive(int(state.get("pid", 0))):
+                stale.append((profile_id, int(state.get("pid", 0))))
+        return stale
 
     def reset(self, profile_id: str, force: bool = False) -> None:
         with self.operation_lock(f"重置 {profile_id}"):
@@ -1995,10 +2025,12 @@ def cmd_run(manager: LabManager, args: argparse.Namespace) -> int:
 def cmd_status(manager: LabManager, _args: argparse.Namespace) -> int:
     running = {state["profile_id"]: state for state in manager.running_states()}
     shown_networks: set[int] = set()
+    printed = False
     for profile_id in available_profiles():
         state = running.get(profile_id)
         if not state:
             continue
+        printed = True
         print(f"{profile_id}: running PID={state['pid']} lab=tcp://127.0.0.1:{state['lab_port']} log={state['log_path']}")
         if state.get("internet_enabled"):
             print("  网络：Kali 联网维护模式")
@@ -2019,7 +2051,19 @@ def cmd_status(manager: LabManager, _args: argparse.Namespace) -> int:
             )
             if network.get("pcap_path"):
                 print(f"  PCAP：{network['pcap_path']}")
-    if not running:
+    for profile_id, pid in manager.stale_runtime_states():
+        printed = True
+        print(f"{profile_id}: 进程已退出（原 PID {pid}），状态文件待清理；可执行 stop --all。")
+    for port in manager.network_ports():
+        if port in shown_networks:
+            continue
+        printed = True
+        network = manager.network_state(port) or {}
+        if bool_pid_alive(int(network.get("pid", 0))):
+            print(f"残留实验网：lab=tcp://127.0.0.1:{port}（无运行实例），可执行 stop --all。")
+        else:
+            print(f"实验网状态文件残留：port {port}（进程已退出），可执行 stop --all。")
+    if not printed:
         print("没有正在运行的 CTFLab 实例。")
     return 0
 
