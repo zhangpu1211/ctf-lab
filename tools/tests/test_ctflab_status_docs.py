@@ -39,6 +39,7 @@ VERIFICATION = PROJECT_ROOT / "docs" / "verification-2026-09-14.md"
 DESIGN = PROJECT_ROOT / "docs" / "ctflab-dynamic-resolution-design.md"
 SMOKE_RECORD = PROJECT_ROOT / "docs" / "verification-utm-smoke-2026-09-14.md"
 BASIC_RECORD = PROJECT_ROOT / "docs" / "verification-utm-basic-pentesting-2-2026-09-14.md"
+PACKAGING_DESIGN = PROJECT_ROOT / "docs" / "ctflab-task6-packaging-design.md"
 ROOT_README = PROJECT_ROOT / "README.md"
 STATUS_LABELS = ("已验证", "部分验证", "未验证", "后续任务")
 
@@ -219,10 +220,11 @@ class VerificationRecordTests(unittest.TestCase):
         # 不钉死细分数字（测试集会增长），但必须带复核日期与当前总数，陈旧计数不得残留
         self.assertIn("本次完整回归", self.text)
         self.assertIn("2026-09-15 复核", self.text)
-        self.assertIn("205 项通过", self.text)
-        self.assertIn("48 项验收状态与设计边界守卫测试", self.text)
+        self.assertIn("245 项通过", self.text)
+        self.assertIn("51 项验收状态与设计边界守卫测试", self.text)
         self.assertIn("82 项路径 A `utm-export` 单元测试", self.text)
-        for stale in ("66 项通过", "当前完整回归", "174 项通过", "161 项通过", "202 项", "95 项"):
+        self.assertIn("37 项 Task 6.1 打包测试", self.text)
+        for stale in ("66 项通过", "当前完整回归", "174 项通过", "161 项通过", "202 项", "205 项", "235 项", "242 项", "243 项", "244 项", "48 项", "95 项"):
             self.assertNotIn(stale, self.text)
 
     def test_matrix_wording_avoids_adapted_claim(self) -> None:
@@ -599,6 +601,37 @@ class DeliveryConsistencyTests(unittest.TestCase):
             self.assertIn(manifest["utm_disk"]["sha256_after_e2e"], readme, slug)
             self.assertIn("SHA256SUMS.at-export", readme, slug)
             self.assertIn("不能对 E2E 后可写盘执行校验", readme, slug)
+
+
+class Task61PackagingDocsTests(unittest.TestCase):
+    """Task 6.1 打包设计：范围与边界必须写清，且不得宣称未交付的能力。"""
+
+    def setUp(self) -> None:
+        self.text = PACKAGING_DESIGN.read_text(encoding="utf-8")
+
+    def test_design_states_scope_limits(self) -> None:
+        flat = normalized(self.text)
+        self.assertIn("不包含", flat)
+        self.assertIn("CTFLab.app", flat)
+        self.assertIn("不含虚拟磁盘", flat)
+        self.assertIn("不构成 Task 6", flat)
+        self.assertIn("undeclared", flat)
+        self.assertIn("干净 Mac 用户验收脚本", flat)
+
+    def test_design_does_not_claim_undelivered_capabilities(self) -> None:
+        """提及未交付能力时句子必须带否定/限定措辞，不得出现正面宣称。"""
+        for phrase in ("签名已完成", "公证已完成", "完整安装已验证", "已内置 QEMU 运行时",
+                       "完整 Path A", "动态分辨率已支持"):
+            for sentence in sentences(self.text):
+                if phrase in sentence:
+                    self.assertTrue(
+                        any(marker in sentence for marker in NEGATION_MARKERS),
+                        f"设计文档出现未加限定的宣称“{phrase}”：{sentence[:90]}")
+
+    def test_design_keeps_dynamic_resolution_scope_untouched(self) -> None:
+        flat = normalized(self.text)
+        self.assertIn("不改变默认 QEMU 命令", flat)
+        self.assertIn("run/stop/reset", flat)
 
 
 if __name__ == "__main__":

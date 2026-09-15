@@ -15,6 +15,8 @@
 !/docs/verification-2026-09-14.md
 !/docs/verification-utm-smoke-2026-09-14.md
 !/docs/verification-utm-basic-pentesting-2-2026-09-14.md
+!/docs/ctflab-task6-packaging-design.md
+!/docs/verification-task6-1-2026-09-15.md
 
 /tools/*
 !/tools/ctflab
@@ -22,6 +24,8 @@
 !/tools/ctflab_inspect.py
 !/tools/ctflab_network.py
 !/tools/ctflab_utm.py
+!/tools/ctflab_package.py
+!/tools/ctflab_acceptance.py
 !/tools/ctflab_utm_fixture.json
 !/tools/ctflab_profiles/
 !/tools/guest_fixes/
@@ -54,6 +58,9 @@
 *.img
 *.ova
 *.utm/
+*.ctflab
+*.tar.gz
+dist/
 *.pyc
 __pycache__/
 .DS_Store

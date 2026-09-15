@@ -207,8 +207,8 @@ class DocumentedCommandTests(unittest.TestCase):
                                  self.global_options)
         self.assertIn("不支持的选项 --nonsense", problems)
 
-    def test_ctflab_packages_are_marked_as_future_work(self) -> None:
-        """.ctflab 内容包是后续交付物，不能出现在可执行示例里。"""
+    def test_ctflab_package_examples_do_not_replace_source_import(self) -> None:
+        """内容包已可校验，但在实施计划的原始镜像示例中不能被误写成 import 源文件。"""
         plan = (PROJECT_ROOT / "docs" / "ctflab-mac-mvp-implementation-plan.md").read_text(encoding="utf-8")
         self.assertNotIn("ctflab import smoke-1.0.0.ctflab", plan)
         self.assertNotIn("ctflab import basic-pentesting-2-1.0.0.ctflab", plan)

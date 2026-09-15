@@ -44,6 +44,8 @@ except ImportError:  # pragma: no cover - 在不含 PyYAML 的分发环境中给
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 PROFILE_DIR = PROJECT_ROOT / "tools" / "ctflab_profiles"
 DEFAULT_STATE_DIR = Path.home() / "Library" / "Application Support" / "CTFLab"
+# 版本是打包（Task 6.1）、内容包版本门禁与 SBOM 的单一来源。
+CTFLAB_VERSION = "0.1.0"
 QEMU_X86_NAMES = ("qemu-system-x86_64",)
 QEMU_ARM_NAMES = ("qemu-system-aarch64",)
 PROFILE_ALIASES = {"kali": "kali-arm64"}
@@ -2241,6 +2243,82 @@ def cmd_utm_export(manager: LabManager, args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_package_build(_manager: LabManager, args: argparse.Namespace) -> int:
+    """Task 6.1：构建源码级可分发安装包（MANIFEST + SBOM + 许可证清单 + install.sh）。"""
+    import ctflab_package  # noqa: PLC0415  延迟导入，保持主 CLI 启动路径不变
+
+    try:
+        result = ctflab_package.build_release_bundle(args.out, version=args.version)
+    except ctflab_package.PackageError as exc:
+        raise CTFLabError(str(exc)) from exc
+    manifest = result["manifest"]
+    print(f"安装包已生成：{result['bundle']}")
+    print(f"外层 SHA-256：{result['sha256']}")
+    print(f"清单：{len(manifest['files'])} 个文件；版本 {manifest['version']}")
+    print("包内包含：MANIFEST.json、SBOM.json、THIRD_PARTY_LICENSES.md、install.sh、SHA256SUMS")
+    print(f"许可证状态：{manifest['license']['status']}（对外分发前必须补充项目 LICENSE）")
+    print("提示：本包为源码级安装包，不含 CTFLab.app、QEMU 运行时与签名；"
+          "干净环境验收脚本：tools/ctflab_acceptance.py")
+    return 0
+
+
+def cmd_package_verify(_manager: LabManager, args: argparse.Namespace) -> int:
+    import ctflab_package  # noqa: PLC0415
+
+    try:
+        report = ctflab_package.verify_release_bundle(args.bundle)
+    except ctflab_package.PackageError as exc:
+        raise CTFLabError(str(exc)) from exc
+    print(f"安装包校验通过：{report['bundle']}")
+    print(f"外层 SHA-256：{report['sha256']}")
+    print(f"版本 {report['manifest']['version']}，共 {report['file_count']} 个登记文件")
+    print(f"启动器无开发解释器硬编码；SBOM 组件数：{len(report['sbom']['components'])}")
+    return 0
+
+
+def cmd_content_pack(_manager: LabManager, args: argparse.Namespace) -> int:
+    import ctflab_package  # noqa: PLC0415
+
+    profile_id = PROFILE_ALIASES.get(args.profile, args.profile)
+    try:
+        result = ctflab_package.build_content_package(profile_id, args.out, version=args.version)
+    except ctflab_package.PackageError as exc:
+        raise CTFLabError(str(exc)) from exc
+    print(f"内容包已生成：{result['package']}")
+    print(f"SHA-256：{result['sha256']}")
+    print(f"不含虚拟磁盘；导入镜像：ctflab import {profile_id} <镜像路径>")
+    return 0
+
+
+def cmd_content_verify(_manager: LabManager, args: argparse.Namespace) -> int:
+    import ctflab_package  # noqa: PLC0415
+
+    try:
+        report = ctflab_package.verify_content_package(
+            args.package, check_version=not args.no_version_check)
+    except ctflab_package.PackageError as exc:
+        raise CTFLabError(str(exc)) from exc
+    content = report["content"]
+    print(f"内容包校验通过：{report['package']}")
+    print(f"id={content['id']} name={content['name']} version={content['version']} "
+          f"requires_ctflab={content['requires_ctflab']}")
+    print(f"登记文件 {report['file_count']} 个；disk_included=False")
+    return 0
+
+
+def cmd_content_unpack(_manager: LabManager, args: argparse.Namespace) -> int:
+    import ctflab_package  # noqa: PLC0415
+
+    try:
+        written = ctflab_package.unpack_content_package(args.package, args.out)
+    except ctflab_package.PackageError as exc:
+        raise CTFLabError(str(exc)) from exc
+    print(f"已解包 {len(written)} 个文件到：{Path(args.out).expanduser()}")
+    for path in written:
+        print(f"  {path.name}")
+    return 0
+
+
 def cmd_install(manager: LabManager, args: argparse.Namespace) -> int:
     state = manager.start_install(
         args.profile,
@@ -2427,6 +2505,7 @@ def cmd_probe(manager: LabManager, args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="ctflab", description="CTFLab Mac M 第一阶段运行器")
     parser.add_argument("--state-dir", type=Path, default=DEFAULT_STATE_DIR, help="运行时状态目录")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {CTFLAB_VERSION}")
     subparsers = parser.add_subparsers(dest="command", required=True)
     profile_choices = available_profiles() + sorted(PROFILE_ALIASES)
 
@@ -2516,13 +2595,41 @@ def build_parser() -> argparse.ArgumentParser:
     utm_export_parser.add_argument("profile", choices=profile_choices)
     utm_export_parser.add_argument("--out", type=Path, required=True, help="输出目录；目标已存在时一律拒绝覆盖")
     utm_export_parser.add_argument("--name", help="包名（不含 .utm 后缀），默认使用配置 id")
+    package_parser = subparsers.add_parser(
+        "package",
+        help="构建/校验可分发安装包（Task 6.1；源码级，不含 .app/QEMU 运行时/签名）",
+    )
+    package_sub = package_parser.add_subparsers(dest="package_command", required=True)
+    package_build = package_sub.add_parser(
+        "build", help="构建 ctflab-<version>-macos-arm64.tar.gz（含 MANIFEST/SBOM/许可证/install.sh）")
+    package_build.add_argument("--out", type=Path, required=True, help="输出目录；目标已存在时一律拒绝覆盖")
+    package_build.add_argument("--version", help=f"版本号（必须与当前 CTFLAB_VERSION={CTFLAB_VERSION} 一致）")
+    package_verify = package_sub.add_parser(
+        "verify", help="校验安装包：旁车 SHA-256、包内 MANIFEST、逐文件哈希与禁止项")
+    package_verify.add_argument("bundle", type=Path)
+
+    content_parser = subparsers.add_parser("content", help="构建/校验 .ctflab 内容包（不含虚拟磁盘）")
+    content_sub = content_parser.add_subparsers(dest="content_command", required=True)
+    content_pack = content_sub.add_parser(
+        "pack", help="按 profile 构建 <id>-<version>.ctflab（profile + 来宾修复，无磁盘）")
+    content_pack.add_argument("profile", choices=profile_choices)
+    content_pack.add_argument("--out", type=Path, required=True, help="输出目录；目标已存在时一律拒绝覆盖")
+    content_pack.add_argument("--version", default="1.0.0", help="内容包版本，默认 1.0.0")
+    content_verify = content_sub.add_parser(
+        "verify", help="校验内容包：哈希、清单、禁止内容与 requires_ctflab 版本门禁")
+    content_verify.add_argument("package", type=Path)
+    content_verify.add_argument("--no-version-check", action="store_true",
+                                help="跳过 requires_ctflab 门禁（仅诊断用，不影响其他检查）")
+    content_unpack = content_sub.add_parser(
+        "unpack", help="校验后解包到目标目录（逐文件复核哈希；不覆盖既有文件）")
+    content_unpack.add_argument("package", type=Path)
+    content_unpack.add_argument("--out", type=Path, required=True)
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    manager = LabManager(args.state_dir)
     handlers = {
         "doctor": cmd_doctor,
         "list": cmd_list,
@@ -2541,7 +2648,17 @@ def main(argv: list[str] | None = None) -> int:
         "probe": cmd_probe,
         "utm-export": cmd_utm_export,
     }
+    package_handlers = {"build": cmd_package_build, "verify": cmd_package_verify}
+    content_handlers = {"pack": cmd_content_pack, "verify": cmd_content_verify,
+                        "unpack": cmd_content_unpack}
     try:
+        # 纯打包/校验命令不需要运行状态；避免仅执行 package/content 时在默认
+        # 状态目录创建 locks/ 等运行时目录，保持该类操作的只读/构建边界。
+        if args.command == "package":
+            return package_handlers[args.package_command](None, args)  # type: ignore[arg-type]
+        if args.command == "content":
+            return content_handlers[args.content_command](None, args)  # type: ignore[arg-type]
+        manager = LabManager(args.state_dir)
         if args.command == "stop" and not args.all and not args.profiles:
             parser.error("stop 需要提供配置名，或使用 --all")
         if args.command == "stop":

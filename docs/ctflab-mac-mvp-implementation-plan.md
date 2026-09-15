@@ -402,14 +402,28 @@ qemu-img create -f qcow2 -F qcow2 \
 - [ ] 打包 `CTFLab.app`、受控 QEMU 运行时和所需动态库。
 - [ ] 将运行时数据移出 `.app`，避免运行破坏签名。
 - [ ] 修复所有动态库为 `@loader_path` 相对路径。
-- [ ] 生成 SBOM、许可证说明、SHA-256 和版本信息。
+- [x] 生成 SBOM、许可证说明、SHA-256 和版本信息（2026-09-15：源码级安装包与两个内容包已生成
+  `MANIFEST.json`/`SBOM.json`/`THIRD_PARTY_LICENSES.md`/`SHA256SUMS` 与 `.sha256` 旁车；
+  `CTFLab.app` 内部的版本信息随 Task 6.2 交付，项目许可证未声明并如实标注 `undeclared`）。
 - [ ] 完成 macOS 签名、公证和干净账户测试。
-- [ ] 构建 `smoke-1.0.0.ctflab` 与 `basic-pentesting-2-1.0.0.ctflab`。
+- [x] 构建 `smoke-1.0.0.ctflab` 与 `basic-pentesting-2-1.0.0.ctflab`（2026-09-15，内容包不含虚拟磁盘，
+  已通过 `ctflab content verify`）。
 - [x] 建立私有 GitHub 源码镜像 `zhangpu1211/ctf-lab`，仅同步 CTFLab 源码、配置模板与文档，不上传虚拟磁盘、凭据或课程数据。
 
 **验收：** 在一台未安装开发依赖的 Mac M 上，用户可以安装 CTFLab、导入两份内容包并完成实验；不需要手工编辑 QEMU 参数。
 
 2026-09-14 部分证据：模拟干净 HOME + 最小 PATH 下，doctor 依赖检测与提示正确，手工安装 PyYAML 后导入、启动、停止、重置全流程通过。这只证明“依赖缺失时提示正确、手工补齐依赖后可用”，**不构成**上述验收：独立安装包、签名与公证尚未交付，因此第 7 节对应验收项保持未通过（见 `docs/verification-2026-09-14.md` 第 3 节）。
+
+2026-09-15（Task 6.1）证据：交付源码级安装包 `ctflab-0.1.0-macos-arm64.tar.gz`
+（复核后 22 个登记文件，含 MANIFEST/SBOM/许可证清单/install.sh；精确 SHA-256 只记录在不入包的
+独立验证记录中，避免包内文档与包自身哈希形成自引用）与两份内容包
+`smoke-1.0.0.ctflab`、`basic-pentesting-2-1.0.0.ctflab`（均通过 `content verify`；**不含虚拟磁盘**）；
+干净环境验收脚本在独立 HOME + 最小 PATH 下 13/13 步通过（校验/解包 → 执行 install.sh →
+doctor 缺依赖提示 → venv 安装 PyYAML → doctor 就绪 → import → run --headless → health → stop →
+reset → 无残留）。范围限制：`.app`、
+受控 QEMU 运行时、动态库、签名与公证**均未实现**；PyYAML 一步为联网 `pip install`，不是零手工
+依赖的完整安装；项目许可证未声明（`undeclared`），对外分发前必须补充。详见
+`docs/ctflab-task6-packaging-design.md` 与 `docs/verification-task6-1-2026-09-15.md`。
 
 ## 7. 第一阶段验收清单
 
@@ -432,7 +446,7 @@ qemu-img create -f qcow2 -F qcow2 \
 - [x] 已验证：`reset` 后靶机从基础镜像重新创建 overlay，基础镜像哈希未变化。
 - [x] 已验证：新镜像可通过 `inspect → onboard → probe` 进入候选适配流程，并明确区分候选与已验证交付。
 - [x] 已验证：Kali 与两个靶机均通过 DHCP 和已配置的 SSH/HTTP 协议健康检查。
-- [ ] 后续任务：在干净的 Mac M 用户环境完成安装、导入和运行。已有部分验证证据：模拟干净 HOME 下 doctor 依赖检测、手工安装 PyYAML 后的导入与运行；独立安装包未交付，无手工依赖的完整安装属于 Task 6，尚未验证。
+- [ ] 后续任务：在干净的 Mac M 用户环境完成安装、导入和运行。已有部分验证证据：模拟干净 HOME 下 doctor 依赖检测、手工安装 PyYAML 后的导入与运行（2026-09-14）；Task 6.1 已交付源码级安装包与内容包，干净环境验收脚本（含实际执行 install.sh）13/13 步通过（2026-09-15；其中 PyYAML 一步仍是联网 pip 安装，见 `docs/verification-task6-1-2026-09-15.md`）；Task 6 的 `.app` 安装、签名分发与零手工依赖的完整安装未交付，尚未通过。
 
 ## 8. 工期、风险与决策
 
