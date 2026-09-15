@@ -472,7 +472,7 @@ entitlement 丢失缺陷（HVF `HV_NO_DEVICE`），并在复核中收紧为 enti
 - [x] 已验证：`reset` 后靶机从基础镜像重新创建 overlay，基础镜像哈希未变化。
 - [x] 已验证：新镜像可通过 `inspect → onboard → probe` 进入候选适配流程，并明确区分候选与已验证交付。
 - [x] 已验证：Kali 与两个靶机均通过 DHCP 和已配置的 SSH/HTTP 协议健康检查。
-- [ ] 后续任务：在干净的 Mac M 用户环境完成安装、导入和运行。已有部分验证证据：模拟干净 HOME 下 doctor 依赖检测、手工安装 PyYAML 后的导入与运行（2026-09-14）；Task 6.1 已交付源码级安装包与内容包，干净环境验收脚本（含实际执行 install.sh）13/13 步通过（2026-09-15；其中 PyYAML 一步仍是联网 pip 安装，见 `docs/verification-task6-1-2026-09-15.md`）；Task 6 的 `.app` 安装、签名分发与零手工依赖的完整安装未交付，尚未通过。
+- [ ] 后续任务：在干净的 Mac M 用户环境完成安装、导入和运行。已有部分验证证据：模拟干净 HOME 下 doctor 依赖检测、手工安装 PyYAML 后的导入与运行（2026-09-14）；Task 6.1 已交付源码级安装包与内容包，干净环境验收脚本（含实际执行 install.sh）13/13 步通过（2026-09-15；其中 PyYAML 一步仍是联网 pip 安装，见 `docs/verification-task6-1-2026-09-15.md`）；Task 6.3B 后 `.app` 已内置解释器与 PyYAML：最小 PATH + 独立 HOME 下 doctor 首次即 0 退出、sandbox 拒绝宿主 Python 后仍通过、smoke E2E 15/15（见 `docs/verification-task6-3b-2026-09-15.md`）——**零手工依赖的运行时已实现**；仍未交付：Developer ID 签名与公证（接收者需手动放行一次）、面向学生的基盘镜像分发渠道、Kali 侧 6.3B 回归。
 
 ## 8. 工期、风险与决策
 

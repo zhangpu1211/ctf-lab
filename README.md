@@ -19,7 +19,12 @@ CTFLab 是面向 Apple Silicon Mac 的本地虚拟靶场运行器。它使用 QE
 
 ## 快速开始
 
-环境要求：macOS Apple Silicon、Python 3.10+、PyYAML、Homebrew QEMU。推荐安装 Tesseract 以自动区分登录界面、UEFI Shell、内核错误和无启动盘；未安装时会安全降级为人工复核。
+**用打包好的 `.app`（推荐给使用靶场的人）**：`CTFLab.app` 已内置受控 QEMU 与 Python 运行时
+（含 PyYAML），目标机器**不需要**安装 Python、pip 或 Homebrew QEMU。拿到 app 后首次打开需在
+“系统设置 → 隐私与安全性”手动放行一次（当前为本地 ad-hoc 构建，未做 Developer ID 公证）。
+
+**从源码运行（开发用）**：环境要求 macOS Apple Silicon、Python 3.10+、PyYAML、Homebrew QEMU。
+推荐安装 Tesseract 以自动区分登录界面、UEFI Shell、内核错误和无启动盘；未安装时会安全降级为人工复核。
 
 ```bash
 ./tools/ctflab doctor
@@ -63,6 +68,7 @@ python3 -m py_compile tools/ctflab.py tools/ctflab_inspect.py tools/ctflab_netwo
 - [Task 6.2 设计：受控 QEMU 运行时的 CTFLab.app](docs/ctflab-task6-app-runtime-design.md)
 - [Task 6.2 验证记录（2026-09-15）](docs/verification-task6-2-2026-09-15.md)
 - [Task 6.3A 验证记录：Kali ARM64 + UEFI 真实验收（2026-09-15）](docs/verification-task6-3a-2026-09-15.md)
+- [Task 6.3B 验证记录：许可证闭环与内置 Python 运行时（2026-09-15）](docs/verification-task6-3b-2026-09-15.md)
 
 ## 许可证
 

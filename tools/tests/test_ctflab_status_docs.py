@@ -220,12 +220,12 @@ class VerificationRecordTests(unittest.TestCase):
         # 不钉死细分数字（测试集会增长），但必须带复核日期与当前总数，陈旧计数不得残留
         self.assertIn("本次完整回归", self.text)
         self.assertIn("2026-09-15 复核", self.text)
-        self.assertIn("293 项通过", self.text)
+        self.assertIn("312 项通过", self.text)
         self.assertIn("56 项验收状态与设计边界守卫测试", self.text)
         self.assertIn("82 项路径 A `utm-export` 单元测试", self.text)
         self.assertIn("37 项 Task 6.1 打包测试", self.text)
-        self.assertIn("43 项 Task 6.2/6.3A app 受控运行时与验收守卫测试", self.text)
-        for stale in ("66 项通过", "当前完整回归", "174 项通过", "161 项通过", "202 项", "205 项", "235 项", "245 项", "280 项", "283 项", "286 项", "279 项", "278 项", "269 项", "267 项", "242 项", "243 项", "244 项", "48 项", "95 项"):
+        self.assertIn("58 项 Task 6.2/6.3A/6.3B app 受控运行时、许可证与验收守卫测试", self.text)
+        for stale in ("66 项通过", "当前完整回归", "174 项通过", "161 项通过", "202 项", "205 项", "235 项", "245 项", "280 项", "283 项", "286 项", "279 项", "278 项", "269 项", "267 项", "242 项", "243 项", "244 项", "48 项", "95 项", "293 项", "309 项", "43 项 Task 6.2"):
             self.assertNotIn(stale, self.text)
 
     def test_matrix_wording_avoids_adapted_claim(self) -> None:
@@ -671,6 +671,49 @@ class Task62AppRuntimeDocsTests(unittest.TestCase):
         self.assertIn("ad-hoc", flat)
         self.assertNotIn("Developer ID 签名通过", flat)
         self.assertNotIn("公证通过", flat)
+
+
+class Task63BLicensePythonDocsTests(unittest.TestCase):
+    """Task 6.3B 记录：许可证闭环与内置 Python 运行时的证据与边界必须写清。"""
+
+    RECORD = PROJECT_ROOT / "docs" / "verification-task6-3b-2026-09-15.md"
+
+    def setUp(self) -> None:
+        self.text = self.RECORD.read_text(encoding="utf-8")
+
+    def test_record_documents_license_closure(self) -> None:
+        flat = normalized(self.text)
+        self.assertIn("MIT", flat)
+        self.assertIn("vendored", flat)
+        self.assertIn("SOURCE_OFFER.md", flat)
+        self.assertIn("distribution_blockers", flat)
+        self.assertIn("qemu-11.1.0.tar.xz", flat)
+        self.assertIn("6ee1d1a61f68", flat)
+
+    def test_record_documents_bundled_python_evidence(self) -> None:
+        flat = normalized(self.text)
+        self.assertIn("python-build-standalone", flat)
+        self.assertIn("3.12.14", flat)
+        self.assertIn("PyYAML", flat)
+        self.assertIn("doctor-zero-setup", flat)
+        self.assertIn("host-python-denied", flat)
+        self.assertIn("no-bytecode-writes", flat)
+        self.assertIn("15/15", flat)
+        self.assertIn("__pycache__", flat)
+
+    def test_record_keeps_undelivered_limits(self) -> None:
+        flat = normalized(self.text)
+        self.assertIn("未做", flat)
+        self.assertIn("公证", flat)
+        self.assertIn("基盘镜像分发", flat)
+        self.assertIn("未执行", flat)
+        for stale in ("公证通过", "Developer ID 签名通过"):
+            self.assertNotIn(stale, flat)
+        # 提及 Kali 侧结论时必须带否定/限定措辞（本轮未跑 Kali E2E）。
+        for sentence in sentences(self.text):
+            if "Kali 侧同样通过" in sentence or "Kali 侧通过" in sentence:
+                self.assertTrue(any(marker in sentence for marker in NEGATION_MARKERS),
+                                f"疑似宣称 Kali 侧通过：{sentence[:90]}")
 
 
 class Task63AKaliAcceptanceDocsTests(unittest.TestCase):

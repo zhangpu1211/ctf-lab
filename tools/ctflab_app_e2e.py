@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
-"""CTFLab Task 6.2 真实 E2E：`.app` 内受控 QEMU 运行时的导入/启动/停止/重置验收。
+"""CTFLab Task 6.2/6.3B 真实 E2E：`.app` 内受控 QEMU + Python 运行时的验收。
 
 与 `tools/ctflab_acceptance.py`（Task 6.1 源码包）分离：本脚本针对 `CTFLab.app`，在
-“独立 HOME + 最小 PATH（不含 /opt/homebrew/bin、不含 conda）”下执行，证明 QEMU 不是来自宿主：
+“独立 HOME + 最小 PATH（不含 /opt/homebrew/bin、不含 conda）”下执行，证明 QEMU 与 Python
+都不是来自宿主：
 
 1. 校验 app（结构/MANIFEST 哈希/动态库引用/SBOM）并记录 app 树哈希；
-2. 从 app 启动器执行 `doctor`（第一次：断言缺 PyYAML 提示，且运行时显示 bundled）；
-3. 独立 venv 安装 PyYAML 后再次 `doctor`（断言 QEMU 路径位于 app 内）；
+2. 首次 `doctor` 必须 **0 退出**：解释器、PyYAML、QEMU 全部来自 app 内（无 venv、无 pip）；
+3. `sandbox-exec` 拒绝宿主 Python 位置与 `/opt/homebrew` 读取后，`doctor` 仍通过；
 4. `sandbox-exec` 拒绝 `/opt/homebrew` 读取，直接用 app 内 QEMU 启动 pc 机器：
    固件必须来自 app（宿主路径被拒仍能启动）；
 5. `import`（复用已导入基础镜像副本）→ `run --headless` → `health` → `stop` → `reset`；
 6. 运行中从进程命令行证明 QEMU 来自 `CTFLab.app`；
-7. 复核无残留、app 树哈希运行前后一致、`codesign --verify --deep --strict` 结果按实际级别记录。
+7. 复核无残留、app 内无 `__pycache__` 写入、app 树哈希运行前后一致、
+   `codesign --verify --deep --strict` 结果按实际级别记录。
 
 不操作 UTM、不触碰用户已有虚拟机；不写 app 内任何文件。
 """
@@ -34,11 +36,16 @@ sys.path.insert(0, str(TOOLS_DIR))
 import ctflab_app  # noqa: E402
 
 HOST_STATE_DIR = pathlib.Path.home() / "Library" / "Application Support" / "CTFLab"
-# 最小编译环境 PATH：系统目录 + 临时 venv（由脚本插入）；**不含** /opt/homebrew/bin。
+# 最小编译环境 PATH：系统目录；**不含** /opt/homebrew/bin，也不需要任何 Python venv。
 MINIMAL_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
+# 拒绝宿主 Python 与开发路径：证明 app 用的解释器来自 bundle 而不是宿主。
 SANDBOX_PROFILE = """(version 1)
 (allow default)
 (deny file-read* (subpath "/opt/homebrew"))
+(deny file-read* (subpath "/opt/miniconda3"))
+(deny file-read* (subpath "/usr/local"))
+(deny file-read* (subpath "/Library/Frameworks/Python.framework"))
+(deny file-read* (literal "/usr/bin/python3"))
 """
 
 
@@ -91,6 +98,10 @@ def base_env(home: pathlib.Path) -> dict[str, str]:
     }
 
 
+def bundled_python_bin(app: pathlib.Path) -> pathlib.Path:
+    return app / ctflab_app.PYTHON_RUNTIME_REL / "bin" / "python3"
+
+
 def find_reuse_source(profile_id: str) -> pathlib.Path | None:
     state_path = HOST_STATE_DIR / "images" / profile_id / "image.json"
     if not state_path.is_file():
@@ -110,6 +121,14 @@ def sandboxed_firmware_check(app: pathlib.Path, timeout: int) -> dict:
     cmd = ["sandbox-exec", "-p", SANDBOX_PROFILE, str(qemu),
            "-machine", "pc", "-accel", "tcg", "-m", "128", "-display", "none",
            "-serial", "none", "-monitor", "none", "-nodefaults", "-S"]
+    return run(cmd, env=env, timeout=timeout)
+
+
+def sandboxed_doctor_check(app: pathlib.Path, launcher: pathlib.Path, env: dict[str, str],
+                           state_dir: pathlib.Path, timeout: int) -> dict:
+    """拒绝宿主 Python 与 /opt/homebrew 后运行 doctor：解释器必须仍来自 app 内。"""
+    cmd = ["sandbox-exec", "-p", SANDBOX_PROFILE, str(launcher),
+           "--state-dir", str(state_dir), "doctor"]
     return run(cmd, env=env, timeout=timeout)
 
 
@@ -145,8 +164,8 @@ def main(argv: list[str] | None = None) -> int:
             "steps": recorder.steps,
             "result": "失败" if recorder.failed else "通过",
             "scope_note": (
-                "范围＝.app 内受控 QEMU 运行时的导入/启动/停止/重置与固件来源证明；"
-                "不含公证（未执行）、不含 UTM、不含用户既有虚拟机。"
+                "范围＝.app 内受控 QEMU + Python 运行时的导入/启动/停止/重置、零手工依赖与"
+                "固件/解释器来源证明；不含公证（未执行）、不含 UTM、不含用户既有虚拟机。"
             ),
         }
         evidence_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
@@ -166,6 +185,7 @@ def main(argv: list[str] | None = None) -> int:
         recorder.record("verify-app", "失败", str(exc))
         return finish()
     hash_before = ctflab_app.app_tree_hash(app)
+    pycache_before = {path.relative_to(app).as_posix() for path in app.rglob("__pycache__")}
     recorder.record("verify-app", "通过",
                     f"版本 {report['version']}，{report['file_count']} 文件；"
                     f"签名 {report['signature']['level']}；树哈希 {hash_before[:12]}…")
@@ -173,40 +193,38 @@ def main(argv: list[str] | None = None) -> int:
     def ctflab(*extra: str) -> list[str]:
         return [str(launcher), "--state-dir", str(state_dir), *extra]
 
-    # 2. 第一次 doctor：最小 PATH 下 PyYAML 缺失 + bundled 运行时
+    # 2. 首次 doctor：零手工依赖，解释器/PyYAML/QEMU 全部来自 app
+    python_bin = bundled_python_bin(app)
     first = run(ctflab("doctor"), env=env, timeout=args.timeout)
     first_out = first["stdout"] + first["stderr"]
-    hint_ok = first["returncode"] == 1 and "pip install pyyaml" in first_out
-    recorder.record("doctor-missing-deps", "通过" if hint_ok else "失败",
-                    "PyYAML 缺失提示正确" if hint_ok else "未按预期提示 PyYAML",
+    bundled_ok = (first["returncode"] == 0
+                  and "运行时：bundled" in first_out
+                  and str(python_bin) in first_out
+                  and str(app / ctflab_app.RUNTIME_REL) in first_out
+                  and "OK   PyYAML: available" in first_out
+                  and "/opt/homebrew" not in first_out)
+    recorder.record("doctor-zero-setup", "通过" if bundled_ok else "失败",
+                    "最小 PATH 下 doctor 直接通过：内置解释器 + PyYAML + bundled 运行时"
+                    if bundled_ok else "doctor 未证明零手工依赖（无 venv/pip 前提下）",
                     evidence=first)
-
-    # 3. venv + PyYAML，再 doctor：断言 QEMU 路径来自 app
-    venv_dir = workdir / "venv"
-    venv_result = run(["python3", "-m", "venv", str(venv_dir)], env=env, timeout=args.timeout)
-    if venv_result["returncode"] != 0:
-        recorder.record("venv", "失败", "创建 venv 失败", evidence=venv_result)
-        return finish()
-    env = dict(env)
-    env["PATH"] = f"{venv_dir / 'bin'}:{MINIMAL_PATH}"
-    pip_result = run([str(venv_dir / "bin" / "python3"), "-m", "pip", "install", "pyyaml"],
-                     env=env, timeout=args.timeout)
-    if pip_result["returncode"] != 0:
-        recorder.record("install-pyyaml", "失败", "pip install pyyaml 失败（联网步骤）", evidence=pip_result)
-        return finish()
-    recorder.record("install-pyyaml", "通过", "PyYAML 已装入独立 venv")
-
-    second = run(ctflab("doctor"), env=env, timeout=args.timeout)
-    second_out = second["stdout"] + second["stderr"]
-    bundled_ok = (second["returncode"] == 0
-                  and "运行时：bundled" in second_out
-                  and str(app / ctflab_app.RUNTIME_REL) in second_out
-                  and "/opt/homebrew" not in second_out)
-    recorder.record("doctor-bundled-runtime", "通过" if bundled_ok else "失败",
-                    "doctor 显示使用 app 内运行时且无宿主 QEMU" if bundled_ok
-                    else "doctor 未证明使用 app 内运行时", evidence=second)
     if not bundled_ok:
         return finish()
+
+    # 3. 沙盒拒绝宿主 Python 与开发路径后，doctor 仍通过（非空证明）
+    if shutil.which("sandbox-exec"):
+        sandbox_doctor = sandboxed_doctor_check(app, launcher, env, state_dir, args.timeout)
+        sandbox_out = sandbox_doctor["stdout"] + sandbox_doctor["stderr"]
+        sandbox_ok = (sandbox_doctor["returncode"] == 0
+                      and str(python_bin) in sandbox_out
+                      and "运行时：bundled" in sandbox_out)
+        recorder.record("host-python-denied", "通过" if sandbox_ok else "失败",
+                        "拒绝 /usr/bin/python3、/opt/homebrew 等宿主路径后 doctor 仍通过"
+                        if sandbox_ok else f"沙盒内 doctor 异常：{sandbox_out.strip()[-200:]}",
+                        evidence=sandbox_doctor)
+        if not sandbox_ok:
+            return finish()
+    else:
+        recorder.record("host-python-denied", "跳过", "本机没有 sandbox-exec，无法证明宿主 Python 被排除")
 
     # 4. 沙盒固件来源检查：拒绝 /opt/homebrew 后 app 内 QEMU 仍能启动
     if shutil.which("sandbox-exec"):
@@ -289,6 +307,14 @@ def main(argv: list[str] | None = None) -> int:
     recorder.record("app-unchanged", "通过" if hash_after == hash_before else "失败",
                     f"运行前后树哈希一致（{hash_after[:12]}…）" if hash_after == hash_before
                     else f"app 内容发生变化：{hash_before[:12]}… → {hash_after[:12]}…")
+
+    # 启动器以 -B 运行：与运行前对比，app 内不得新增任何 __pycache__
+    # （发行版自带预编译缓存，属正常随包内容；这里验证的是"运行不写入"）。
+    pycache_after = {path.relative_to(app).as_posix() for path in app.rglob("__pycache__")}
+    new_pycache = sorted(pycache_after - pycache_before)
+    recorder.record("no-bytecode-writes", "通过" if not new_pycache else "失败",
+                    f"运行后无新增字节码缓存（-B 生效；随包预编译缓存 {len(pycache_before)} 处保持原样）"
+                    if not new_pycache else f"运行写入新的字节码缓存：{new_pycache[:3]}")
 
     signature = ctflab_app.codesign_verify(app)
     recorder.record("codesign-verify",

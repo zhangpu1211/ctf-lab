@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""CTFLab Task 6.3A：`CTFLab.app` 的 Kali ARM64 + UEFI 真实验收。
+"""CTFLab Task 6.3A/6.3B：`CTFLab.app` 的 Kali ARM64 + UEFI 真实验收（含内置 Python 运行时）。
 
 只做验收与必要修复：不签名、不公证、不做动态分辨率、不操作 UTM 与用户已有虚拟机。
 
 流程（每步记录 JSON 证据，任一步失败即停止）：
 
 1. 复核 App：结构/MANIFEST/动态库引用/SBOM/codesign，并与 `CTFLab.app.sha256` 旁车交叉核对；
-2. 独立 HOME + 最小 PATH（**不含 `/opt/homebrew/bin`**）：doctor 两次（缺依赖提示 → venv 装 PyYAML →
-   就绪），断言 aarch64 QEMU、`edk2-aarch64-code.fd`、`edk2-arm-vars.fd` 全部来自 App；
+2. 独立 HOME + 最小 PATH（**不含 `/opt/homebrew/bin`**）：首次 doctor 必须 0 退出——解释器与
+   PyYAML 来自 App 内（无 venv/pip），aarch64 QEMU、`edk2-aarch64-code.fd`、`edk2-arm-vars.fd`
+   全部来自 App；`sandbox-exec` 拒绝宿主 Python 位置后 doctor 仍通过（非空证明）；
 3. `sandbox-exec` 拒绝 `/opt/homebrew` 读取后，直接用 App 内 `qemu-system-aarch64` + App 内固件
    启动 virt 机器（证明固件/运行时来源）；
 4. 复用经哈希验证的 `kali-arm64` 基盘与原始 RAW NVRAM 的**副本**（原文件只读校验）；
@@ -15,8 +16,8 @@
 6. 派生 NVRAM 可写；App 内模板与用户原始 RAW NVRAM 哈希不变；
 7. 健康检查（DHCP+SSH）通过；Kali 在隔离实验网内可达 smoke/basic，公网不可达（经 SSH 来宾内验证）；
 8. 来宾内正常关机 → 再次启动（重启）→ 再次健康检查 → 停止 → reset；
-9. 复核：无 QEMU/QMP/网络/overlay 残留、原始基盘与 RAW NVRAM 哈希不变、
-   App 树哈希不变、`qemu-img check` 通过。
+9. 复核：无 QEMU/QMP/网络/overlay 残留、原始基盘与 RAW NVRAM 哈希不变、App 内无 `__pycache__`
+   写入、App 树哈希不变、`qemu-img check` 通过。
 """
 
 from __future__ import annotations
@@ -40,7 +41,12 @@ import ctflab_app  # noqa: E402
 
 HOST_STATE_DIR = pathlib.Path.home() / "Library" / "Application Support" / "CTFLab"
 MINIMAL_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
-SANDBOX_PROFILE = '(version 1)\n(allow default)\n(deny file-read* (subpath "/opt/homebrew"))\n'
+SANDBOX_PROFILE = (
+    '(version 1)\n(allow default)\n(deny file-read* (subpath "/opt/homebrew"))\n'
+    '(deny file-read* (subpath "/opt/miniconda3"))\n(deny file-read* (subpath "/usr/local"))\n'
+    '(deny file-read* (subpath "/Library/Frameworks/Python.framework"))\n'
+    '(deny file-read* (literal "/usr/bin/python3"))\n'
+)
 KALI_SSH_PORT = 12210
 SMOKE_IP = "192.168.242.20"
 BASIC_IP = "192.168.242.21"
@@ -324,6 +330,7 @@ def main(argv: list[str] | None = None) -> int:
         recorder.record("verify-app", "失败", str(exc))
         return finish()
     tree_before = ctflab_app.app_tree_hash(app)
+    pycache_before = {path.relative_to(app).as_posix() for path in app.rglob("__pycache__")}
     sidecar = app.parent / "CTFLab.app.sha256"
     sidecar_ok = False
     if sidecar.is_file():
@@ -348,43 +355,35 @@ def main(argv: list[str] | None = None) -> int:
     recorder.record("app-runtime-assets", "通过",
                     "；".join(f"{k}={v[:12]}…" for k, v in asset_hashes.items()), hashes=asset_hashes)
 
-    # --- 2. 独立 HOME + 最小 PATH ---
+    # --- 2. 独立 HOME + 最小 PATH：零手工依赖（无 venv/pip） ---
+    python_bin = app / ctflab_app.PYTHON_RUNTIME_REL / "bin" / "python3"
     first = run(ctflab_cmd("doctor"), env=env, timeout=args.timeout)
     first_out = first["stdout"] + first["stderr"]
-    hint_ok = first["returncode"] == 1 and "pip install pyyaml" in first_out
-    bundled_first = (f"运行时：bundled（{runtime}）" in first_out
-                     and "edk2-aarch64-code.fd" in first_out
-                     and str(runtime) in first_out
-                     and "/opt/homebrew" not in first_out)
-    recorder.record("doctor-missing-deps", "通过" if (hint_ok and bundled_first) else "失败",
-                    "缺 PyYAML 提示正确且固件/运行时来自 App" if (hint_ok and bundled_first)
-                    else "doctor 输出未同时满足缺依赖提示与 App 内固件来源",
+    zero_setup = (first["returncode"] == 0
+                  and f"运行时：bundled（{runtime}）" in first_out
+                  and str(python_bin) in first_out
+                  and "OK   PyYAML: available" in first_out
+                  and "edk2-aarch64-code.fd" in first_out
+                  and "/opt/homebrew" not in first_out)
+    recorder.record("doctor-zero-setup", "通过" if zero_setup else "失败",
+                    "最小 PATH 下 doctor 直接通过：内置解释器 + PyYAML + App 内固件"
+                    if zero_setup else "doctor 未证明零手工依赖与 App 内运行时/固件",
                     evidence={"returncode": first["returncode"], "stdout": first["stdout"]})
-    if not (hint_ok and bundled_first):
+    if not zero_setup:
         return finish()
 
-    venv_dir = workdir / "venv"
-    venv_result = run(["/usr/bin/python3", "-m", "venv", str(venv_dir)], env=env, timeout=args.timeout)
-    if venv_result["returncode"] != 0:
-        recorder.record("venv", "失败", "创建 venv 失败", evidence=venv_result)
-        return finish()
-    env = dict(env)
-    env["PATH"] = f"{venv_dir / 'bin'}:{MINIMAL_PATH}"
-    pip_result = run([str(venv_dir / "bin" / "python3"), "-m", "pip", "install", "pyyaml"],
-                     env=env, timeout=args.timeout)
-    if pip_result["returncode"] != 0:
-        recorder.record("install-pyyaml", "失败", "pip install pyyaml 失败（联网步骤）", evidence=pip_result)
-        return finish()
-    recorder.record("install-pyyaml", "通过", "PyYAML 已装入独立 venv")
-
-    second = run(ctflab_cmd("doctor"), env=env, timeout=args.timeout)
-    second_out = second["stdout"] + second["stderr"]
-    ready_ok = (second["returncode"] == 0 and f"运行时：bundled（{runtime}）" in second_out
-                and "/opt/homebrew" not in second_out)
-    recorder.record("doctor-ready", "通过" if ready_ok else "失败",
-                    "必选依赖就绪且运行时为 App 内 bundled" if ready_ok else "doctor 未就绪或非 bundled",
-                    evidence={"returncode": second["returncode"], "stdout": second["stdout"]})
-    if not ready_ok:
+    # --- 2.5 沙箱拒绝宿主 Python/开发路径后 doctor 仍通过（非空证明） ---
+    sandbox_doctor = run(["/usr/bin/sandbox-exec", "-p", SANDBOX_PROFILE, *ctflab_cmd("doctor")],
+                         env=env, timeout=args.timeout)
+    sandbox_doctor_out = sandbox_doctor["stdout"] + sandbox_doctor["stderr"]
+    denied_ok = (sandbox_doctor["returncode"] == 0
+                 and str(python_bin) in sandbox_doctor_out
+                 and f"运行时：bundled（{runtime}）" in sandbox_doctor_out)
+    recorder.record("host-python-denied", "通过" if denied_ok else "失败",
+                    "拒绝 /usr/bin/python3、/opt/homebrew 等宿主路径后 doctor 仍通过" if denied_ok
+                    else f"沙盒内 doctor 异常：{sandbox_doctor_out.strip()[-200:]}",
+                    evidence=sandbox_doctor)
+    if not denied_ok:
         return finish()
 
     # --- 3. 沙箱固件来源证明（aarch64 + App 内固件） ---
@@ -662,6 +661,12 @@ def main(argv: list[str] | None = None) -> int:
                     "App 树、App 固件模板、原始基盘与原始 RAW NVRAM 哈希均未变化" if not changed
                     else f"以下对象发生变化：{list(changed)}",
                     invariants={name: pair[0] for name, pair in invariants.items()})
+
+    pycache_after = {path.relative_to(app).as_posix() for path in app.rglob("__pycache__")}
+    new_pycache = sorted(pycache_after - pycache_before)
+    recorder.record("no-bytecode-writes", "通过" if not new_pycache else "失败",
+                    f"运行后无新增字节码缓存（-B 生效；随包预编译缓存 {len(pycache_before)} 处保持原样）"
+                    if not new_pycache else f"运行写入新的字节码缓存：{new_pycache[:3]}")
 
     check_result = run([str(runtime / "bin" / "qemu-img"), "check", str(local_base)],
                        env=env, timeout=args.timeout)

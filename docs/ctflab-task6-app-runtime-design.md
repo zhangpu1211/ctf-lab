@@ -15,7 +15,8 @@
 
 边界：
 
-- 不内置 Python 解释器与 PyYAML（`.app` 使用 PATH 中的 `python3`，验收脚本用它建 venv 安装 PyYAML）；
+- **内置 Python 3.12 解释器与 PyYAML**（python-build-standalone，见 §11）：启动器只使用 app 内
+  解释器，缺失即报错，**不回退**系统 Python；接收者无需 venv/pip/联网；
 - 不改默认 QEMU 命令语义、不改 `run/stop/reset` 行为、不动 UTM 路径；
 - 不写入 app：状态、镜像、overlay、日志仍在 `~/Library/Application Support/CTFLab`；
 - 本地构建，不签名分发：默认 ad-hoc 签名；没有 Developer ID 身份时**不会**冒充正式签名。
@@ -26,22 +27,27 @@
 CTFLab.app/
 ├── Contents/
 │   ├── Info.plist                      # CFBundleExecutable=CTFLab、版本与 MANIFEST 一致
-│   ├── MacOS/CTFLab                    # 启动器：导出 CTFLAB_RUNTIME_ROOT 后 exec python3
+│   ├── MacOS/CTFLab                    # 启动器：导出 CTFLAB_RUNTIME_ROOT 后 exec 内置解释器
 │   ├── _CodeSignature/                 # codesign 写入（不在 MANIFEST 内）
 │   └── Resources/
 │       ├── ctflab/tools/…              # 与仓库同构的源码镜像（profile、guest_fixes、fixture）
 │       ├── runtime/bin/                # qemu-system-aarch64、qemu-system-x86_64、qemu-img
 │       ├── runtime/lib/                # 全部非系统动态库（闭包，install id 改为 @loader_path）
 │       ├── runtime/share/qemu/         # firmware/ROM/keymaps（见 §5 白名单）
-│       ├── licenses/<formula>/…        # 随包组件的许可证文本（含 edk2）
-│       ├── MANIFEST.json               # 逐文件 SHA-256、运行时清单、签名分级、分发阻塞
+│       ├── runtime/python/             # 内置 Python 3.12（裁剪后 stdlib + site-packages/yaml，见 §11）
+│       ├── licenses/<formula>/…        # 随包组件的许可证文本（含 edk2、python、pyyaml、dtc vendored）
+│       ├── LICENSE                     # 项目自身 MIT 许可证全文
+│       ├── SOURCE_OFFER.md             # QEMU 对应源码书面要约（GPL-2.0 §3，见 §6）
+│       ├── MANIFEST.json               # 逐文件 SHA-256、运行时清单、签名分级、许可证状态
 │       ├── SBOM.json                   # 组件、版本、架构、哈希、许可证、bundled 状态
 │       └── THIRD_PARTY_LICENSES.md     # 人读清单 + QEMU/GPL 义务单列
 └── （app 外同级目录）CTFLab.app.sha256  # 旁车：app 树哈希 + MANIFEST.json 哈希
 ```
 
-启动器内容经过测试断言：不含 `/opt/homebrew`、`/usr/local`、`/Users/`、`conda` 等开发机路径；
-运行时根由 `Contents/Resources/runtime` 计算并导出为 `CTFLAB_RUNTIME_ROOT`。
+启动器内容经过测试与 `verify_app` 断言：不含 `/opt/homebrew`、`/usr/local`、`/Users/`、`conda`
+等开发机路径，不含 `command -v python3`（禁止探测系统解释器）；运行时根由
+`Contents/Resources/runtime` 计算并导出为 `CTFLAB_RUNTIME_ROOT`，解释器固定为
+`runtime/python/bin/python3` 且以 `-B -s -E` 调用（见 §11）。
 
 ## 3. 运行时选择规则（`tools/ctflab.py`）
 
@@ -120,14 +126,18 @@ CTFLab.app/
 
 ## 9. 验收方式
 
-- 单元测试 `tools/tests/test_ctflab_app.py`（43 项，用 clang 现场编译的最小 QEMU 替身，不依赖 Homebrew；
-  含 entitlement 键和值摘要、GRUB/LightDM 分类、口令必填与标准输入传递守卫）；
+- 单元测试 `tools/tests/test_ctflab_app.py`（58 项，用 clang 现场编译的最小 QEMU/Python 替身，
+  不依赖 Homebrew；含 entitlement 键和值摘要、许可证与书面要约、Python 裁剪与符号链接解引用、
+  GRUB/LightDM 分类、口令必填与标准输入传递守卫）；
 - 真实 E2E `tools/ctflab_app_e2e.py`：独立 HOME + 最小 PATH（**不含 `/opt/homebrew/bin`**）下
-  校验 app → doctor（bundled 运行时）→ venv 安装 PyYAML → `sandbox-exec` 固件来源证明 →
-  import → run --headless → health（DHCP/SSH）→ stop → reset → 无残留 → app 树哈希不变 →
-  `codesign --verify --deep --strict` 按实际级别记录；过程中从进程命令行证明 QEMU 来自 `.app`。
-- 证据与结论见 `docs/verification-task6-2-2026-09-15.md`；Kali ARM64 + UEFI 的真实运行验收见
-  `docs/verification-task6-3a-2026-09-15.md`（该记录同时给出 entitlement 丢失缺陷的定位与修复）。
+  校验 app → doctor **首次即 0 退出**（内置解释器 + PyYAML + bundled 运行时，无 venv/pip）→
+  `sandbox-exec` 拒绝宿主 Python 位置后 doctor 仍通过 → `sandbox-exec` 固件来源证明 →
+  import → run --headless → health（DHCP/SSH）→ stop → reset → 无残留 → app 树哈希不变与
+  无新增 `__pycache__` → `codesign --verify --deep --strict` 按实际级别记录；
+  过程中从进程命令行证明 QEMU 来自 `.app`。
+- 证据与结论见 `docs/verification-task6-2-2026-09-15.md`、`docs/verification-task6-3a-2026-09-15.md`
+  （entitlement 丢失缺陷的定位与修复）与 `docs/verification-task6-3b-2026-09-15.md`
+  （许可证闭环与内置 Python 运行时）。
 
 ## 10. 仍需决策
 
@@ -136,3 +146,31 @@ CTFLab.app/
    （`tools/licenses/`，见 PROVENANCE.md）+ 随包书面要约（`SOURCE_OFFER.md`）；
 3. Developer ID 身份与公证 Keychain Profile（依赖用户提供，本轮未使用）；
 4. 面向学生的基盘镜像分发渠道与校验方式。
+
+## 11. 内置 Python 运行时与 PyYAML（2026-09-15）
+
+目标：接收者机器**不需要**任何 Python 环境——无系统解释器、无 venv、无 pip、无联网。
+
+- **来源**：python-build-standalone 的 `install_only_stripped` 发行版
+  （`cpython-<版本>+<release>-aarch64-apple-darwin-...tar.gz`，实测 3.12.14 归档 25MB/解压 66MB）；
+  构建时必填 `--python-runtime` 与其可选 SHA-256，归档成员逐个校验路径与类型后再解包；
+- **复制与裁剪**：复制进 `runtime/python/`，按 `PYTHON_PRUNE_GLOBS` 裁剪 30 项（pip/ensurepip、
+  idle/lib2to3、tkinter/Tcl/Tk、include/share、静态链接下运行时不加载的 libpython 等），
+  逐项记录到 `MANIFEST.runtime.python.pruned`；裁剪不猜测，新增删除项必须写明理由；
+- **符号链接**：解引用为硬链接（去重别名体积），复制后断言零残留——`verify_app` 禁止 app 内
+  出现任何符号链接；
+- **PyYAML**：必填 `--pyyaml`（wheel 或目录），`yaml/` 与 `_yaml/` 原样装入
+  `lib/python3.X/site-packages/`；C 扩展（`_yaml*.so`）依赖均为系统库，保留并签名；
+  MIT 许可证文本从 wheel 的 `dist-info/licenses/` 提取到 `licenses/pyyaml/`；
+- **解释器与 stdlib 许可证**：PSF `LICENSE.txt` 从发行版提取到 `licenses/python/`；
+- **签名与扫描**：递归签名 python 树内全部 Mach-O（解释器、扩展模块），引用扫描覆盖该子树
+  （嵌套未签名代码会让 `codesign --verify --deep --strict` 失败）；
+- **启动器**：固定 `runtime/python/bin/python3`，缺失即报错、不回退系统 Python；以
+  `-B -s -E` 调用并导出 `PYTHONDONTWRITEBYTECODE`/`PYTHONNOUSERSITE`——**禁止**在已签名
+  bundle 内写 `__pycache__`（否则清单与签名被破坏；旧启动器的这一潜在缺陷已修复并加断言）；
+- **SBOM**：`CPython` 与 `PyYAML` 组件记录版本、来源、归档/wheel SHA-256、`directory`
+  与裁剪清单；`app verify` 校验组件目录存在、`runtime.python` 字段与 Python 条目的完整性。
+
+实测（`docs/verification-task6-3b-2026-09-15.md`）：最小 PATH + 独立 HOME 下首次 `doctor`
+即 0 退出；`sandbox-exec` 拒绝宿主 Python 位置后仍通过；smoke E2E 15/15；App 体积
+218MB → 264MB。
