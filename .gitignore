@@ -13,12 +13,16 @@
 !/docs/verification-2026-09-07.md
 !/docs/verification-2026-09-13.md
 !/docs/verification-2026-09-14.md
+!/docs/verification-utm-smoke-2026-09-14.md
+!/docs/verification-utm-basic-pentesting-2-2026-09-14.md
 
 /tools/*
 !/tools/ctflab
 !/tools/ctflab.py
 !/tools/ctflab_inspect.py
 !/tools/ctflab_network.py
+!/tools/ctflab_utm.py
+!/tools/ctflab_utm_fixture.json
 !/tools/ctflab_profiles/
 !/tools/guest_fixes/
 !/tools/tests/

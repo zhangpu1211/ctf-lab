@@ -363,7 +363,7 @@ qemu-img create -f qcow2 -F qcow2 \
 - [x] 验证 XFCE 登录、键盘、鼠标、1920×1080 手动显示及 Firefox/Burp/Wireshark 主界面。
 - [x] 验证 XFCE 登录、窗口缩放、键盘、鼠标和至少 1920×1080 显示。
 - [x] 安装/验证 guest agent 的文本剪贴板：Mac↔Kali 双向（英文/中文/多行）、关闭通道不共享、重启后可用。
-- [ ] 动态分辨率：默认路径（QEMU 11.1 + cocoa + virtio-gpu）没有让来宾分辨率跟随窗口的通道（2026-09-13 证据）。两条真实路径与推荐见 `docs/ctflab-dynamic-resolution-design.md`：A. 独立 UTM 导出/适配——UTM 侧显示机制 PoC 已验证，CTFLab 导出的 UTM 包尚未 E2E 验收，导出包默认无网卡；B. 将来分发带 SPICE 的 QEMU + 本地 SPICE 客户端——显式请求时能力探测失败必须启动前报错，仅监听 127.0.0.1，未传显示参数时保持 Cocoa 默认，剪贴板未授权不得共享。设计已交付，实现未开始。
+- [ ] 动态分辨率：默认路径（QEMU 11.1 + cocoa + virtio-gpu）没有让来宾分辨率跟随窗口的通道（2026-09-13 证据）。两条真实路径与推荐见 `docs/ctflab-dynamic-resolution-design.md`：A. 独立 UTM 导出/适配——`utm-export` 已实现（aarch64+UEFI 与 x86_64+BIOS 两个变体），UTM 4.7.5 必需段/必需键已按上游源码补齐；2026-09-14 R1 导入被拒后，R2 已通过 UTM 导入/解析、冷启动与 Kali 图形登录、剪贴板负向、网络隔离与来宾内正常关机，会话内动态分辨率三档跟随但**重启后复测失败（显示链路不稳定，当前包仅保证固定显示可用）**；Smoke 与 Basic Pentesting 2 两包已交付并通过 UTM E2E（导入/冷启动/控制台登录/交互/ACPI 正常关机/盘完整性），导出包默认无网卡，详见 `docs/verification-2026-09-14.md` 第 6 节与两份 `verification-utm-*.md`；B. 将来分发带 SPICE 的 QEMU + 本地 SPICE 客户端——显式请求时能力探测失败必须启动前报错，仅监听 127.0.0.1，未传显示参数时保持 Cocoa 默认，剪贴板未授权不得共享（路径 B 未实现）。
 - [x] 明确显示窗口关闭策略：确认框 + ACPI 电源键，来宾确认后正常关机；不提供隐藏后台（需要后台请用 `--headless`）。
 
 2026-09-07：`--headless` 已实现，窗口关闭策略、动态缩放和剪贴板仍未验收。新增 `install/install-status/stop-install/finalize-install`，以及只允许 Kali 独占运行的 `--internet` 维护模式；`--from-runtime` 可保留旧盘并固化维护成果。独立重装实例已验证无需手工修复即可 DHCP/SSH 登录。Ghidra 已安装并出现项目窗口，但首次帮助页报错，不能列为完整工具验收通过。

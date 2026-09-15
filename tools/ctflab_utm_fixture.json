@@ -1,0 +1,141 @@
+{
+  "schema": 2,
+  "fixture_version": 6,
+  "utm_version_reference": "4.7.5",
+  "structure_status": "complete-required-keys",
+  "disk_relative_path": "Data/data.qcow2",
+  "config_structure": {
+    "Backend": "QEMU",
+    "ConfigurationVersion": 4,
+    "Information": {
+      "Icon": "linux",
+      "IconCustom": false,
+      "Name": "<name>",
+      "UUID": "<uuid>"
+    },
+    "System": {
+      "Architecture": "aarch64",
+      "Target": "virt",
+      "CPU": "default",
+      "CPUFlagsAdd": [],
+      "CPUFlagsRemove": [],
+      "CPUCount": "<cpu-count>",
+      "ForceMulticore": false,
+      "MemorySize": "<memory-mib>",
+      "JITCacheSize": 0
+    },
+    "QEMU": {
+      "DebugLog": false,
+      "UEFIBoot": true,
+      "RNGDevice": true,
+      "BalloonDevice": false,
+      "TPMDevice": false,
+      "Hypervisor": true,
+      "TSO": false,
+      "RTCLocalTime": false,
+      "PS2Controller": false,
+      "AdditionalArguments": []
+    },
+    "Input": {
+      "UsbBusSupport": "3.0",
+      "UsbSharing": false,
+      "MaximumUsbShare": 3
+    },
+    "Sharing": {
+      "DirectoryShareMode": "None",
+      "DirectoryShareReadOnly": false,
+      "ClipboardSharing": false
+    },
+    "Display": [
+      {
+        "Hardware": "virtio-gpu-pci",
+        "DynamicResolution": true,
+        "UpscalingFilter": "Nearest",
+        "DownscalingFilter": "Linear",
+        "NativeResolution": false
+      }
+    ],
+    "Drive": [
+      {
+        "Identifier": "<drive-uuid>",
+        "ImageName": "data.qcow2",
+        "ImageType": "Disk",
+        "Interface": "VirtIO",
+        "InterfaceVersion": 1,
+        "ReadOnly": false
+      }
+    ],
+    "Network": [],
+    "Serial": [],
+    "Sound": []
+  },
+  "x86_64_bios_drive_interfaces": {
+    "ide": "IDE",
+    "scsi": "SCSI"
+  },
+  "x86_64_bios_structure": {
+    "Backend": "QEMU",
+    "ConfigurationVersion": 4,
+    "Information": {
+      "Icon": "linux",
+      "IconCustom": false,
+      "Name": "<name>",
+      "UUID": "<uuid>"
+    },
+    "System": {
+      "Architecture": "x86_64",
+      "Target": "pc",
+      "CPU": "qemu64",
+      "CPUFlagsAdd": [],
+      "CPUFlagsRemove": [],
+      "CPUCount": "<cpu-count>",
+      "ForceMulticore": "<force-multicore>",
+      "MemorySize": "<memory-mib>",
+      "JITCacheSize": 0
+    },
+    "QEMU": {
+      "DebugLog": false,
+      "UEFIBoot": false,
+      "RNGDevice": true,
+      "BalloonDevice": false,
+      "TPMDevice": false,
+      "Hypervisor": false,
+      "TSO": false,
+      "RTCLocalTime": false,
+      "PS2Controller": true,
+      "AdditionalArguments": []
+    },
+    "Input": {
+      "UsbBusSupport": "3.0",
+      "UsbSharing": false,
+      "MaximumUsbShare": 3
+    },
+    "Sharing": {
+      "DirectoryShareMode": "None",
+      "DirectoryShareReadOnly": false,
+      "ClipboardSharing": false
+    },
+    "Display": [
+      {
+        "Hardware": "VGA",
+        "DynamicResolution": false,
+        "UpscalingFilter": "Nearest",
+        "DownscalingFilter": "Linear",
+        "NativeResolution": false
+      }
+    ],
+    "Drive": [
+      {
+        "Identifier": "<drive-uuid>",
+        "ImageName": "data.qcow2",
+        "ImageType": "Disk",
+        "Interface": "<drive-interface>",
+        "InterfaceVersion": 1,
+        "ReadOnly": false
+      }
+    ],
+    "Network": [],
+    "Serial": [],
+    "Sound": []
+  }
+}

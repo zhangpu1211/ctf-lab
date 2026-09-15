@@ -33,6 +33,7 @@ import urllib.error
 import urllib.request
 
 from ctflab_inspect import InspectionError, inspect_image, profile_from_report, report_text
+from ctflab_utm import PublishError, UTMExportError, exclusive_rename, export_utm_package
 
 try:
     import yaml
@@ -125,6 +126,26 @@ def qemu_info(path: Path, *, force_share: bool = False) -> dict[str, Any]:
         return json.loads(result.stdout)
     except json.JSONDecodeError as exc:
         raise CTFLabError(f"qemu-img info 返回了无法解析的内容：{path}") from exc
+
+
+def compare_disk_images(source: Path, source_format: str, base_path: Path) -> bool:
+    """用 qemu-img compare（严格模式）判断来源与现有基盘的来宾可见内容是否一致。
+
+    必须使用 `-s`：默认模式下 qemu-img compare 只警告尺寸不一致并仍返回 0，
+    会把截断或不同容量的镜像误判为一致。返回 True 表示一致；False 表示内容或容量不同；
+    无法比较（文件损坏等）时抛错，调用方必须按“不可信”处理。
+    """
+    result = subprocess.run(
+        [qemu_img_path(), "compare", "-s", "-f", source_format, "-F", "qcow2", str(source), str(base_path)],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode == 0:
+        return True
+    if result.returncode == 1:
+        return False
+    detail = (result.stderr or result.stdout or "").strip()
+    raise CTFLabError(f"qemu-img compare 无法完成（退出码 {result.returncode}）：{detail[:400]}")
 
 
 def validate_arm64_installer_iso(path: Path) -> dict[str, Any]:
@@ -793,8 +814,8 @@ class LabManager:
                 and Path(str(existing.get("base_path", ""))).exists()
             ):
                 # 同一来源的重复导入必须是幂等的，尤其不能把已验证的来宾修复基盘
-                # 悄悄切回最初转换出的未修复基盘。
-                return existing
+                # 悄悄切回最初转换出的未修复基盘；同时不得静默信任缺少 base_sha256 的旧基盘。
+                return self._reuse_existing_base(profile_id, existing, source_for_convert)
             info = qemu_info(source_for_convert)
             source_format = str(info.get("format") or "")
             if not source_format:
@@ -802,8 +823,20 @@ class LabManager:
             image_dir = self.images_dir / profile_id
             image_dir.mkdir(parents=True, exist_ok=True)
             base_path = image_dir / f"base-{source_hash[:12]}.qcow2"
-            if not base_path.exists():
-                run_command([qemu_img_path(), "convert", "-f", source_format, "-O", "qcow2", str(source_for_convert), str(base_path)], capture=False)
+            evidence = "converted"
+            if base_path.exists():
+                # 目标基盘已存在但没有可信登记：不得直接计算当前哈希并登记。
+                # 只有 qemu-img compare 证明它与来源镜像的来宾可见内容一致时才登记。
+                if not compare_disk_images(source_for_convert, source_format, base_path):
+                    raise CTFLabError(
+                        f"已存在 {base_path.name}，但没有可信的 base_sha256 登记，"
+                        "且 qemu-img compare 未能证明它与来源镜像的来宾可见内容一致；"
+                        "拒绝登记该文件。请人工核对该文件，或等待后续专门的完整性迁移流程。"
+                    )
+                evidence = "qemu-img-compare"
+                base_path.chmod(0o444)
+            else:
+                self._convert_base_image(source_for_convert, source_format, base_path)
             destination_info = qemu_info(base_path)
             state = {
                 "schema": 1,
@@ -813,6 +846,8 @@ class LabManager:
                 "source_sha256": source_hash,
                 "source_format": source_format,
                 "base_path": str(base_path),
+                "base_sha256": sha256_file(base_path),
+                "base_sha256_evidence": evidence,
                 "virtual_size": destination_info.get("virtual-size"),
                 "imported_at": now_iso(),
                 "guest": profile.get("guest", {}),
@@ -822,6 +857,54 @@ class LabManager:
         finally:
             if temporary_dir is not None:
                 temporary_dir.cleanup()
+
+    def _reuse_existing_base(self, profile_id: str, existing: dict[str, Any], source_for_convert: Path) -> dict[str, Any]:
+        """重复导入：已登记则核对；未登记则只在内容比对证明一致时补登记。"""
+        base_path = Path(str(existing.get("base_path")))
+        registered = str(existing.get("base_sha256") or "")
+        if registered:
+            if sha256_file(base_path) != registered:
+                raise CTFLabError(
+                    f"{profile_id} 的基础镜像与登记 base_sha256 不一致；拒绝静默重新登记。"
+                    "请人工核对，或等待后续专门的完整性迁移流程。"
+                )
+            return existing
+        source_format = str(existing.get("source_format") or "")
+        if not source_format:
+            source_format = str(qemu_info(source_for_convert).get("format") or "")
+        if not source_format or not compare_disk_images(source_for_convert, source_format, base_path):
+            raise CTFLabError(
+                f"{profile_id} 的导入记录缺少 base_sha256，且 qemu-img compare 未能证明现有基盘与"
+                "来源镜像的来宾可见内容一致；拒绝登记该文件。请人工核对，或等待后续专门的完整性迁移流程。"
+            )
+        state = dict(existing)
+        state["base_sha256"] = sha256_file(base_path)
+        state["base_sha256_evidence"] = "qemu-img-compare"
+        base_path.chmod(0o444)
+        write_json(self.image_state_path(profile_id), state)
+        return state
+
+    def _convert_base_image(self, source: Path, source_format: str, base_path: Path) -> None:
+        """新转换写入临时文件，info/check 通过后再排他发布，并设为只读。"""
+        temporary_base = base_path.parent / f"{base_path.stem}.partial-{os.getpid()}-{int(time.time() * 1000)}.qcow2"
+        try:
+            run_command(
+                [qemu_img_path(), "convert", "-f", source_format, "-O", "qcow2", str(source), str(temporary_base)],
+                capture=False,
+            )
+            if str(qemu_info(temporary_base).get("format") or "") != "qcow2":
+                raise CTFLabError("基础镜像转换结果不是 qcow2，拒绝发布。")
+            run_command([qemu_img_path(), "check", "-q", str(temporary_base)])
+            try:
+                exclusive_rename(temporary_base, base_path)
+            except PublishError as exc:
+                raise CTFLabError(
+                    f"发布基础镜像失败：{exc}。目标可能是外部并发创建的文件，请人工核对。"
+                ) from exc
+            base_path.chmod(0o444)
+        finally:
+            if temporary_base.exists():
+                temporary_base.unlink(missing_ok=True)
 
     def installer_command(
         self,
@@ -2136,6 +2219,28 @@ def cmd_import(manager: LabManager, args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_utm_export(manager: LabManager, args: argparse.Namespace) -> int:
+    """路径 A：把一个已导入的基础镜像导出为新的 UTM 包（aarch64+UEFI 或 x86_64+BIOS 变体）。"""
+    profile_id = PROFILE_ALIASES.get(args.profile, args.profile)
+    with manager.operation_lock(f"导出 {profile_id} 的 UTM 包"):
+        try:
+            result = export_utm_package(
+                profile_id=profile_id,
+                profile=load_profile(profile_id),
+                image_state=manager.image_state(profile_id),
+                out_dir=args.out,
+                name=args.name,
+            )
+        except UTMExportError as exc:
+            raise CTFLabError(str(exc)) from exc
+    out_dir = Path(args.out).expanduser()
+    print(f"UTM 包已导出：{out_dir / result['bundle']['name']}")
+    print(f"导出清单：{out_dir / result['manifest']['name']}")
+    print("提示：UTM 4.7.5 必需段/键已按上游源码补齐；真实 UTM E2E 结论见设计文档 2.4 与 "
+          "docs/verification-utm-*.md：重启后复测失败，显示链路不稳定；当前包仅保证固定显示可用。")
+    return 0
+
+
 def cmd_install(manager: LabManager, args: argparse.Namespace) -> int:
     state = manager.start_install(
         args.profile,
@@ -2403,6 +2508,14 @@ def build_parser() -> argparse.ArgumentParser:
     probe_parser.add_argument("--matrix-timeout", type=int, default=90, help="矩阵中每个候选的探测秒数，默认 90")
     probe_parser.add_argument("--matrix-max", type=int, help="只尝试前 N 个候选（用于快速排查）")
     probe_parser.add_argument("--matrix-start", type=int, default=1, help="跳过前 N-1 个候选，从第 N 个开始（用于验证回退路径与定位）")
+
+    utm_export_parser = subparsers.add_parser(
+        "utm-export",
+        help="把已导入的基础镜像导出为新的 UTM 包（路径 A；支持 aarch64+UEFI 与 x86_64+BIOS 变体）",
+    )
+    utm_export_parser.add_argument("profile", choices=profile_choices)
+    utm_export_parser.add_argument("--out", type=Path, required=True, help="输出目录；目标已存在时一律拒绝覆盖")
+    utm_export_parser.add_argument("--name", help="包名（不含 .utm 后缀），默认使用配置 id")
     return parser
 
 
@@ -2426,6 +2539,7 @@ def main(argv: list[str] | None = None) -> int:
         "reset": cmd_reset,
         "health": cmd_health,
         "probe": cmd_probe,
+        "utm-export": cmd_utm_export,
     }
     try:
         if args.command == "stop" and not args.all and not args.profiles:
