@@ -2,8 +2,11 @@
 
 > 状态：**已实现 + 真实 E2E 通过（限定范围）**，2026-09-15。本文件描述 `.app` 结构、运行时选择规则、
 > 动态库打包与改写、SBOM/许可证、签名分级与验收方式。
-> **未交付**：Developer ID 正式签名、公证、`.pkg`/DMG 安装器；项目许可证仍为 `undeclared`，
-> **禁止公开发布**；一个随包组件的许可证文本缺失（见 §6）。
+> 许可证与 GPL 义务已在 Task 6.3B 闭环：项目代码 MIT（随包 `LICENSE`），`dtc`/libfdt 许可证文本
+> 由仓库 `tools/licenses/` 提供（`license_text_status=vendored`），QEMU 源码义务以随包
+> `SOURCE_OFFER.md`（GPL-2.0 §3 书面要约）履行。
+> **未交付**：Developer ID 正式签名、公证、`.pkg`/DMG 安装器——对外分发前仍建议先完成，否则
+> 每个接收者需要在系统设置中手动放行（见 §7）。
 
 ## 1. 目标与边界
 
@@ -85,12 +88,17 @@ CTFLab.app/
   绝对路径；
 - 许可证文本从 Homebrew keg 收集（`COPYING*`/`LICENSE*`/`NOTICE*`/`LGPL-*`/`GPL-*` 等），
   EDK2 许可证文本随固件提供；
-- **QEMU/GPL 义务单独列出**：GPL-2.0-only 随二进制分发需要提供对应源码或书面要约；
-  本 app 未随附源码，因此**不得宣称 GPL 合规、不得公开发布**；
-- 已知缺口：`dtc`（libfdt）在 Homebrew keg 中没有许可证文本——构建默认会**失败**；
-  本地测试用 `--allow-incomplete-license-texts` 放行，并在 `MANIFEST.json.license.distribution_blockers`
-  与 `SBOM.json`（`license_text_status: missing-in-keg`）中如实记录。对外分发前必须补齐文本；
-- 项目自身许可证仍为 `undeclared`：不得公开发布，也不得宣称许可证问题已解决。
+- **回退来源**：keg 内没有文本的组件（如 `dtc`/libfdt）回退到仓库 `tools/licenses/<formula>/` 的
+  vendored 文本，来源与哈希登记在 `tools/licenses/PROVENANCE.md`；SBOM 记
+  `license_text_status: "vendored"`。keg 与 vendored 都没有时构建仍然失败（除非显式
+  `--allow-incomplete-license-texts`），不猜测；
+- **项目自身许可证**：MIT（`ctflab_package.PROJECT_LICENSE` 单一来源）。`LICENSE` 全文随包放在
+  `Contents/Resources/LICENSE`，`MANIFEST.json.license.status = "MIT"`；
+- **QEMU/GPL 义务单独列出**：GPL-2.0-only 随二进制分发需要提供对应源码或书面要约；本 app 不随附
+  源码，改为随包 `SOURCE_OFFER.md`（GPL-2.0 §3 书面要约）：写明 QEMU 精确版本、上游源码归档 URL
+  与 SHA-256（登记于 `QEMU_SOURCE_SHA256`，未知版本直接构建失败）、有效期（分发之日起三年）与获取
+  渠道；`MANIFEST.json.license.source_offer` 与 `app verify` 校验要约字段、与登记表的一致性以及
+  `SOURCE_OFFER.md` 内容确实包含所声明的版本/URL/哈希，防止文档过期。
 
 ## 7. 签名分级
 
@@ -123,6 +131,8 @@ CTFLab.app/
 
 ## 10. 仍需决策
 
-1. 项目许可证（公开分发前提）与 `dtc`/libfdt 许可证文本的补齐方式；
-2. 是否随附 QEMU 对应源码或书面要约以满足 GPL 分发义务；
-3. Developer ID 身份与公证 Keychain Profile（依赖用户提供，本轮未使用）。
+1. ~~项目许可证~~ 已决定：MIT（2026-09-15）；
+2. ~~`dtc`/libfdt 许可证文本补齐方式与 QEMU 源码义务~~ 已实现：仓库 vendored 文本
+   （`tools/licenses/`，见 PROVENANCE.md）+ 随包书面要约（`SOURCE_OFFER.md`）；
+3. Developer ID 身份与公证 Keychain Profile（依赖用户提供，本轮未使用）；
+4. 面向学生的基盘镜像分发渠道与校验方式。

@@ -323,7 +323,9 @@ qemu-img create -f qcow2 -F qcow2 \
 
 ### Task 0：基线与兼容性验证
 
-- [ ] 固定首版 QEMU 版本、构建来源和许可证清单。
+- [x] 固定首版 QEMU 版本、构建来源和许可证清单（2026-09-15 Task 6.3B：随包 QEMU 11.1.0，
+  SBOM 记录 Homebrew 来源与逐文件哈希；项目 MIT、`dtc` vendored 文本、QEMU 书面要约见
+  `docs/ctflab-task6-app-runtime-design.md` 第 6 节）。
 - [ ] 在 Mac M 上验证 `qemu-system-aarch64 -accel hvf`。
 - [x] 在 Mac M 上验证 x86_64 TCG 多线程启动 Smoke 与 Basic。
 - [x] 记录每台镜像的 BIOS、磁盘控制器、网卡、内存和 CPU 最小配置。

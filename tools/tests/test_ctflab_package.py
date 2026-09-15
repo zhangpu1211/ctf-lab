@@ -157,7 +157,7 @@ class ReleaseBundleTests(PackageTestCase):
         report = ctflab_package.verify_release_bundle(pathlib.Path(result["bundle"]))
         manifest = report["manifest"]
         self.assertEqual(manifest["format"], "ctflab-release")
-        self.assertEqual(manifest["license"]["status"], "undeclared")
+        self.assertEqual(manifest["license"]["status"], ctflab_package.PROJECT_LICENSE)
         self.assertIn("不包含 CTFLab.app", " ".join(manifest["notes"]))
         names = {entry["path"] for entry in manifest["files"]}
         self.assertIn("tools/ctflab.py", names)
@@ -165,6 +165,7 @@ class ReleaseBundleTests(PackageTestCase):
         self.assertIn("tools/ctflab_profiles/smoke.yaml", names)
         self.assertIn("tools/guest_fixes/smoke/interfaces", names)
         self.assertIn("README.md", names)
+        self.assertIn("LICENSE", names, "项目许可证全文必须随包分发")
         self.assertFalse([name for name in names if name.startswith("tools/tests")],
                          "发布包不得包含开发测试目录")
 
@@ -490,7 +491,7 @@ class SbomTests(PackageTestCase):
         entries = ctflab_package.read_tar_gz(pathlib.Path(result["bundle"]))
         sbom = json.loads(entries["ctflab-0.1.0/SBOM.json"].decode("utf-8"))
         by_name = {component["name"]: component for component in sbom["components"]}
-        self.assertEqual(by_name["ctflab"]["license"], "undeclared")
+        self.assertEqual(by_name["ctflab"]["license"], ctflab_package.PROJECT_LICENSE)
         self.assertIs(by_name["ctflab"]["bundled"], True)
         self.assertEqual(by_name["PyYAML"]["license"], "MIT")
         self.assertEqual(by_name["QEMU (qemu-system-*, qemu-img)"]["license"], "GPL-2.0-only")
@@ -498,7 +499,8 @@ class SbomTests(PackageTestCase):
         self.assertTrue(all(c["bundled"] is False for c in others),
                         "当前发布包不内置任何第三方组件")
         licenses = entries["ctflab-0.1.0/THIRD_PARTY_LICENSES.md"].decode("utf-8")
-        self.assertIn("尚未声明许可证", licenses)
+        self.assertIn(ctflab_package.PROJECT_LICENSE, licenses)
+        self.assertIn("LICENSE", licenses)
         self.assertIn("MIT", licenses)
 
     def test_sums_file_lists_every_file(self) -> None:

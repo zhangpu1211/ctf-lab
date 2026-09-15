@@ -57,9 +57,11 @@ ctflab-<version>-macos-arm64.tar.gz
 - **版本一致性**：发布包版本必须与 `tools/ctflab.py` 中的 `CTFLAB_VERSION` 一致，避免清单版本与
   实际运行器版本漂移；`--version` 仅接受该单一来源的当前值；
 - **目标保护**：输出目录中同名目标已存在一律拒绝，不覆盖（与 `utm-export` 一致的排他发布原则）；
-- **许可证状态**：仓库当前**未声明**项目许可证；`MANIFEST.json.license.status = "undeclared"` 且
-  `install.sh` 会原样提示。第三方组件许可证见 `THIRD_PARTY_LICENSES.md`。对外分发前必须由权利人
-  补充 LICENSE——打包工具不会替项目选择许可证。
+- **许可证状态**：项目自身代码以 **MIT** 发布（`ctflab_package.PROJECT_LICENSE` 单一来源），
+  `MANIFEST.json.license.status = "MIT"`、`SBOM.json` 的同名组件与 `install.sh` 输出同一状态；
+  根目录 `LICENSE` 全文随包分发（`RELEASE_DOC_FILES` 白名单）。第三方组件许可证见
+  `THIRD_PARTY_LICENSES.md`。发布包不内置 QEMU 等第三方二进制，因此不含 GPL 源码义务；
+  该义务只适用于 `.app`（见 `docs/ctflab-task6-app-runtime-design.md` 的书面要约设计）。
 
 ## 3. `.ctflab` 内容包格式
 
@@ -117,6 +119,7 @@ smoke-1.0.0.ctflab
 
 ## 7. 仍需决策
 
-1. 项目许可证（对外分发前必须由权利人决定）；
+1. ~~项目许可证~~ 已决定：MIT（2026-09-15，`LICENSE` 入库，`PROJECT_LICENSE` 单一来源）；
 2. `.app`/QEMU 运行时打包方案与签名、公证流程（Task 6 后续子任务）；
-3. 内容包是否需要签名（当前只有 SHA-256 完整性，无来源认证）。
+3. 内容包是否需要签名（当前只有 SHA-256 完整性，无来源认证）；
+4. 面向学生的基盘镜像分发渠道与校验方式（内容包不含虚拟磁盘，该问题在 .app 交付路线中另行设计）。

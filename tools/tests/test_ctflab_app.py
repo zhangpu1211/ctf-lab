@@ -33,8 +33,16 @@ FAKE_SHARE_FILES = ("firmware-a.fd", "firmware-b.fd", "bios-test.bin", "rom-test
                     "edk2-licenses.txt")
 
 MAIN_C = """#include <stdio.h>
+#include <string.h>
 int stub_answer(void);
-int main(void) { printf("%d\\n", stub_answer()); return 0; }
+int main(int argc, char **argv) {
+  if (argc > 1 && strcmp(argv[1], "--version") == 0) {
+    printf("QEMU emulator version 11.1.0\\n");
+    return 0;
+  }
+  printf("%d\\n", stub_answer());
+  return 0;
+}
 """
 LIB_C = "int stub_answer(void) { return 42; }\n"
 LIB2_C = "int stub_answer(void); int layer2(void) { return stub_answer() + 1; }\n"
@@ -81,7 +89,8 @@ class FakeRuntime:
             raise RuntimeError(result.stderr)
 
 
-def make_source_root(path: pathlib.Path, *, with_decoys: bool = False) -> pathlib.Path:
+def make_source_root(path: pathlib.Path, *, with_decoys: bool = False,
+                     with_vendored: bool = False) -> pathlib.Path:
     """最小 CTFLab 源码树（用于 app 内的 tools/ 镜像）。"""
     path.mkdir(parents=True, exist_ok=True)
     (path / "tools" / "ctflab_profiles").mkdir(parents=True, exist_ok=True)
@@ -95,6 +104,13 @@ def make_source_root(path: pathlib.Path, *, with_decoys: bool = False) -> pathli
         encoding="utf-8")
     (path / "tools" / "guest_fixes" / "smoke" / "interfaces").write_text("auto lo\n", encoding="utf-8")
     (path / "README.md").write_text("# stub\n", encoding="utf-8")
+    (path / "LICENSE").write_text("MIT License\n\nstub for tests\n", encoding="utf-8")
+    if with_vendored:
+        # 假 runtime 的 dylib 不在 /opt/homebrew 下，formula 归为 unknown；
+        # 在 vendored 目录里放文本即可命中回退路径。
+        vendored = path / "tools" / "licenses" / "unknown"
+        vendored.mkdir(parents=True, exist_ok=True)
+        (vendored / "BSD-2-Clause").write_text("vendored license stub\n", encoding="utf-8")
     if with_decoys:
         (path / "tools" / "guest_fixes" / "smoke" / "evil.qcow2").write_bytes(b"disk")
         (path / "tools" / "guest_fixes" / "smoke" / "guest-credentials.txt").write_bytes(b"secret")
@@ -506,6 +522,113 @@ class EntitlementPreservationTests(AppTestCase):
         with self.assertRaises(ctflab_app.AppBuildError) as raised:
             ctflab_app.verify_app(app, check_signature=False)
         self.assertIn("entitlements", str(raised.exception))
+
+
+class LicenseComplianceTests(AppTestCase):
+    """项目 LICENSE、vendored 许可证文本回退与 QEMU 源码书面要约（GPL-2.0 §3）。"""
+
+    def test_app_ships_license_and_source_offer(self) -> None:
+        source_root = make_source_root(pathlib.Path(self.temp.name) / "license-src",
+                                       with_vendored=True)
+        result = self.build(source_root=source_root)
+        app = pathlib.Path(result["app"])
+        manifest = result["manifest"]
+        self.assertEqual(manifest["license"]["status"], ctflab_package.PROJECT_LICENSE)
+        self.assertEqual(manifest["license"]["project_license_file"], ctflab_app.LICENSE_REL)
+        blockers = manifest["license"]["distribution_blockers"]
+        for blocker in blockers:
+            self.assertNotIn("项目许可证未声明", blocker,
+                             "许可证已声明，不得再记录旧的分发阻塞")
+            self.assertNotIn("unknown", blocker, "vendored 回退应已覆盖缺失文本")
+        offer = manifest["license"]["source_offer"]
+        self.assertEqual(offer["qemu_version"], "11.1.0")
+        self.assertEqual(offer["sha256"], ctflab_app.QEMU_SOURCE_SHA256["11.1.0"])
+        self.assertEqual(offer["url"], "https://download.qemu.org/qemu-11.1.0.tar.xz")
+        self.assertEqual(offer["valid_until"], "2029-09-15T00:00:00Z")
+        license_text = (app / ctflab_app.LICENSE_REL).read_text(encoding="utf-8")
+        self.assertIn("MIT License", license_text)
+        offer_text = (app / ctflab_app.SOURCE_OFFER_REL).read_text(encoding="utf-8")
+        self.assertIn("GPL", offer_text)
+        self.assertIn(offer["sha256"], offer_text)
+        third_party = (app / ctflab_app.THIRD_PARTY_REL).read_text(encoding="utf-8")
+        self.assertIn(ctflab_package.PROJECT_LICENSE, third_party)
+        ctflab_app.verify_app(app, check_signature=False)
+
+    def test_vendored_license_texts_cover_missing_keg(self) -> None:
+        source_root = make_source_root(pathlib.Path(self.temp.name) / "vendored-src",
+                                       with_vendored=True)
+        result = self.build(source_root=source_root)
+        app = pathlib.Path(result["app"])
+        dylibs = [c for c in result["sbom"]["components"] if c.get("file", "").endswith(".dylib")]
+        self.assertTrue(dylibs, "fixture 必须包含 dylib 组件")
+        for component in dylibs:
+            self.assertEqual(component["license_text_status"], "vendored",
+                             "假 runtime 的 dylib 不在 Homebrew keg 中，必须命中 vendored 回退")
+        vendored_file = app / ctflab_app.LICENSES_REL / "unknown" / "BSD-2-Clause"
+        self.assertTrue(vendored_file.is_file(), "vendored 许可证文本必须随包复制")
+
+    def test_missing_project_license_stops_build(self) -> None:
+        source_root = make_source_root(pathlib.Path(self.temp.name) / "no-license-src")
+        (source_root / "LICENSE").unlink()
+        with self.assertRaises(ctflab_app.AppBuildError) as raised:
+            self.build(source_root=source_root)
+        self.assertIn("LICENSE", str(raised.exception))
+
+    def test_unregistered_qemu_version_stops_build(self) -> None:
+        with mock.patch.dict(ctflab_app.QEMU_SOURCE_SHA256, {}, clear=True):
+            with self.assertRaises(ctflab_app.AppBuildError) as raised:
+                self.build()
+        self.assertIn("未登记", str(raised.exception))
+
+    def test_source_offer_tampering_is_rejected(self) -> None:
+        result = self.build()
+        app = pathlib.Path(result["app"])
+        offer_path = app / ctflab_app.SOURCE_OFFER_REL
+        offer_path.write_text("# 被替换的要约\n", encoding="utf-8")
+        # 同步 MANIFEST 中 SOURCE_OFFER.md 的普通文件哈希，让测试抵达要约一致性校验。
+        manifest_path = app / ctflab_app.MANIFEST_REL
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        for entry in manifest["files"]:
+            if entry["path"] == ctflab_app.SOURCE_OFFER_REL:
+                entry["sha256"] = ctflab_app.sha256_file(offer_path)
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        with self.assertRaises(ctflab_app.AppBuildError) as raised:
+            ctflab_app.verify_app(app, check_signature=False)
+        self.assertIn("SOURCE_OFFER.md", str(raised.exception))
+
+    def test_source_offer_registry_mismatch_is_rejected(self) -> None:
+        result = self.build()
+        app = pathlib.Path(result["app"])
+        manifest_path = app / ctflab_app.MANIFEST_REL
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["license"]["source_offer"]["sha256"] = "0" * 64
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        with self.assertRaises(ctflab_app.AppBuildError) as raised:
+            ctflab_app.verify_app(app, check_signature=False)
+        self.assertIn("登记表不一致", str(raised.exception))
+
+
+class FormulaVersionTests(unittest.TestCase):
+    """SBOM 的来源字段依赖 Cellar 版本解析；解析失败会静默降级成 `?`。"""
+
+    def test_cellar_symlink_resolves_to_version(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            opt_root = pathlib.Path(temp) / "opt"
+            keg = pathlib.Path(temp) / "Cellar" / "qemu" / "11.1.0"
+            keg.mkdir(parents=True)
+            opt_root.mkdir()
+            (opt_root / "qemu").symlink_to(keg, target_is_directory=True)
+            self.assertEqual(ctflab_app._formula_version("qemu", opt_root=opt_root), "11.1.0")
+
+    def test_missing_or_unrelated_paths_return_none(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            opt_root = pathlib.Path(temp) / "opt"
+            opt_root.mkdir()
+            self.assertIsNone(ctflab_app._formula_version("qemu", opt_root=opt_root))
+            outside = pathlib.Path(temp) / "elsewhere" / "qemu"
+            outside.mkdir(parents=True)
+            (opt_root / "qemu").symlink_to(outside, target_is_directory=True)
+            self.assertIsNone(ctflab_app._formula_version("qemu", opt_root=opt_root))
 
 
 class KaliE2EGuardTests(unittest.TestCase):

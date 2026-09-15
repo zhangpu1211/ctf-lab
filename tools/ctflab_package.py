@@ -9,8 +9,9 @@
   相同输入与相同 `generated_at` 产出逐字节相同的包；
 - 排他发布：目标已存在时拒绝覆盖；
 - 完整性：包内 `MANIFEST.json` / `content.json` 逐文件 SHA-256，外层 tar.gz 另有 `.sha256` 旁车；
-- 诚实边界：项目许可证未声明时如实标注 `undeclared`；内容包不含虚拟磁盘；SBOM 不虚构
-  “已内置”的组件（第三方依赖标为 `bundled=false`，CTFLab 自身源码标为 `bundled=true`）。
+- 诚实边界：项目许可证以 `PROJECT_LICENSE` 单一来源记录（随包附带根目录 `LICENSE`）；内容包不含
+  虚拟磁盘；SBOM 不虚构“已内置”的组件（第三方依赖标为 `bundled=false`，CTFLab 自身源码标为
+  `bundled=true`）。
 
 本模块不导入 `ctflab` 的顶层实现（避免循环导入），仅在需要校验 profile 时做函数内导入。
 """
@@ -39,6 +40,13 @@ FORMAT_VERSION = 1
 RELEASE_PLATFORM = "macos-arm64"
 MIN_PYTHON = "3.10"
 
+# 项目自身许可证的单一来源：LICENSE 文件、SBOM、MANIFEST、install.sh 与 app 元数据都引用这里。
+PROJECT_LICENSE = "MIT"
+PROJECT_LICENSE_DETAIL = (
+    "CTFLab 自身代码以 MIT 许可证发布（全文见随包根目录 LICENSE）；"
+    "随包的第三方组件按各自许可证分发，清单见 THIRD_PARTY_LICENSES.md。"
+)
+
 # 发布包白名单：仓库内允许进入安装包的工具/文档（相对 PROJECT_ROOT）。
 RELEASE_TOOL_FILES = (
     "tools/ctflab.py",
@@ -53,6 +61,7 @@ RELEASE_TOOL_FILES = (
     "tools/ctflab_app.py",
 )
 RELEASE_DOC_FILES = (
+    "LICENSE",
     "README.md",
     "docs/ctflab-phase1-quickstart.md",
     "docs/ctflab-mac-mvp-implementation-plan.md",
@@ -384,8 +393,8 @@ def build_sbom(*, version: str, generated_at: str) -> dict[str, Any]:
             "type": "application",
             "role": "runtime",
             "version": version,
-            "license": "undeclared",
-            "license_detail": "仓库尚未声明项目许可证；对外分发前必须由权利人补充 LICENSE。",
+            "license": PROJECT_LICENSE,
+            "license_detail": PROJECT_LICENSE_DETAIL,
             "bundled": True,
             "source": "本仓库（私有源码镜像）",
         },
@@ -456,7 +465,8 @@ def build_sbom(*, version: str, generated_at: str) -> dict[str, Any]:
         "components": components,
         "notes": [
             "当前发布包不内置任何二进制或动态库；bundled=true 的条目仅 CTFLab 自身源码。",
-            "第三方许可证全文未随包分发（未内置第三方组件）；本清单只登记标识与来源。",
+            "本包未内置第三方组件，因此不随附第三方许可证全文；本清单只登记标识与来源。",
+            "项目自身许可证（" + PROJECT_LICENSE + "）全文随包分发，见根目录 LICENSE。",
         ],
     }
 
@@ -481,8 +491,8 @@ def third_party_licenses_markdown(sbom: dict[str, Any]) -> str:
         "",
         "## 项目自身许可证",
         "",
-        "本仓库尚未声明许可证（`MANIFEST.json.license.status = undeclared`）。对外分发前，"
-        "权利人必须补充 `LICENSE`；在此之前不得把本安装包用于对外发布。",
+        f"CTFLab 自身代码以 `{PROJECT_LICENSE}` 许可证发布，全文见随包根目录 `LICENSE`。"
+        "SBOM 与 `MANIFEST.json.license.status` 记录同一状态。",
         "",
     ]
     return "\n".join(lines)
@@ -584,7 +594,7 @@ trap - EXIT HUP INT TERM
 
 echo "已安装到：${{prefix}}"
 echo "启动脚本：${{launcher}}（请把 ${{bin_dir}} 加入 PATH）"
-echo "许可证状态：{license_status}（对外分发前必须补充项目 LICENSE）"
+echo "许可证状态：{license_status}（项目自身许可证全文见随包 LICENSE）"
 """
 
 CONTENT_README_TEMPLATE = """# {name} 内容包（{file_name}）
@@ -635,7 +645,7 @@ def build_release_bundle(
     file_entries.sort(key=lambda item: item["path"])
 
     sbom = build_sbom(version=version, generated_at=generated_at)
-    license_status = "undeclared"
+    license_status = PROJECT_LICENSE
     install_sh = INSTALL_SH_TEMPLATE.format(
         version=version, min_python=MIN_PYTHON, license_status=license_status
     )
@@ -655,7 +665,7 @@ def build_release_bundle(
         },
         "license": {
             "status": license_status,
-            "detail": "仓库尚未声明项目许可证；对外分发前必须由权利人补充 LICENSE。",
+            "detail": PROJECT_LICENSE_DETAIL,
         },
         "files": file_entries,
         "sbom": "SBOM.json",

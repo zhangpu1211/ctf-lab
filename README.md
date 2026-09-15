@@ -64,6 +64,12 @@ python3 -m py_compile tools/ctflab.py tools/ctflab_inspect.py tools/ctflab_netwo
 - [Task 6.2 验证记录（2026-09-15）](docs/verification-task6-2-2026-09-15.md)
 - [Task 6.3A 验证记录：Kali ARM64 + UEFI 真实验收（2026-09-15）](docs/verification-task6-3a-2026-09-15.md)
 
+## 许可证
+
+- 本项目自身代码以 **MIT** 许可证发布，全文见 [LICENSE](LICENSE)；
+- 随包分发的第三方组件按各自许可证提供（见 `THIRD_PARTY_LICENSES.md` 与 `SBOM.json`）；
+  其中的 GPL 组件（QEMU）以随包 `SOURCE_OFFER.md` 书面要约履行源码义务。
+
 ## 安全边界
 
 - 原始镜像只读，所有来宾修复写入可恢复的派生副本；

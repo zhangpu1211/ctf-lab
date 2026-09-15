@@ -2,6 +2,7 @@
 /*
 !/.gitignore
 !/README.md
+!/LICENSE
 !/docs/
 !/tools/
 
@@ -35,7 +36,17 @@
 !/tools/ctflab_utm_fixture.json
 !/tools/ctflab_profiles/
 !/tools/guest_fixes/
+!/tools/licenses/
 !/tools/tests/
+
+# vendored 许可证文本：只允许明确登记的组件目录与文件（默认拒绝）。
+/tools/licenses/*
+!/tools/licenses/PROVENANCE.md
+!/tools/licenses/dtc/
+/tools/licenses/dtc/*
+!/tools/licenses/dtc/GPL
+!/tools/licenses/dtc/BSD-2-Clause
+!/tools/licenses/dtc/README.license
 
 /tools/ctflab_profiles/*
 !/tools/ctflab_profiles/*.yaml

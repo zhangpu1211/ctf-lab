@@ -616,7 +616,8 @@ class Task61PackagingDocsTests(unittest.TestCase):
         self.assertIn("CTFLab.app", flat)
         self.assertIn("不含虚拟磁盘", flat)
         self.assertIn("不构成 Task 6", flat)
-        self.assertIn("undeclared", flat)
+        self.assertIn("MIT", flat)
+        self.assertIn("LICENSE", flat)
         self.assertIn("干净 Mac 用户验收脚本", flat)
 
     def test_design_does_not_claim_undelivered_capabilities(self) -> None:
@@ -641,13 +642,25 @@ class Task62AppRuntimeDocsTests(unittest.TestCase):
     APP_DESIGN = PROJECT_ROOT / "docs" / "ctflab-task6-app-runtime-design.md"
     APP_RECORD = PROJECT_ROOT / "docs" / "verification-task6-2-2026-09-15.md"
 
-    def test_design_and_record_state_limits(self) -> None:
-        for path in (self.APP_DESIGN, self.APP_RECORD):
-            flat = normalized(path.read_text(encoding="utf-8"))
-            self.assertIn("未验证", flat, path.name)
-            self.assertIn("undeclared", flat, path.name)
-            self.assertIn("dtc", flat, path.name)
-            self.assertIn("禁止公开发布", flat, path.name)
+    def test_design_states_license_closure(self) -> None:
+        """设计文档描述当前设计：MIT + vendored 文本 + 书面要约必须写清。"""
+        flat = normalized(self.APP_DESIGN.read_text(encoding="utf-8"))
+        self.assertIn("MIT", flat)
+        self.assertIn("LICENSE", flat)
+        self.assertIn("vendored", flat)
+        self.assertIn("SOURCE_OFFER.md", flat)
+        self.assertIn("书面要约", flat)
+        self.assertIn("dtc", flat)
+        self.assertIn("未验证", flat, "公证状态必须继续如实标注为未验证")
+        self.assertIn("公证", flat)
+
+    def test_historical_record_keeps_period_limits(self) -> None:
+        """6.2 验证记录是历史文件：当时的 undeclared/dtc/禁止公开发布事实不得被改写。"""
+        flat = normalized(self.APP_RECORD.read_text(encoding="utf-8"))
+        self.assertIn("未验证", flat, self.APP_RECORD.name)
+        self.assertIn("undeclared", flat, self.APP_RECORD.name)
+        self.assertIn("dtc", flat, self.APP_RECORD.name)
+        self.assertIn("禁止公开发布", flat, self.APP_RECORD.name)
 
     def test_no_fake_signing_or_notarization_claims(self) -> None:
         for path in (self.APP_DESIGN, self.APP_RECORD):

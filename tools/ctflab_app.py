@@ -9,7 +9,11 @@
 - `.app` 内不出现任何虚拟磁盘、凭据、日志；运行状态仍写在 app 外部；
 - 排他发布：同父目录内构建随机临时 `.app`，全部校验通过后才改名为最终目录；失败清理本次临时内容；
 - 签名分级如实记录：`unsigned` / `ad-hoc` / `developer-id`；没有真实身份时不冒充 Developer ID；
-  公证只记录“未验证/后续任务”，本模块不接触任何密码或凭据。
+  公证只记录“未验证/后续任务”，本模块不接触任何密码或凭据；
+- 许可证闭环：随包附项目 `LICENSE`（`ctflab_package.PROJECT_LICENSE` 单一来源）；Homebrew keg 缺
+  许可证文本的组件回退到仓库 `tools/licenses/` 的 vendored 文本（如 dtc/libfdt）；
+  GPL-2.0 组件的源码义务用随包 `SOURCE_OFFER.md` 书面要约履行（GPL-2.0 §3），
+  源码哈希按版本登记，未知版本直接失败——不编造、不猜测。
 """
 
 from __future__ import annotations
@@ -39,9 +43,21 @@ LICENSES_REL = "Contents/Resources/licenses"
 MANIFEST_REL = "Contents/Resources/MANIFEST.json"
 SBOM_REL = "Contents/Resources/SBOM.json"
 THIRD_PARTY_REL = "Contents/Resources/THIRD_PARTY_LICENSES.md"
+LICENSE_REL = "Contents/Resources/LICENSE"
+SOURCE_OFFER_REL = "Contents/Resources/SOURCE_OFFER.md"
 LAUNCHER_REL = f"Contents/MacOS/{APP_EXECUTABLE}"
 INFO_PLIST_REL = "Contents/Info.plist"
 SIGNATURE_DIR_REL = "Contents/_CodeSignature"
+
+# 仓库内 vendored 许可证文本目录（Homebrew keg 缺文本时的回退；见 tools/licenses/PROVENANCE.md）。
+VENDORED_LICENSES_REL = "tools/licenses"
+
+# QEMU 对应源码（GPL-2.0 §3 书面要约指向的上游归档）。版本必须与随包二进制一致；
+# 未知版本的源码哈希无法编造，构建直接失败并要求先核实登记。
+QEMU_SOURCE_URL_TEMPLATE = "https://download.qemu.org/qemu-{version}.tar.xz"
+QEMU_SOURCE_SHA256 = {
+    "11.1.0": "6ee1d1a61f68212476b27108c26da5f449dc09b626d42f8279ba0dc2e08fa858",
+}
 
 QEMU_BINARIES = ("qemu-system-aarch64", "qemu-system-x86_64", "qemu-img")
 # 只随包实际需要的固件/ROM/keymaps（aarch64 virt UEFI + x86_64 pc BIOS/UEFI 与三种网卡）。
@@ -311,11 +327,13 @@ def _formula_of(path: Path) -> str | None:
     return match.group(1) if match else None
 
 
-def _formula_version(formula: str) -> str | None:
-    opt = Path("/opt/homebrew/opt") / formula
+def _formula_version(formula: str, opt_root: Path = Path("/opt/homebrew/opt")) -> str | None:
+    """解析 `<opt_root>/<formula>` 指向的 Cellar 版本目录名（如 `11.1.0`）。"""
+    opt = Path(opt_root) / formula
     if opt.exists():
         target = opt.resolve()
-        if target.parent.name == "Cellar":
+        # target 形如 <prefix>/Cellar/<formula>/<version>，因此 Cellar 在两级之上。
+        if target.parent.parent.name == "Cellar":
             return target.name
     return None
 
@@ -333,6 +351,88 @@ def collect_license_texts(formula: str) -> list[tuple[str, Path]]:
                 seen.add(path.name)
                 found.append((path.name, path))
     return found
+
+
+def collect_vendored_license_texts(source_root: Path, formula: str) -> list[tuple[str, Path]]:
+    """回退：仓库 `tools/licenses/<formula>/` 内原样 vendored 的上游许可证文本。
+
+    Homebrew keg 不随附所有上游文本（例如 dtc/libfdt），回退目录里的每个普通文件都随包分发；
+    目录不存在或为空时返回空列表，由调用方决定是否失败。来源与哈希登记见 PROVENANCE.md。
+    """
+    vendored = Path(source_root) / VENDORED_LICENSES_REL / formula
+    if not vendored.is_dir():
+        return []
+    found: list[tuple[str, Path]] = []
+    for path in sorted(vendored.iterdir()):
+        _expect(not path.is_symlink(), f"vendored 许可证文本不得是符号链接：{path}")
+        if path.is_file() and not path.name.startswith("."):
+            found.append((path.name, path))
+    return found
+
+
+def _qemu_semver(version_line: str | None) -> str | None:
+    """从 `QEMU emulator version 11.1.0` 之类的首行提取版本号。"""
+    if not version_line:
+        return None
+    match = re.search(r"version\s+([0-9][0-9A-Za-z.\-]*)", version_line)
+    return match.group(1) if match else None
+
+
+def _plus_three_years(generated_at: str) -> str:
+    """按构建时间计算书面要约的有效期下限（GPL 要求至少三年）。"""
+    try:
+        moment = datetime.strptime(generated_at, "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError as exc:
+        raise AppBuildError(f"generated_at 格式不正确：{generated_at}") from exc
+    try:
+        later = moment.replace(year=moment.year + 3)
+    except ValueError:  # 2 月 29 日
+        later = moment.replace(year=moment.year + 3, day=28)
+    return later.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def build_source_offer(*, qemu_version: str | None, formula_version: str | None,
+                       generated_at: str) -> tuple[dict[str, Any], str]:
+    """生成 QEMU 对应源码的书面要约（GPL-2.0 §3）与机器可读元数据。
+
+    源码归档哈希必须与随包二进制版本匹配；未登记的版本无法编造哈希，直接失败。
+    """
+    _expect(qemu_version, "无法确定 QEMU 版本，不能生成源码书面要约。")
+    sha256 = QEMU_SOURCE_SHA256.get(qemu_version)
+    _expect(sha256,
+            f"QEMU {qemu_version} 的对应源码 SHA-256 未登记（见 QEMU_SOURCE_SHA256）："
+            "请先核实 download.qemu.org 上的归档并登记后再构建，不得编造哈希。")
+    url = QEMU_SOURCE_URL_TEMPLATE.format(version=qemu_version)
+    valid_until = _plus_three_years(generated_at)
+    meta = {
+        "qemu_version": qemu_version,
+        "url": url,
+        "sha256": sha256,
+        "source_formula": f"Homebrew qemu {formula_version or '?'}",
+        "valid_until": valid_until,
+        "text_file": SOURCE_OFFER_REL,
+    }
+    lines = [
+        "# QEMU 对应源码书面要约（GPL-2.0 §3）",
+        "",
+        f"本 App 随包分发 QEMU {qemu_version} 的二进制（qemu-system-aarch64、qemu-system-x86_64、",
+        "qemu-img 及其非系统动态库闭包、firmware/ROM/keymaps）。",
+        "",
+        "依据 GNU GPL 第 2 版第 3 节，CTFLab 项目承诺：自本 App 分发之日起三年内",
+        f"（至 {valid_until}），任何收到本 App 的第三方均可索取上述组件的完整对应源码。",
+        "",
+        f"- 对应源码归档：{url}",
+        f"- 归档 SHA-256：`{sha256}`",
+        f"- 随包二进制版本：{qemu_version}（{meta['source_formula']}）",
+        "- 构建配方：Homebrew qemu formula 及其补丁集（构建时 formula 版本记录在 `SBOM.json` 的",
+        "  QEMU 组件 `source` 字段；配方历史见 https://github.com/Homebrew/homebrew-core/blob/HEAD/Formula/q/qemu.rb ）",
+        "- 获取方式：通过 CTFLab 源码仓库（私有镜像 zhangpu1211/ctf-lab）的联系渠道提出请求；",
+        "  我们按 GPL 要求提供源码（下载链接、介质或成本价复制）。",
+        "",
+        "该要约不可撤回，且适用于所有收到本 App 的第三方。",
+        "",
+    ]
+    return meta, "\n".join(lines)
 
 
 def sign_level_from_identity(identity: str | None) -> str:
@@ -542,7 +642,11 @@ def _binary_arch(path: Path) -> str | None:
 
 def build_sbom(*, version: str, generated_at: str, qemu_root: Path, libs: dict[str, Path],
                qemu_share: list[str], license_index: dict[str, list[str]],
-               license_texts_complete: bool) -> dict[str, Any]:
+               license_texts_complete: bool, vendored_index: dict[str, list[str]] | None = None,
+               source_offer: dict[str, Any] | None = None) -> dict[str, Any]:
+    import ctflab_package  # noqa: PLC0415  函数内导入，避免循环依赖
+
+    vendored_index = vendored_index or {}
     qemu_bins = []
     for name in QEMU_BINARIES:
         source = qemu_root / "bin" / name
@@ -559,6 +663,12 @@ def build_sbom(*, version: str, generated_at: str, qemu_root: Path, libs: dict[s
     dylib_components = []
     for name, source in sorted(libs.items()):
         formula = _formula_of(source) or "unknown"
+        if license_index.get(formula):
+            text_status = "present"
+        elif vendored_index.get(formula):
+            text_status = "vendored"
+        else:
+            text_status = "missing-in-keg"
         dylib_components.append({
             "file": f"{RUNTIME_REL}/lib/{name}",
             "formula": formula,
@@ -566,7 +676,7 @@ def build_sbom(*, version: str, generated_at: str, qemu_root: Path, libs: dict[s
             "arch": _binary_arch(source),
             "sha256": sha256_file(source),
             "license": KNOWN_LICENSES.get(formula, f"unknown（见 licenses/{formula}/ 内文本）"),
-            "license_text_status": "present" if license_index.get(formula) else "missing-in-keg",
+            "license_text_status": text_status,
             "bundled": True,
             "source": f"Homebrew formula {formula}",
         })
@@ -575,8 +685,9 @@ def build_sbom(*, version: str, generated_at: str, qemu_root: Path, libs: dict[s
         "type": "application",
         "role": "runtime",
         "version": version,
-        "license": "undeclared",
-        "license_detail": "仓库尚未声明项目许可证；对外分发/公开发布被禁止，直到权利人补充 LICENSE。",
+        "license": ctflab_package.PROJECT_LICENSE,
+        "license_detail": ctflab_package.PROJECT_LICENSE_DETAIL.replace(
+            "随包根目录 LICENSE", f"`{LICENSE_REL}`"),
         "bundled": True,
     }, {
         "name": "QEMU",
@@ -593,8 +704,9 @@ def build_sbom(*, version: str, generated_at: str, qemu_root: Path, libs: dict[s
                     "BSD-2-Clause-Patent（见 licenses/edk2/）。",
         },
         "distribution_obligations": [
-            "QEMU 为 GPL-2.0-only：随二进制分发时须向接收者提供完整对应源码或书面要约；"
-            "本 app 未随附源码，不得据此宣称 GPL 合规或对外发布。",
+            "QEMU 为 GPL-2.0-only：随二进制分发须向接收者提供完整对应源码或书面要约；"
+            f"本 app 未随附源码，已随包提供书面要约（{SOURCE_OFFER_REL}，GPL-2.0 §3），"
+            "指向 qemu-<version> 上游归档与 SHA-256，有效期至少三年。",
             "EDK2 固件（edk2-*.fd、efi-*.rom）为 BSD-2-Clause-Patent；许可证文本见 licenses/edk2/。",
             "捆绑的 LGPL 组件（glib/gnutls/libssh/libidn2/nettle 等）以独立动态库形式随包，"
             "接收者可用兼容版本替换以实现重新链接；许可证文本随包提供。",
@@ -607,15 +719,19 @@ def build_sbom(*, version: str, generated_at: str, qemu_root: Path, libs: dict[s
         "generated_at": generated_at,
         "components": components,
         "license_texts_complete": license_texts_complete,
+        "source_offer": source_offer,
         "notes": [
             "bundled=true 表示该组件实际位于 app 内；哈希为打包时值（见 MANIFEST.json）。",
-            "许可证标识来自 Homebrew formula 声明与随包文本，未做法律审查。",
-            "项目自身许可证仍为 undeclared：禁止公开发布本 app。",
+            "许可证标识来自 Homebrew formula 声明与随包文本，未做法律审查；"
+            "license_text_status=vendored 表示文本取自仓库 tools/licenses/（见 PROVENANCE.md）。",
+            f"项目自身许可证为 {ctflab_package.PROJECT_LICENSE}，全文随包提供（{LICENSE_REL}）。",
         ],
     }
 
 
 def third_party_markdown(sbom: dict[str, Any]) -> str:
+    import ctflab_package  # noqa: PLC0415  函数内导入，避免循环依赖
+
     lines = [
         "# 第三方组件与许可证（CTFLab.app）",
         "",
@@ -643,7 +759,8 @@ def third_party_markdown(sbom: dict[str, Any]) -> str:
         "",
         "## 项目自身许可证",
         "",
-        "`undeclared`：未声明许可证，**禁止公开发布本 app**。许可证文本完整性："
+        f"CTFLab 自身代码以 `{ctflab_package.PROJECT_LICENSE}` 许可证发布，全文随包提供"
+        f"（`{LICENSE_REL}`）。许可证文本完整性："
         f"{'完整' if sbom['license_texts_complete'] else '不完整（见 SBOM.json 中 license_text_status=missing-in-keg 的条目）'}。",
         "",
     ]
@@ -748,10 +865,13 @@ def build_app(
             if actual:
                 bundled_entitlements[name] = actual
 
-        # 6) 许可证文本
+        # 6) 许可证文本与合规文件
+        import ctflab_package  # noqa: PLC0415  函数内导入，避免循环依赖
+
         licenses_dir = resources / "licenses"
         licenses_dir.mkdir()
         license_index: dict[str, list[str]] = {}
+        vendored_index: dict[str, list[str]] = {}
         formulas = sorted({_formula_of(source) or "unknown" for source in libs_sources.values()}
                           | {"qemu", "edk2"})
         missing: list[str] = []
@@ -763,25 +883,45 @@ def build_app(
                 license_index["edk2"] = ["edk2-licenses.txt"]
                 continue
             texts = collect_license_texts(formula)
+            source_kind = "keg"
+            if not texts:
+                texts = collect_vendored_license_texts(source_root, formula)
+                source_kind = "vendored"
             if not texts:
                 missing.append(formula)
                 license_index[formula] = []
                 continue
             target_dir = licenses_dir / formula
             target_dir.mkdir()
-            license_index[formula] = []
+            names: list[str] = []
             for name, path in texts:
                 shutil.copy2(path, target_dir / name)
-                license_index[formula].append(name)
+                names.append(name)
+            if source_kind == "vendored":
+                vendored_index[formula] = names
+            else:
+                license_index[formula] = names
         _expect(not missing or allow_incomplete_license_texts,
-                "以下随包组件的许可证文本在 Homebrew keg 中不存在，且未使用 "
-                f"--allow-incomplete-license-texts：{', '.join(missing)}；"
+                "以下随包组件的许可证文本在 Homebrew keg 与仓库 tools/licenses/ 中都不存在，"
+                f"且未使用 --allow-incomplete-license-texts：{', '.join(missing)}；"
                 "分发义务无法确认时停止，不猜测。")
+
+        # 项目自身许可证与 QEMU 源码书面要约（GPL-2.0 §3）随包分发
+        project_license = source_root / "LICENSE"
+        _expect(project_license.is_file(),
+                f"缺少项目 LICENSE（应为 {ctflab_package.PROJECT_LICENSE} 全文）：{project_license}")
+        shutil.copy2(project_license, resources / "LICENSE")
+        offer_meta, offer_text = build_source_offer(
+            qemu_version=_qemu_semver(_qemu_version(qemu_root / "bin" / "qemu-system-aarch64")),
+            formula_version=_formula_version("qemu"),
+            generated_at=generated_at)
+        (resources / "SOURCE_OFFER.md").write_text(offer_text, encoding="utf-8")
 
         # 7) SBOM / 许可证说明 / MANIFEST（在签名后计算最终文件哈希）
         sbom = build_sbom(version=version, generated_at=generated_at, qemu_root=qemu_root,
                           libs=libs_sources, qemu_share=copied_share,
-                          license_index=license_index, license_texts_complete=not missing)
+                          license_index=license_index, license_texts_complete=not missing,
+                          vendored_index=vendored_index, source_offer=offer_meta)
         (resources / "SBOM.json").write_text(json.dumps(sbom, ensure_ascii=False, indent=2) + "\n",
                                              encoding="utf-8")
         (resources / "THIRD_PARTY_LICENSES.md").write_text(third_party_markdown(sbom), encoding="utf-8")
@@ -813,10 +953,11 @@ def build_app(
             },
             "signature": dict(signature_plan),
             "license": {
-                "status": "undeclared",
+                "status": ctflab_package.PROJECT_LICENSE,
+                "project_license_file": LICENSE_REL,
+                "source_offer": offer_meta,
                 "distribution_blockers": (
-                    (["许可证文本不完整：" + ", ".join(missing)] if missing else [])
-                    + ["项目许可证未声明且未随附 QEMU 对应源码；禁止公开发布"]
+                    ["许可证文本不完整：" + ", ".join(missing)] if missing else []
                 ),
             },
             "files": [
@@ -935,6 +1076,7 @@ def verify_app(app_path: Path, *, check_signature: bool = True) -> dict[str, Any
     _expect(app_path.is_dir() and not app_path.is_symlink() and app_path.suffix == ".app",
             f"不是普通 .app 目录：{app_path}")
     for rel in (INFO_PLIST_REL, LAUNCHER_REL, MANIFEST_REL, SBOM_REL, THIRD_PARTY_REL,
+                LICENSE_REL, SOURCE_OFFER_REL,
                 f"{CTFLAB_REL}/tools/ctflab.py", f"{RUNTIME_REL}/bin/qemu-img"):
         _expect((app_path / rel).exists(), f"app 缺少必需内容：{rel}")
 
@@ -1058,9 +1200,36 @@ def verify_app(app_path: Path, *, check_signature: bool = True) -> dict[str, Any
                     f"SBOM binary 路径越界：{binary_rel}")
             _expect((app_path / binary_rel).is_file(),
                     f"SBOM 标记 bundled=true 但文件缺失：{binary_rel}")
+    import ctflab_package  # noqa: PLC0415  函数内导入，避免循环依赖
+
     blockers = manifest["license"].get("distribution_blockers")
     _expect(isinstance(blockers, list) and all(isinstance(item, str) for item in blockers),
             "MANIFEST.license.distribution_blockers 必须是字符串数组。")
+    _expect(manifest["license"].get("status") == ctflab_package.PROJECT_LICENSE,
+            f"MANIFEST.license.status 必须为 {ctflab_package.PROJECT_LICENSE}。")
+    _expect(manifest["license"].get("project_license_file") == LICENSE_REL,
+            f"MANIFEST.license.project_license_file 必须指向 {LICENSE_REL}。")
+
+    # QEMU 源码书面要约：字段必须与随包 SOURCE_OFFER.md 的实际内容一致，防止文档过期。
+    offer = manifest["license"].get("source_offer")
+    _expect(isinstance(offer, dict), "MANIFEST.license.source_offer 必须是对象。")
+    for field in ("qemu_version", "url", "sha256", "valid_until", "text_file"):
+        _expect(isinstance(offer.get(field), str) and offer[field],
+                f"MANIFEST.license.source_offer 缺少字段：{field}")
+    _expect(offer["text_file"] == SOURCE_OFFER_REL,
+            f"source_offer.text_file 必须指向 {SOURCE_OFFER_REL}。")
+    _expect(re.fullmatch(r"[0-9a-f]{64}", offer["sha256"]),
+            "source_offer.sha256 必须是 64 位十六进制摘要。")
+    _expect(QEMU_SOURCE_SHA256.get(offer["qemu_version"]) == offer["sha256"],
+            f"source_offer 的 QEMU {offer['qemu_version']} 源码哈希与登记表不一致。")
+    _expect(offer["url"] == QEMU_SOURCE_URL_TEMPLATE.format(version=offer["qemu_version"]),
+            "source_offer.url 与登记的源码地址模板不一致。")
+    _expect(re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", offer["valid_until"]),
+            "source_offer.valid_until 必须是 ISO-8601 UTC 时间。")
+    offer_text = (app_path / SOURCE_OFFER_REL).read_text(encoding="utf-8")
+    for needle in (offer["qemu_version"], offer["url"], offer["sha256"], offer["valid_until"]):
+        _expect(needle in offer_text,
+                f"SOURCE_OFFER.md 未包含要约声明的 {needle!r}（文档与清单不一致）。")
 
     # 旁车是清单自身哈希和 app 全树哈希的唯一外部锚点，verify 必须实际复核它。
     sidecar_path = app_path.with_name(app_path.name + ".sha256")
