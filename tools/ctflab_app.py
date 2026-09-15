@@ -27,7 +27,7 @@ import shutil
 import subprocess
 import tempfile
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Iterable
 
 TOOLS_DIR = Path(__file__).resolve().parent
@@ -58,6 +58,39 @@ QEMU_SOURCE_URL_TEMPLATE = "https://download.qemu.org/qemu-{version}.tar.xz"
 QEMU_SOURCE_SHA256 = {
     "11.1.0": "6ee1d1a61f68212476b27108c26da5f449dc09b626d42f8279ba0dc2e08fa858",
 }
+
+# 内置 Python 运行时（python-build-standalone，见 docs/ctflab-task6-app-runtime-design.md §11）。
+PYTHON_RUNTIME_REL = f"{RUNTIME_REL}/python"
+# 裁剪清单：只保留 CTFLab CLI 运行所需（stdlib + 内置扩展）。每一项在构建时记录，
+# 裁剪内容与理由见设计文档；tkinter/Tcl/Tk 不随包（无许可证文本缺口）、pip/ensurepip 不随包
+# （学生机不需要安装包）、idle/lib2to3/2to3 等开发工具与 include/config 头文件不随包。
+PYTHON_PRUNE_GLOBS = (
+    "include",
+    "share",
+    "bin/2to3*",
+    "bin/idle3*",
+    "bin/pip*",
+    "bin/pydoc3*",
+    "bin/python3-config*",
+    "bin/python",                # 别名；保留 bin/python3（硬链接到 python3.12）
+    "lib/libtcl*",
+    "lib/libtk*",
+    "lib/tcl*",
+    "lib/tk*",
+    "lib/itcl*",
+    "lib/thread*",
+    "lib/libpython3.*.dylib",    # python-build-standalone 的静态可执行文件不加载它（实测）
+    "lib/pkgconfig",
+    "lib/python*/idlelib",
+    "lib/python*/lib2to3",
+    "lib/python*/tkinter",
+    "lib/python*/ensurepip",
+    "lib/python*/config-*",
+    "lib/python*/lib-dynload/_tkinter*",
+    "lib/python*/site-packages/pip*",
+)
+PYTHON_VERSION_RE = re.compile(r"^Python\s+([0-9][0-9A-Za-z.]*)$")
+PBS_ASSET_RE = re.compile(r"^(cpython-\d+\.\d+\.\d+)\+(\d{8})-aarch64-apple-darwin-")
 
 QEMU_BINARIES = ("qemu-system-aarch64", "qemu-system-x86_64", "qemu-img")
 # 只随包实际需要的固件/ROM/keymaps（aarch64 virt UEFI + x86_64 pc BIOS/UEFI 与三种网卡）。
@@ -121,6 +154,8 @@ KNOWN_LICENSES = {
     "p11-kit": "BSD-3-Clause",
     "pcre2": "BSD-3-Clause",
     "pixman": "MIT",
+    "python": "PSF-2.0",
+    "pyyaml": "MIT",
     "snappy": "BSD-3-Clause",
     "vde": "GPL-2.0-or-later AND LGPL-2.1-or-later（libvdeplug）",
     "zstd": "BSD-3-Clause OR GPL-2.0",
@@ -128,7 +163,7 @@ KNOWN_LICENSES = {
 LICENSE_GLOBS = ("COPYING*", "LICENSE*", "NOTICE*", "LGPL-*", "GPL-*", "MIT*", "BSD*")
 
 LAUNCHER_TEMPLATE = """#!/bin/sh
-# CTFLab 启动器（.app 内）：计算受控运行时路径，不依赖任何开发机绝对路径。
+# CTFLab 启动器（.app 内）：使用 app 自带运行时（QEMU + Python），不依赖任何开发机路径。
 set -eu
 
 contents_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
@@ -139,13 +174,19 @@ if [ -d "$runtime/bin" ]; then
   export CTFLAB_RUNTIME_ROOT
 fi
 
-python_bin=$(command -v python3 || true)
-if [ -z "$python_bin" ]; then
-  echo "错误：需要 Python 3.10+（未找到 python3）。" >&2
+python_bin="$runtime/python/bin/python3"
+if [ ! -x "$python_bin" ]; then
+  echo "错误：App 内 Python 运行时缺失或不可执行（构建不完整）；不回退系统 Python。" >&2
   exit 1
 fi
 
-exec "$python_bin" "$resources/ctflab/tools/ctflab.py" "$@"
+# 不在已签名 bundle 内写 __pycache__（保护签名与清单）；子进程同样生效。
+PYTHONDONTWRITEBYTECODE=1
+PYTHONNOUSERSITE=1
+export PYTHONDONTWRITEBYTECODE PYTHONNOUSERSITE
+
+# -B：禁止写字节码缓存；-s：忽略用户 site-packages；-E：忽略 PYTHON* 环境变量。
+exec "$python_bin" -B -s -E "$resources/ctflab/tools/ctflab.py" "$@"
 """
 
 
@@ -370,6 +411,230 @@ def collect_vendored_license_texts(source_root: Path, formula: str) -> list[tupl
     return found
 
 
+MACHO_MAGICS = (
+    b"\xfe\xed\xfa\xce", b"\xce\xfa\xed\xfe",   # 32 位
+    b"\xfe\xed\xfa\xcf", b"\xcf\xfa\xed\xfe",   # 64 位
+    b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca",   # fat/universal
+)
+
+
+def _is_mach_o(path: Path) -> bool:
+    try:
+        with path.open("rb") as handle:
+            return handle.read(4) in MACHO_MAGICS
+    except OSError:
+        return False
+
+
+def iter_macho_files(root: Path) -> list[Path]:
+    """递归列出 Mach-O 文件（用魔数判断，不依赖 file 命令）。"""
+    if not root.is_dir():
+        return []
+    return [path for path in sorted(root.rglob("*")) if path.is_file() and _is_mach_o(path)]
+
+
+def _extract_tar_safely(archive: Path, destination: Path) -> None:
+    """解包 .tar.gz；拒绝绝对路径、`..` 越界与设备/硬链接成员。"""
+    import tarfile  # noqa: PLC0415
+
+    with tarfile.open(archive, "r:gz") as tar:
+        for member in tar.getmembers():
+            name = PurePosixPath(member.name)
+            _expect(not name.is_absolute() and ".." not in name.parts,
+                    f"归档成员路径越界：{member.name}")
+            if member.issym():
+                target = PurePosixPath(member.linkname)
+                _expect(not target.is_absolute() and ".." not in target.parts,
+                        f"归档符号链接越界：{member.name} -> {member.linkname}")
+            _expect(member.isfile() or member.isdir() or member.issym(),
+                    f"归档含不允许的成员类型：{member.name}")
+        tar.extractall(destination)  # noqa: S202  已逐成员校验路径与类型
+
+
+def _dereference_symlinks(root: Path) -> int:
+    """把树内符号链接替换为指向目标的硬链接（app 内禁止符号链接，见 verify_app）。"""
+    resolved_root = root.resolve()
+    replaced = 0
+    for path in sorted(root.rglob("*")):
+        if not path.is_symlink():
+            continue
+        target = path.resolve()
+        _expect(target.is_file(), f"符号链接目标不是普通文件：{path} -> {target}")
+        _expect(target.is_relative_to(resolved_root),
+                f"符号链接指向树外：{path} -> {target}")
+        path.unlink()
+        os.link(target, path)
+        replaced += 1
+    return replaced
+
+
+def _prune_python_tree(root: Path, patterns: tuple[str, ...] = PYTHON_PRUNE_GLOBS) -> list[str]:
+    """按白名单外清单裁剪发行版；返回实际删除的相对路径（记录进 MANIFEST）。"""
+    removed: list[str] = []
+    for pattern in patterns:
+        for path in sorted(root.glob(pattern)):
+            removed.append(path.relative_to(root).as_posix())
+            if path.is_dir() and not path.is_symlink():
+                shutil.rmtree(path)
+            else:
+                path.unlink()
+    return sorted(removed)
+
+
+def _python_version(python_root: Path) -> str | None:
+    binary = python_root / "bin" / "python3"
+    if not binary.is_file():
+        return None
+    result = _run_tool([str(binary), "--version"], check=False)
+    text = (result.stdout or result.stderr).strip()
+    match = PYTHON_VERSION_RE.match(text)
+    return match.group(1) if match else None
+
+
+def copy_python_runtime(source: Path, destination: Path, *,
+                        expected_sha256: str | None = None) -> dict[str, Any]:
+    """把 python-build-standalone 发行版（.tar.gz 或已解包目录）复制进 app。
+
+    复制后：按 PYTHON_PRUNE_GLOBS 裁剪、符号链接解引用为硬链接、断言无符号链接残留。
+    返回 SBOM 元数据；归档只接受 `.tar.gz`，哈希可选用 `expected_sha256` 强制校验。
+    """
+    source = Path(source).expanduser()
+    _expect(source.exists(), f"Python 运行时不不存在：{source}")
+    staging: Path | None = None
+    if source.is_dir():
+        source_root = source
+        archive_sha256: str | None = None
+    else:
+        _expect(source.name.endswith(".tar.gz"),
+                f"Python 运行时必须是 .tar.gz 归档或目录：{source}")
+        archive_sha256 = sha256_file(source)
+        if expected_sha256:
+            _expect(archive_sha256 == expected_sha256,
+                    f"Python 运行时归档 SHA-256 不符：期望 {expected_sha256}，"
+                    f"实际 {archive_sha256}")
+        staging = destination.parent / f".{destination.name}.staging"
+        _expect(not staging.exists(), f"Python 运行时临时目录已存在：{staging}")
+        staging.mkdir()
+        try:
+            _extract_tar_safely(source, staging)
+            candidates = [staging] if (staging / "bin" / "python3").is_file() else [
+                child for child in staging.iterdir()
+                if child.is_dir() and (child / "bin" / "python3").is_file()]
+            _expect(len(candidates) == 1,
+                    f"归档内找不到唯一的 Python 发行版根目录（含 bin/python3）：{source.name}")
+            source_root = candidates[0]
+        except Exception:
+            shutil.rmtree(staging, ignore_errors=True)
+            raise
+
+    try:
+        shutil.copytree(source_root, destination, symlinks=True)
+        pruned = _prune_python_tree(destination)
+        replaced = _dereference_symlinks(destination)
+        leftovers = [path.relative_to(destination).as_posix()
+                     for path in sorted(destination.rglob("*")) if path.is_symlink()]
+        _expect(not leftovers, f"Python 运行时仍含符号链接：{', '.join(leftovers[:5])}")
+        version = _python_version(destination)
+        _expect(version, "无法读取内置 Python 版本（bin/python3 --version）。")
+    finally:
+        if staging is not None:
+            shutil.rmtree(staging, ignore_errors=True)
+
+    asset_match = PBS_ASSET_RE.match(source.name)
+    if asset_match:
+        source_desc = (f"python-build-standalone {asset_match.group(2)}"
+                       f"（{asset_match.group(1)}）")
+    else:
+        source_desc = f"python-build-standalone（来源名未识别：{source.name}）"
+    return {
+        "version": version,
+        "source": source_desc,
+        "archive_sha256": archive_sha256,
+        "symlinks_dereferenced": replaced,
+        "pruned": pruned,
+    }
+
+
+def copy_pyyaml(source: Path, site_packages: Path, licenses_dir: Path, *,
+                expected_sha256: str | None = None) -> dict[str, Any]:
+    """把 PyYAML（wheel 或已解包目录）复制进 site-packages，并提取 MIT 许可证文本。
+
+    只复制 `yaml/` 与 `_yaml/` 两个包（wheel 的 dist-info 不随包，来源以 SBOM 记录为准）。
+    """
+    source = Path(source).expanduser()
+    _expect(source.exists(), f"PyYAML 来源不存在：{source}")
+    wheel_sha256: str | None = None
+    license_text: str | None = None
+    version: str | None = None
+
+    def _copy_from_dir(root: Path) -> int:
+        nonlocal license_text, version
+        yaml_pkg = root / "yaml"
+        _expect((yaml_pkg / "__init__.py").is_file(),
+                f"PyYAML 来源缺少 yaml/__init__.py：{root}")
+        count = 0
+        for name in ("yaml", "_yaml"):
+            pkg = root / name
+            if not pkg.is_dir():
+                continue
+            for path in sorted(pkg.rglob("*")):
+                _expect(not path.is_symlink(), f"PyYAML 包内不得含符号链接：{path}")
+                if path.is_file():
+                    target = site_packages / name / path.relative_to(pkg)
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(path, target)
+                    count += 1
+        for dist_info in sorted(root.glob("*.dist-info")):
+            metadata = dist_info / "METADATA"
+            if metadata.is_file():
+                match = re.search(r"^Version:\s*(\S+)\s*$", metadata.read_text(encoding="utf-8"),
+                                  re.MULTILINE)
+                if match:
+                    version = match.group(1)
+            for license_file in sorted((dist_info / "licenses").glob("*")) if (dist_info / "licenses").is_dir() else []:
+                if license_file.is_file():
+                    licenses_dir.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(license_file, licenses_dir / "LICENSE")
+                    license_text = licenses_dir / "LICENSE"
+                    break
+        return count
+
+    if source.is_dir():
+        file_count = _copy_from_dir(source)
+    else:
+        _expect(source.suffix == ".whl", f"PyYAML 来源必须是 .whl 或目录：{source}")
+        wheel_sha256 = sha256_file(source)
+        if expected_sha256:
+            _expect(wheel_sha256 == expected_sha256,
+                    f"PyYAML wheel SHA-256 不符：期望 {expected_sha256}，实际 {wheel_sha256}")
+        import zipfile  # noqa: PLC0415
+
+        staging = Path(tempfile.mkdtemp(prefix=".pyyaml.", suffix=".tmp"))
+        try:
+            with zipfile.ZipFile(source) as archive:
+                for member in archive.namelist():
+                    name = PurePosixPath(member)
+                    _expect(not name.is_absolute() and ".." not in name.parts,
+                            f"PyYAML wheel 成员路径越界：{member}")
+                archive.extractall(staging)  # noqa: S202  已逐个成员校验
+            file_count = _copy_from_dir(staging)
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
+
+    _expect(version, f"无法从 PyYAML 来源确定版本：{source}")
+    _expect(license_text is not None,
+            f"PyYAML 来源缺少许可证文本（dist-info/licenses/LICENSE）：{source}")
+    name_match = re.match(r"^[Pp]y[Yy][Aa][Mm][Ll]-(\d+\.\d+\.\d+)-", source.name)
+    if name_match:
+        _expect(name_match.group(1) == version,
+                f"PyYAML wheel 文件名版本（{name_match.group(1)}）与 METADATA（{version}）不一致")
+    return {
+        "version": version,
+        "wheel_sha256": wheel_sha256,
+        "files": file_count,
+    }
+
+
 def _qemu_semver(version_line: str | None) -> str | None:
     """从 `QEMU emulator version 11.1.0` 之类的首行提取版本号。"""
     if not version_line:
@@ -577,7 +842,8 @@ def _copy_ctflab_sources(source_root: Path, destination: Path) -> list[str]:
 
 
 def _sign_macho_files(runtime_bin: Path, runtime_lib: Path, identity: str,
-                      entitlements: dict[str, dict[str, Any]] | None = None) -> list[str]:
+                      entitlements: dict[str, dict[str, Any]] | None = None,
+                      extra_roots: Iterable[Path] = ()) -> list[str]:
     entitlements = entitlements or {}
     signed: list[str] = []
     for directory in (runtime_lib, runtime_bin):
@@ -587,6 +853,12 @@ def _sign_macho_files(runtime_bin: Path, runtime_lib: Path, identity: str,
             if path.is_file() and not path.name.startswith("."):
                 sign_with_entitlements(path, identity, entitlements.get(path.name))
                 signed.append(str(path))
+    # 额外子树（内置 Python 运行时）：递归签名所有 Mach-O，否则外层
+    # `codesign --verify --deep --strict` 会因嵌套未签名代码失败。
+    for root in extra_roots:
+        for path in iter_macho_files(Path(root)):
+            sign_with_entitlements(path, identity, entitlements.get(path.name))
+            signed.append(str(path))
     return signed
 
 
@@ -643,7 +915,9 @@ def _binary_arch(path: Path) -> str | None:
 def build_sbom(*, version: str, generated_at: str, qemu_root: Path, libs: dict[str, Path],
                qemu_share: list[str], license_index: dict[str, list[str]],
                license_texts_complete: bool, vendored_index: dict[str, list[str]] | None = None,
-               source_offer: dict[str, Any] | None = None) -> dict[str, Any]:
+               source_offer: dict[str, Any] | None = None,
+               python_meta: dict[str, Any] | None = None,
+               pyyaml_meta: dict[str, Any] | None = None) -> dict[str, Any]:
     import ctflab_package  # noqa: PLC0415  函数内导入，避免循环依赖
 
     vendored_index = vendored_index or {}
@@ -713,6 +987,34 @@ def build_sbom(*, version: str, generated_at: str, qemu_root: Path, libs: dict[s
         ],
     }]
     components.extend(dylib_components)
+    _expect(python_meta, "构建 SBOM 需要内置 Python 运行时元数据。")
+    _expect(pyyaml_meta, "构建 SBOM 需要 PyYAML 元数据。")
+    components.append({
+        "name": "CPython",
+        "type": "application",
+        "role": "runtime",
+        "version": python_meta["version"],
+        "license": KNOWN_LICENSES["python"],
+        "license_text_status": "present",
+        "bundled": True,
+        "directory": python_meta["root"],
+        "source": python_meta["source"],
+        "archive_sha256": python_meta.get("archive_sha256"),
+        "pruned": python_meta.get("pruned", []),
+        "note": "随包解释器与标准库；裁剪清单记录在本组件 pruned 字段，逐文件哈希见 MANIFEST.json。",
+    })
+    components.append({
+        "name": "PyYAML",
+        "type": "library",
+        "role": "runtime",
+        "version": pyyaml_meta["version"],
+        "license": KNOWN_LICENSES["pyyaml"],
+        "license_text_status": "present",
+        "bundled": True,
+        "directory": pyyaml_meta["package_rel"],
+        "source": "PyPI wheel（原始文件未修改）",
+        "wheel_sha256": pyyaml_meta.get("wheel_sha256"),
+    })
     return {
         "schema": 1,
         "format": "ctflab-app-sbom",
@@ -750,8 +1052,9 @@ def third_party_markdown(sbom: dict[str, Any]) -> str:
             lines.append(f"| {component['file'].split('/')[-1]} | {component.get('version') or '-'} | "
                          f"{component['license']} | {component['source']} |")
         else:
+            detail = component.get("source") or component.get("license_detail", "")
             lines.append(f"| {component['name']} | {component.get('version')} | {component['license']} | "
-                         f"{component.get('license_detail', '')} |")
+                         f"{detail} |")
     lines += ["", "## QEMU / GPL 分发义务（单独列出）", ""]
     for obligation in sbom["components"][1]["distribution_obligations"]:
         lines.append(f"- {obligation}")
@@ -773,13 +1076,22 @@ def build_app(
     version: str | None = None,
     source_root: Path | None = None,
     qemu_root: Path | None = None,
+    python_runtime: Path | None = None,
+    python_runtime_sha256: str | None = None,
+    pyyaml_source: Path | None = None,
+    pyyaml_sha256: str | None = None,
     generated_at: str | None = None,
     sign_identity: str | None = None,
     allow_incomplete_license_texts: bool = False,
     unsigned: bool = False,
     share_files: Iterable[str] | None = None,
 ) -> dict[str, Any]:
-    """构建 `CTFLab.app`；排他发布，目标已存在时拒绝覆盖。"""
+    """构建 `CTFLab.app`；排他发布，目标已存在时拒绝覆盖。
+
+    必填 `python_runtime`（python-build-standalone 的 `.tar.gz` 或解包目录）与
+    `pyyaml_source`（PyPI wheel 或解包目录）：app 必须自带解释器与 PyYAML，
+    否则学生机仍需系统 Python/pip，违背交付目标；缺参直接失败，不回退。
+    """
     source_root = Path(source_root or DEFAULT_SOURCE_ROOT)
     runtime_version = ctflab_version()
     version = str(runtime_version if version is None else version)
@@ -787,6 +1099,12 @@ def build_app(
             f"app 版本必须与 CTFLAB_VERSION 一致：当前 {runtime_version}，请求 {version}")
     generated_at = generated_at or now_iso()
     qemu_root = Path(qemu_root) if qemu_root else detect_qemu_root()
+    _expect(python_runtime,
+            "缺少 --python-runtime：app 必须内置 Python 运行时（python-build-standalone "
+            "install_only_stripped 的 .tar.gz 或解包目录），不回退系统 Python。")
+    _expect(pyyaml_source,
+            "缺少 --pyyaml：app 必须内置 PyYAML（PyPI wheel 或解包目录），"
+            "否则接收者仍需联网 pip install。")
 
     if sign_identity is not None and sign_identity != "-":
         available = list_codesign_identities()
@@ -846,9 +1164,25 @@ def build_app(
         libs_targets = {name: runtime_lib / name for name in libs_sources}
         _rewrite_install_names([runtime_bin / name for name in QEMU_BINARIES], libs_targets)
 
+        # 4.5) 内置 Python 运行时与 PyYAML（学生机零 Python 依赖的硬前提）
+        licenses_dir = resources / "licenses"
+        licenses_dir.mkdir()
+        runtime_python = runtime / "python"
+        python_meta = copy_python_runtime(python_runtime, runtime_python,
+                                          expected_sha256=python_runtime_sha256)
+        python_meta["root"] = PYTHON_RUNTIME_REL
+        site_candidates = sorted(runtime_python.glob("lib/python3.*/site-packages"))
+        _expect(len(site_candidates) == 1,
+                f"内置 Python 缺少唯一的 lib/python3.*/site-packages 目录：{runtime_python}")
+        site_packages = site_candidates[0]
+        pyyaml_meta = copy_pyyaml(pyyaml_source, site_packages, licenses_dir / "pyyaml",
+                                  expected_sha256=pyyaml_sha256)
+        pyyaml_meta["package_rel"] = (site_packages / "yaml").relative_to(temp_app).as_posix()
+
         # 5) 签名 Mach-O（install_name_tool 之后必须重新签名；没有身份时 ad-hoc）
         if not unsigned:
-            _sign_macho_files(runtime_bin, runtime_lib, sign_identity or "-", source_entitlements)
+            _sign_macho_files(runtime_bin, runtime_lib, sign_identity or "-", source_entitlements,
+                              extra_roots=[runtime_python])
             # 断言：源二进制的能力（例如 com.apple.security.hypervisor）必须在副本上保留，
             # 否则 HVF 会在启动时拒绝创建 VGIC（HV_NO_DEVICE）。
             for name, expected in source_entitlements.items():
@@ -865,11 +1199,9 @@ def build_app(
             if actual:
                 bundled_entitlements[name] = actual
 
-        # 6) 许可证文本与合规文件
+        # 6) 许可证文本与合规文件（licenses/ 已在 4.5 创建：PyYAML 许可证已就位）
         import ctflab_package  # noqa: PLC0415  函数内导入，避免循环依赖
 
-        licenses_dir = resources / "licenses"
-        licenses_dir.mkdir()
         license_index: dict[str, list[str]] = {}
         vendored_index: dict[str, list[str]] = {}
         formulas = sorted({_formula_of(source) or "unknown" for source in libs_sources.values()}
@@ -906,6 +1238,14 @@ def build_app(
                 f"且未使用 --allow-incomplete-license-texts：{', '.join(missing)}；"
                 "分发义务无法确认时停止，不猜测。")
 
+        # 内置 Python 的 PSF 许可证文本（发行版自带，原样复制）
+        python_licenses = sorted((runtime_python / "lib").glob("python3.*/LICENSE.txt"))
+        _expect(len(python_licenses) == 1,
+                f"内置 Python 缺少唯一的许可证文本 lib/python3.*/LICENSE.txt：{runtime_python}")
+        target_dir = licenses_dir / "python"
+        target_dir.mkdir()
+        shutil.copy2(python_licenses[0], target_dir / "LICENSE.txt")
+
         # 项目自身许可证与 QEMU 源码书面要约（GPL-2.0 §3）随包分发
         project_license = source_root / "LICENSE"
         _expect(project_license.is_file(),
@@ -921,7 +1261,8 @@ def build_app(
         sbom = build_sbom(version=version, generated_at=generated_at, qemu_root=qemu_root,
                           libs=libs_sources, qemu_share=copied_share,
                           license_index=license_index, license_texts_complete=not missing,
-                          vendored_index=vendored_index, source_offer=offer_meta)
+                          vendored_index=vendored_index, source_offer=offer_meta,
+                          python_meta=python_meta, pyyaml_meta=pyyaml_meta)
         (resources / "SBOM.json").write_text(json.dumps(sbom, ensure_ascii=False, indent=2) + "\n",
                                              encoding="utf-8")
         (resources / "THIRD_PARTY_LICENSES.md").write_text(third_party_markdown(sbom), encoding="utf-8")
@@ -949,6 +1290,20 @@ def build_app(
                 "entitlements": {
                     name: entitlement_record(value)
                     for name, value in sorted(bundled_entitlements.items())
+                },
+                "python": {
+                    "root": PYTHON_RUNTIME_REL,
+                    "bin": f"{PYTHON_RUNTIME_REL}/bin/python3",
+                    "version": python_meta["version"],
+                    "source": python_meta["source"],
+                    "archive_sha256": python_meta.get("archive_sha256"),
+                    "symlinks_dereferenced": python_meta.get("symlinks_dereferenced"),
+                    "pruned": python_meta.get("pruned", []),
+                    "pyyaml": {
+                        "version": pyyaml_meta["version"],
+                        "wheel_sha256": pyyaml_meta.get("wheel_sha256"),
+                        "package": pyyaml_meta["package_rel"],
+                    },
                 },
             },
             "signature": dict(signature_plan),
@@ -1033,17 +1388,19 @@ def _exclusive_publish_file(source: Path, destination: Path) -> None:
 
 
 def verify_runtime_references(app: Path) -> list[str]:
-    """检查 app 内所有 Mach-O 文件：无禁止引用，且非系统依赖都在 runtime/lib 内。"""
+    """检查 app 内所有 Mach-O 文件：无禁止引用，且非系统依赖都在 app 运行时内。"""
     runtime = app / RUNTIME_REL
     problems: list[str] = []
     macho_files = [p for p in (runtime / "bin").iterdir() if p.is_file()]
     macho_files += [p for p in (runtime / "lib").iterdir() if p.is_file()]
-    lib_dir = (runtime / "lib").resolve()
+    # 内置 Python 运行时：解释器与扩展模块同样纳入引用检查（递归、按 Mach-O 魔数筛选）。
+    macho_files += iter_macho_files(runtime / "python")
+    allowed_roots = [(runtime / "lib").resolve(), (runtime / "python").resolve()]
     for path in macho_files:
         for dep in otool_deps(path):
             if dep.startswith("@loader_path/"):
                 target = (path.parent / dep[len("@loader_path/"):]).resolve()
-                if not target.is_relative_to(lib_dir):
+                if not any(target.is_relative_to(root) for root in allowed_roots):
                     problems.append(f"{path.name}: 相对依赖指向 app 外：{dep}")
                 elif not target.exists():
                     problems.append(f"{path.name}: 相对依赖缺失：{dep}")
@@ -1100,6 +1457,12 @@ def verify_app(app_path: Path, *, check_signature: bool = True) -> dict[str, Any
     for pattern in FORBIDDEN_BINARY_PATTERNS:
         _expect(not pattern.search(launcher), f"启动器包含禁止路径：{pattern.pattern}")
     _expect("CTFLAB_RUNTIME_ROOT" in launcher, "启动器必须导出 CTFLAB_RUNTIME_ROOT。")
+    _expect("command -v python3" not in launcher,
+            "启动器不得探测系统 Python（必须使用 app 内置解释器）。")
+    _expect(f"{Path(PYTHON_RUNTIME_REL).name}/bin/python3" in launcher,
+            f"启动器必须使用内置解释器（{PYTHON_RUNTIME_REL}/bin/python3）。")
+    _expect("-B -s -E" in launcher,
+            "启动器必须以 -B -s -E 调用内置解释器（禁止写字节码缓存、忽略用户 site 与环境变量）。")
 
     for name in QEMU_BINARIES:
         binary = app_path / RUNTIME_REL / "bin" / name
@@ -1112,6 +1475,22 @@ def verify_app(app_path: Path, *, check_signature: bool = True) -> dict[str, Any
     for name in share_files:
         _expect((share_dir / name).is_file(), f"缺少运行时资源：{name}")
     _expect((share_dir / "keymaps").is_dir(), "缺少 keymaps 目录。")
+
+    # 内置 Python 运行时与 PyYAML：学生机零依赖的硬前提，缺一即校验失败。
+    python_section = manifest["runtime"].get("python")
+    _expect(isinstance(python_section, dict), "MANIFEST.runtime.python 必须是对象。")
+    python_bin = app_path / str(python_section.get("bin", ""))
+    _expect(python_bin.is_file() and os.access(python_bin, os.X_OK),
+            f"内置 Python 解释器缺失或不可执行：{python_section.get('bin')!r}")
+    _expect(re.fullmatch(r"\d+\.\d+\.\d+", str(python_section.get("version", ""))),
+            "MANIFEST.runtime.python.version 必须是 X.Y.Z。")
+    _expect((app_path / str(python_section.get("root", ""))).is_dir(),
+            "MANIFEST.runtime.python.root 必须是 app 内目录。")
+    pyyaml_section = python_section.get("pyyaml")
+    _expect(isinstance(pyyaml_section, dict), "MANIFEST.runtime.python.pyyaml 必须是对象。")
+    pyyaml_package = app_path / str(pyyaml_section.get("package", ""))
+    _expect((pyyaml_package / "__init__.py").is_file(),
+            f"内置 PyYAML 包缺失：{pyyaml_section.get('package')!r}")
 
     problems = verify_runtime_references(app_path)
     _expect(not problems, "运行时引用检查失败：\n" + "\n".join(problems))
@@ -1189,6 +1568,15 @@ def verify_app(app_path: Path, *, check_signature: bool = True) -> dict[str, Any
                     f"SBOM bundled file 路径越界：{file_rel}")
             _expect((app_path / file_rel).is_file(),
                     f"SBOM 标记 bundled=true 但文件缺失：{file_rel}")
+        directory = component.get("directory")
+        if directory is not None:
+            _expect(isinstance(directory, str) and directory,
+                    "SBOM component.directory 必须是非空字符串。")
+            directory_path = Path(directory)
+            _expect(not directory_path.is_absolute() and ".." not in directory_path.parts,
+                    f"SBOM directory 路径越界：{directory}")
+            _expect((app_path / directory).is_dir(),
+                    f"SBOM 标记 bundled=true 但目录缺失：{directory}")
         binaries = component.get("binaries", [])
         _expect(isinstance(binaries, list), "SBOM component.binaries 必须是数组。")
         for binary in binaries:

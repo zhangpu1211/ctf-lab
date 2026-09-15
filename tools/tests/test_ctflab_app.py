@@ -44,8 +44,90 @@ int main(int argc, char **argv) {
   return 0;
 }
 """
+PYTHON_MAIN_C = """#include <stdio.h>
+#include <string.h>
+int main(int argc, char **argv) {
+  if (argc > 1 && strcmp(argv[1], "--version") == 0) {
+    printf("Python 3.12.14\\n");
+    return 0;
+  }
+  printf("stub python\\n");
+  return 0;
+}
+"""
+BUNDLE_C = "int stub_bundle(void) { return 7; }\n"
 LIB_C = "int stub_answer(void) { return 42; }\n"
 LIB2_C = "int stub_answer(void); int layer2(void) { return stub_answer() + 1; }\n"
+
+
+class FakePythonRuntime:
+    """用 clang 构造最小 Python 发行版替身：symlink、可裁剪项与一个 Mach-O 扩展模块。"""
+
+    def __init__(self, root: pathlib.Path) -> None:
+        self.root = root
+
+    @staticmethod
+    def _clang(args: list[str]) -> None:
+        result = subprocess.run([CLANG, *args], capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr)
+
+    def build(self) -> pathlib.Path:
+        root = self.root
+        (root / "bin").mkdir(parents=True, exist_ok=True)
+        (root / "lib" / "python3.12" / "lib-dynload").mkdir(parents=True, exist_ok=True)
+        (root / "lib" / "python3.12" / "site-packages").mkdir(parents=True, exist_ok=True)
+        (root / "lib" / "python3.12" / "encodings").mkdir(parents=True, exist_ok=True)
+        (root / "lib" / "python3.12" / "tkinter").mkdir(parents=True, exist_ok=True)
+        (root / "include" / "python3.12").mkdir(parents=True, exist_ok=True)
+        (root / "share" / "man" / "man1").mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory() as temp:
+            temp_path = pathlib.Path(temp)
+            (temp_path / "main.c").write_text(PYTHON_MAIN_C, encoding="utf-8")
+            (temp_path / "bundle.c").write_text(BUNDLE_C, encoding="utf-8")
+            (temp_path / "lib.c").write_text(LIB_C, encoding="utf-8")
+            self._clang(["-o", str(root / "bin" / "python3.12"), str(temp_path / "main.c")])
+            self._clang(["-dynamiclib", "-o", str(root / "lib" / "libpython3.12.dylib"),
+                         str(temp_path / "lib.c")])
+            self._clang(["-bundle", "-undefined", "dynamic_lookup", "-o",
+                         str(root / "lib" / "python3.12" / "lib-dynload"
+                             / "_example.cpython-312-darwin.so"),
+                         str(temp_path / "bundle.c")])
+        (root / "bin" / "python3").symlink_to("python3.12")
+        (root / "bin" / "pip3").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        (root / "lib" / "python3.12" / "LICENSE.txt").write_text("PSF LICENSE stub\n", encoding="utf-8")
+        (root / "lib" / "python3.12" / "encodings" / "__init__.py").write_text("", encoding="utf-8")
+        (root / "lib" / "python3.12" / "site-packages" / "README.txt").write_text(
+            "stub\n", encoding="utf-8")
+        (root / "lib" / "python3.12" / "tkinter" / "__init__.py").write_text("", encoding="utf-8")
+        (root / "include" / "python3.12" / "Python.h").write_text("/* stub */\n", encoding="utf-8")
+        (root / "share" / "man" / "man1" / "python3.1").write_text("stub\n", encoding="utf-8")
+        return root
+
+
+def make_fake_pyyaml(path: pathlib.Path) -> pathlib.Path:
+    """构造最小 PyYAML wheel（zip）：yaml/ 包（含真实 Mach-O 扩展）、_yaml/、dist-info 许可证。"""
+    import zipfile
+
+    extension_bytes = b"\0" * 16
+    if CLANG:
+        with tempfile.TemporaryDirectory() as temp:
+            source = pathlib.Path(temp) / "bundle.c"
+            target = pathlib.Path(temp) / "bundle.so"
+            source.write_text(BUNDLE_C, encoding="utf-8")
+            FakePythonRuntime._clang(["-bundle", "-undefined", "dynamic_lookup",
+                                     "-o", str(target), str(source)])
+            extension_bytes = target.read_bytes()
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("yaml/__init__.py", "def safe_load(text):\n    return {}\n")
+        archive.writestr("yaml/_yaml.cpython-312-darwin.so", extension_bytes)
+        archive.writestr("_yaml/__init__.py", "import yaml\n")
+        archive.writestr("pyyaml-6.0.3.dist-info/METADATA",
+                         "Metadata-Version: 2.1\nName: PyYAML\nVersion: 6.0.3\n")
+        archive.writestr("pyyaml-6.0.3.dist-info/licenses/LICENSE", "MIT License stub\n")
+    return path
 
 
 class FakeRuntime:
@@ -128,6 +210,8 @@ class AppTestCase(unittest.TestCase):
         base = pathlib.Path(cls._class_temp.name)
         cls.fake_runtime = FakeRuntime(base / "fakeqemu").build().root
         cls.source_root = make_source_root(base / "src")
+        cls.fake_python = FakePythonRuntime(base / "fakepython").build()
+        cls.fake_pyyaml = make_fake_pyyaml(base / "pyyaml-6.0.3-cp312-cp312-macosx_11_0_arm64.whl")
 
     @classmethod
     def tearDownClass(cls) -> None:
@@ -145,6 +229,8 @@ class AppTestCase(unittest.TestCase):
             "version": "0.1.0",
             "source_root": self.source_root,
             "qemu_root": self.fake_runtime,
+            "python_runtime": self.fake_python,
+            "pyyaml_source": self.fake_pyyaml,
             "generated_at": "2026-09-15T00:00:00Z",
             "allow_incomplete_license_texts": True,
             "unsigned": True,
@@ -175,7 +261,10 @@ class StructureTests(AppTestCase):
         result = self.build()
         launcher = (pathlib.Path(result["app"]) / ctflab_app.LAUNCHER_REL).read_text(encoding="utf-8")
         self.assertIn("CTFLAB_RUNTIME_ROOT", launcher)
-        self.assertIn("command -v python3", launcher)
+        self.assertIn("runtime/python/bin/python3", launcher)
+        self.assertIn("-B -s -E", launcher)
+        self.assertNotIn("command -v python3", launcher,
+                         "启动器不得探测系统 Python（必须使用内置解释器）")
         for needle in ("/opt/homebrew", "/usr/local", "/Users/", "conda"):
             self.assertNotIn(needle, launcher)
 
@@ -606,6 +695,96 @@ class LicenseComplianceTests(AppTestCase):
         with self.assertRaises(ctflab_app.AppBuildError) as raised:
             ctflab_app.verify_app(app, check_signature=False)
         self.assertIn("登记表不一致", str(raised.exception))
+
+
+class PythonRuntimeTests(AppTestCase):
+    """内置 Python 运行时：复制、裁剪、符号链接解引用、PyYAML 与签名覆盖。"""
+
+    def test_python_runtime_bundled_pruned_and_dereferenced(self) -> None:
+        result = self.build()
+        app = pathlib.Path(result["app"])
+        python_root = app / ctflab_app.PYTHON_RUNTIME_REL
+        python_bin = python_root / "bin" / "python3"
+        self.assertTrue(python_bin.is_file(), "内置解释器必须存在")
+        self.assertTrue(os.access(python_bin, os.X_OK), "内置解释器必须可执行")
+        self.assertEqual([p for p in python_root.rglob("*") if p.is_symlink()], [],
+                         "app 内 Python 树不得残留符号链接")
+        for pruned in ("bin/pip3", "lib/python3.12/tkinter", "include", "share",
+                       "lib/libpython3.12.dylib"):
+            self.assertFalse((python_root / pruned).exists(), f"应被裁剪：{pruned}")
+        section = result["manifest"]["runtime"]["python"]
+        self.assertEqual(section["version"], "3.12.14")
+        self.assertEqual(section["symlinks_dereferenced"], 1)
+        self.assertIn("bin/pip3", section["pruned"])
+        self.assertIn("lib/libpython3.12.dylib", section["pruned"])
+
+    def test_python_runtime_from_tarball(self) -> None:
+        import tarfile
+
+        archive = pathlib.Path(self.temp.name) / "cpython-3.12.14+20260901-aarch64-apple-darwin-install_only_stripped.tar.gz"
+        with tarfile.open(archive, "w:gz") as tar:
+            tar.add(self.fake_python, arcname="python")
+        result = self.build(python_runtime=archive)
+        app = pathlib.Path(result["app"])
+        self.assertTrue((app / ctflab_app.PYTHON_RUNTIME_REL / "bin" / "python3").is_file())
+        section = result["manifest"]["runtime"]["python"]
+        self.assertEqual(section["source"], "python-build-standalone 20260901（cpython-3.12.14）")
+        self.assertEqual(section["archive_sha256"], ctflab_app.sha256_file(archive))
+
+    def test_python_runtime_sha256_mismatch_stops_build(self) -> None:
+        import tarfile
+
+        archive = pathlib.Path(self.temp.name) / "python-bad.tar.gz"
+        with tarfile.open(archive, "w:gz") as tar:
+            tar.add(self.fake_python, arcname="python")
+        with self.assertRaises(ctflab_app.AppBuildError) as raised:
+            self.build(python_runtime=archive, python_runtime_sha256="0" * 64)
+        self.assertIn("SHA-256 不符", str(raised.exception))
+
+    def test_missing_python_or_pyyaml_stops_build(self) -> None:
+        with self.assertRaises(ctflab_app.AppBuildError) as raised:
+            self.build(python_runtime=None)
+        self.assertIn("--python-runtime", str(raised.exception))
+        with self.assertRaises(ctflab_app.AppBuildError) as raised:
+            self.build(pyyaml_source=None)
+        self.assertIn("--pyyaml", str(raised.exception))
+
+    def test_pyyaml_installed_into_site_packages(self) -> None:
+        result = self.build()
+        app = pathlib.Path(result["app"])
+        site = app / "Contents/Resources/runtime/python/lib/python3.12/site-packages"
+        self.assertTrue((site / "yaml" / "__init__.py").is_file())
+        self.assertTrue((site / "_yaml" / "__init__.py").is_file())
+        self.assertTrue((site / "yaml" / "_yaml.cpython-312-darwin.so").is_file(),
+                        "PyYAML 的 C 扩展（系统库依赖）应随包并在签名覆盖内")
+        self.assertTrue((app / ctflab_app.LICENSES_REL / "pyyaml" / "LICENSE").is_file())
+        self.assertTrue((app / ctflab_app.LICENSES_REL / "python" / "LICENSE.txt").is_file())
+        pyyaml = result["manifest"]["runtime"]["python"]["pyyaml"]
+        self.assertEqual(pyyaml["version"], "6.0.3")
+        self.assertEqual(pyyaml["package"],
+                         "Contents/Resources/runtime/python/lib/python3.12/site-packages/yaml")
+
+    def test_pyyaml_wheel_path_escape_is_rejected(self) -> None:
+        import zipfile
+
+        evil = pathlib.Path(self.temp.name) / "pyyaml-6.0.3-cp312-cp312-macosx_11_0_arm64.whl"
+        with zipfile.ZipFile(evil, "w") as archive:
+            archive.writestr("../escape.txt", "no")
+        with self.assertRaises(ctflab_app.AppBuildError) as raised:
+            self.build(pyyaml_source=evil)
+        self.assertIn("越界", str(raised.exception))
+
+    def test_python_tree_is_signed_when_signing_enabled(self) -> None:
+        result = self.build(unsigned=False)
+        app = pathlib.Path(result["app"])
+        for rel in ("Contents/Resources/runtime/python/bin/python3.12",
+                    "Contents/Resources/runtime/python/lib/python3.12/lib-dynload/"
+                    "_example.cpython-312-darwin.so"):
+            verify = subprocess.run(["codesign", "--verify", "--strict", str(app / rel)],
+                                    capture_output=True, text=True)
+            self.assertEqual(verify.returncode, 0, f"{rel}: {verify.stderr}")
+        report = ctflab_app.verify_app(app)
+        self.assertEqual(report["signature"]["level"], "ad-hoc")
 
 
 class FormulaVersionTests(unittest.TestCase):

@@ -46,6 +46,8 @@ PROFILE_DIR = PROJECT_ROOT / "tools" / "ctflab_profiles"
 DEFAULT_STATE_DIR = Path.home() / "Library" / "Application Support" / "CTFLab"
 # 版本是打包（Task 6.1）、内容包版本门禁与 SBOM 的单一来源。
 CTFLAB_VERSION = "0.1.0"
+# 最低 Python 版本（与 tools/ctflab_package.py 的 MIN_PYTHON 一致；doctor 实际校验）。
+MIN_PYTHON = (3, 10)
 QEMU_X86_NAMES = ("qemu-system-x86_64",)
 QEMU_ARM_NAMES = ("qemu-system-aarch64",)
 PROFILE_ALIASES = {"kali": "kali-arm64"}
@@ -59,6 +61,11 @@ class CTFLabError(RuntimeError):
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def python_version_ok() -> bool:
+    """当前解释器是否满足最低版本（doctor 的实际校验，而非只看解释器存在）。"""
+    return sys.version_info[:2] >= MIN_PYTHON
 
 
 def run_command(command: list[str], *, capture: bool = True) -> subprocess.CompletedProcess[str]:
@@ -2123,7 +2130,13 @@ def cmd_doctor(manager: LabManager, _args: argparse.Namespace) -> int:
             True,
             "需要 macOS Apple Silicon（Darwin arm64）",
         ),
-        ("python", sys.executable, True, "需要 Python 3.10+；推荐使用自带 PyYAML 的解释器"),
+        (
+            "python",
+            f"{sys.executable}（{platform.python_version()}）" if python_version_ok() else None,
+            True,
+            f"需要 Python {MIN_PYTHON}+；当前 {sys.executable} 是 {platform.python_version()}，"
+            "推荐使用自带解释器与 PyYAML 的 CTFLab.app",
+        ),
         ("qemu-img", resolve_tool("qemu-img"), True,
          "请安装 QEMU：brew install qemu，或使用自带运行时的 CTFLab.app"),
         ("qemu-system-x86_64", which_any(QEMU_X86_NAMES), True,
@@ -2372,7 +2385,7 @@ def cmd_content_unpack(_manager: LabManager, args: argparse.Namespace) -> int:
 
 
 def cmd_app_build(_manager: LabManager, args: argparse.Namespace) -> int:
-    """Task 6.2：构建包含受控 QEMU 运行时的 CTFLab.app。"""
+    """Task 6.2/6.3B：构建包含受控 QEMU + Python 运行时的 CTFLab.app。"""
     import ctflab_app  # noqa: PLC0415
 
     try:
@@ -2380,6 +2393,10 @@ def cmd_app_build(_manager: LabManager, args: argparse.Namespace) -> int:
             args.out,
             version=args.version,
             qemu_root=args.qemu_root,
+            python_runtime=args.python_runtime,
+            python_runtime_sha256=args.python_runtime_sha256,
+            pyyaml_source=args.pyyaml,
+            pyyaml_sha256=args.pyyaml_sha256,
             sign_identity=args.sign_identity,
             allow_incomplete_license_texts=args.allow_incomplete_license_texts,
             unsigned=args.unsigned,
@@ -2387,16 +2404,22 @@ def cmd_app_build(_manager: LabManager, args: argparse.Namespace) -> int:
     except ctflab_app.AppBuildError as exc:
         raise CTFLabError(str(exc)) from exc
     signature = result["signature"]
+    runtime = result["manifest"]["runtime"]
     print(f"CTFLab.app 已生成：{result['app']}")
     print(f"版本 {result['manifest']['version']}，{len(result['manifest']['files'])} 个登记文件；"
-          f"QEMU：{result['manifest']['runtime']['qemu_version']}")
-    print(f"动态库 {len(result['manifest']['runtime']['dylibs'])} 个，"
-          f"运行时资源 {len(result['manifest']['runtime']['share_files'])} 个")
+          f"QEMU：{runtime['qemu_version']}")
+    print(f"动态库 {len(runtime['dylibs'])} 个，"
+          f"运行时资源 {len(runtime['share_files'])} 个")
+    print(f"内置 Python {runtime['python']['version']}（{runtime['python']['source']}），"
+          f"PyYAML {runtime['python']['pyyaml']['version']}；"
+          f"裁掉 {len(runtime['python']['pruned'])} 项、解引用符号链接 "
+          f"{runtime['python']['symlinks_dereferenced']} 个")
     print(f"签名级别：{signature['level']}；公证：{signature['notarization_status']}")
     if result["missing_license_texts"]:
-        print("警告：以下组件在 Homebrew keg 中没有许可证文本：" + ", ".join(result["missing_license_texts"]))
+        print("警告：以下组件在 Homebrew keg 与仓库 tools/licenses/ 中都没有许可证文本："
+              + ", ".join(result["missing_license_texts"]))
     for blocker in result["manifest"]["license"]["distribution_blockers"]:
-        print(f"分发阻塞（禁止公开发布）：{blocker}")
+        print(f"分发阻塞：{blocker}")
     return 0
 
 
@@ -2407,13 +2430,19 @@ def cmd_app_verify(_manager: LabManager, args: argparse.Namespace) -> int:
         report = ctflab_app.verify_app(args.app)
     except ctflab_app.AppBuildError as exc:
         raise CTFLabError(str(exc)) from exc
+    runtime = report["runtime"]
     print(f"app 校验通过：{report['app']}")
     print(f"版本 {report['version']}，{report['file_count']} 个登记文件；"
-          f"QEMU：{report['runtime']['qemu_version']}")
+          f"QEMU：{runtime['qemu_version']}")
+    python_section = runtime.get("python", {})
+    if python_section:
+        print(f"内置 Python：{python_section.get('version')}"
+              f"（{python_section.get('bin')}），"
+              f"PyYAML：{python_section.get('pyyaml', {}).get('version')}")
     print(f"签名级别：{report['signature']['level']}；公证：{report['signature']['notarization_status']}")
     print(f"许可证文本完整性：{report['license_texts_complete']}")
     for blocker in report["distribution_blockers"]:
-        print(f"分发阻塞（禁止公开发布）：{blocker}")
+        print(f"分发阻塞：{blocker}")
     return 0
 
 
@@ -2724,13 +2753,22 @@ def build_parser() -> argparse.ArgumentParser:
     content_unpack.add_argument("--out", type=Path, required=True)
 
     app_parser = subparsers.add_parser(
-        "app", help="构建/校验含受控 QEMU 运行时的 CTFLab.app（Task 6.2；本地构建，不做公证）")
+        "app", help="构建/校验含受控 QEMU + Python 运行时的 CTFLab.app（Task 6.2/6.3B；本地构建，不做公证）")
     app_sub = app_parser.add_subparsers(dest="app_command", required=True)
     app_build = app_sub.add_parser("build", help="构建 CTFLab.app（排他发布；默认 ad-hoc 签名）")
     app_build.add_argument("--out", type=Path, required=True, help="输出目录；目标已存在时一律拒绝覆盖")
     app_build.add_argument("--version", help=f"覆盖版本号，默认 {CTFLAB_VERSION}")
     app_build.add_argument("--qemu-root", type=Path,
                            help="QEMU 安装根目录（含 bin/ 与 share/qemu/）；默认从 PATH 探测")
+    app_build.add_argument("--python-runtime", type=Path, required=True,
+                           help="python-build-standalone install_only_stripped 的 .tar.gz 或解包目录"
+                                "（必填：app 必须内置解释器，不回退系统 Python）")
+    app_build.add_argument("--python-runtime-sha256",
+                           help="期望的 Python 运行时归档 SHA-256（可选，强制校验来源）")
+    app_build.add_argument("--pyyaml", type=Path, required=True,
+                           help="PyYAML wheel（.whl）或解包目录（必填：随包分发，接收者无需 pip）")
+    app_build.add_argument("--pyyaml-sha256",
+                           help="期望的 PyYAML wheel SHA-256（可选，强制校验来源）")
     app_build.add_argument("--sign-identity",
                            help="codesign 身份；缺省为 ad-hoc（-）。本机不存在的身份会直接失败")
     app_build.add_argument("--unsigned", action="store_true",
