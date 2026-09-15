@@ -220,12 +220,12 @@ class VerificationRecordTests(unittest.TestCase):
         # 不钉死细分数字（测试集会增长），但必须带复核日期与当前总数，陈旧计数不得残留
         self.assertIn("本次完整回归", self.text)
         self.assertIn("2026-09-15 复核", self.text)
-        self.assertIn("280 项通过", self.text)
-        self.assertIn("53 项验收状态与设计边界守卫测试", self.text)
+        self.assertIn("293 项通过", self.text)
+        self.assertIn("56 项验收状态与设计边界守卫测试", self.text)
         self.assertIn("82 项路径 A `utm-export` 单元测试", self.text)
         self.assertIn("37 项 Task 6.1 打包测试", self.text)
-        self.assertIn("33 项 Task 6.2 app 受控运行时测试", self.text)
-        for stale in ("66 项通过", "当前完整回归", "174 项通过", "161 项通过", "202 项", "205 项", "235 项", "245 项", "279 项", "278 项", "269 项", "267 项", "242 项", "243 项", "244 项", "48 项", "95 项"):
+        self.assertIn("43 项 Task 6.2/6.3A app 受控运行时与验收守卫测试", self.text)
+        for stale in ("66 项通过", "当前完整回归", "174 项通过", "161 项通过", "202 项", "205 项", "235 项", "245 项", "280 项", "283 项", "286 项", "279 项", "278 项", "269 项", "267 项", "242 项", "243 项", "244 项", "48 项", "95 项"):
             self.assertNotIn(stale, self.text)
 
     def test_matrix_wording_avoids_adapted_claim(self) -> None:
@@ -658,6 +658,50 @@ class Task62AppRuntimeDocsTests(unittest.TestCase):
         self.assertIn("ad-hoc", flat)
         self.assertNotIn("Developer ID 签名通过", flat)
         self.assertNotIn("公证通过", flat)
+
+
+class Task63AKaliAcceptanceDocsTests(unittest.TestCase):
+    """Task 6.3A 记录：缺陷与修复、范围限制、未交付项必须写清。"""
+
+    RECORD = PROJECT_ROOT / "docs" / "verification-task6-3a-2026-09-15.md"
+
+    def setUp(self) -> None:
+        self.text = self.RECORD.read_text(encoding="utf-8")
+
+    def test_record_documents_defect_and_fix(self) -> None:
+        flat = normalized(self.text)
+        self.assertIn("com.apple.security.hypervisor", flat)
+        self.assertIn("HV_NO_DEVICE", flat)
+        self.assertIn("entitlements", flat)
+        self.assertIn("已验证", flat)
+        self.assertIn("qemu-img check", flat)
+        self.assertIn("login_ready", flat)
+        self.assertIn("GRUB", flat)
+        self.assertIn("29/29", flat)
+        self.assertIn("键和值", flat)
+        self.assertIn("final-screen-initial.png", flat)
+        self.assertIn("final-screen-reboot.png", flat)
+
+    def test_record_keeps_signing_and_distribution_limits(self) -> None:
+        flat = normalized(self.text)
+        self.assertIn("ad-hoc", flat)
+        self.assertIn("未做", flat)
+        self.assertIn("公证", flat)
+        self.assertIn("禁止公开发布", flat)
+        for stale in ("Developer ID 签名通过", "公证通过"):
+            self.assertNotIn(stale, flat)
+        for sentence in sentences(self.text):
+            if "已签名分发" in sentence:
+                self.assertTrue(any(marker in sentence for marker in NEGATION_MARKERS),
+                                f"疑似声称已签名分发：{sentence[:80]}")
+
+    def test_record_keeps_runtime_provenance_evidence(self) -> None:
+        flat = normalized(self.text)
+        self.assertIn("bundled", flat)
+        self.assertIn("sandbox-exec", flat)
+        self.assertIn("/opt/homebrew", flat)
+        self.assertTrue("CTFLAB_RUNTIME_ROOT" in flat or "runtime" in flat)
+        self.assertIn("runtime/bin/qemu-system-aarch64", flat)
 
 
 if __name__ == "__main__":

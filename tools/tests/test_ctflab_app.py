@@ -25,6 +25,7 @@ sys.path.insert(0, str(TOOLS_DIR))
 
 import ctflab  # noqa: E402
 import ctflab_app  # noqa: E402
+import ctflab_app_kali_e2e  # noqa: E402
 import ctflab_package  # noqa: E402
 
 CLANG = shutil.which("clang")
@@ -434,6 +435,128 @@ class SigningTests(AppTestCase):
         with self.assertRaises(ctflab_app.AppBuildError) as raised:
             self.build(unsigned=False, sign_identity="Developer ID Application: Nobody (0000000000)")
         self.assertIn("未找到签名身份", str(raised.exception))
+
+
+@unittest.skipUnless(CLANG, "需要 clang 构造最小 Mach-O 运行时")
+class EntitlementPreservationTests(AppTestCase):
+    """HVF 依赖 com.apple.security.hypervisor：重签名必须保留源二进制 entitlements。"""
+
+    ENTITLEMENTS = {"com.apple.security.hypervisor": True}
+
+    def _runtime_with_entitlements(self) -> pathlib.Path:
+        """构造带 entitlements 的假运行时（仅 qemu-system-* 带，模拟宿主 QEMU）。"""
+        runtime = FakeRuntime(pathlib.Path(self.temp.name) / "entqemu").build().root
+        plist = pathlib.Path(self.temp.name) / "ent.plist"
+        plist.write_bytes(plistlib.dumps(self.ENTITLEMENTS))
+        for name in ("qemu-system-aarch64", "qemu-system-x86_64"):
+            result = subprocess.run(
+                ["codesign", "--force", "--sign", "-", "--entitlements", str(plist),
+                 str(runtime / "bin" / name)],
+                capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        return runtime
+
+    def test_read_entitlements_round_trip(self) -> None:
+        runtime = self._runtime_with_entitlements()
+        found = ctflab_app.read_entitlements(runtime / "bin" / "qemu-system-aarch64")
+        self.assertEqual(found, self.ENTITLEMENTS)
+        self.assertIsNone(ctflab_app.read_entitlements(runtime / "bin" / "qemu-img"))
+
+    def test_build_preserves_entitlements_and_records_them(self) -> None:
+        runtime = self._runtime_with_entitlements()
+        result = self.build(qemu_root=runtime, unsigned=False)
+        app = pathlib.Path(result["app"])
+        for name in ("qemu-system-aarch64", "qemu-system-x86_64"):
+            actual = ctflab_app.read_entitlements(app / ctflab_app.RUNTIME_REL / "bin" / name)
+            self.assertEqual(actual, self.ENTITLEMENTS, f"{name} 丢失 entitlements（HVF 会失败）")
+        recorded = result["manifest"]["runtime"]["entitlements"]
+        self.assertEqual(recorded["qemu-system-aarch64"]["keys"],
+                         ["com.apple.security.hypervisor"])
+        self.assertRegex(recorded["qemu-system-aarch64"]["sha256"], r"^[0-9a-f]{64}$")
+        self.assertEqual(
+            recorded["qemu-system-aarch64"],
+            ctflab_app.entitlement_record(self.ENTITLEMENTS),
+        )
+
+    def test_verify_app_detects_stripped_entitlements(self) -> None:
+        runtime = self._runtime_with_entitlements()
+        result = self.build(qemu_root=runtime, unsigned=False)
+        app = pathlib.Path(result["app"])
+        target = app / ctflab_app.RUNTIME_REL / "bin" / "qemu-system-aarch64"
+        strip = subprocess.run(["codesign", "--force", "--sign", "-", str(target)],
+                               capture_output=True, text=True)
+        self.assertEqual(strip.returncode, 0, strip.stderr)
+        with self.assertRaises(ctflab_app.AppBuildError) as raised:
+            ctflab_app.verify_app(app, check_signature=False)
+        message = str(raised.exception)
+        self.assertTrue("entitlements" in message or "哈希不符" in message, message)
+
+    def test_verify_app_detects_changed_entitlement_value(self) -> None:
+        runtime = self._runtime_with_entitlements()
+        result = self.build(qemu_root=runtime, unsigned=False)
+        app = pathlib.Path(result["app"])
+        target = app / ctflab_app.RUNTIME_REL / "bin" / "qemu-system-aarch64"
+        false_plist = pathlib.Path(self.temp.name) / "false-entitlement.plist"
+        false_plist.write_bytes(plistlib.dumps({"com.apple.security.hypervisor": False}))
+        resign = subprocess.run(
+            ["codesign", "--force", "--sign", "-", "--entitlements", str(false_plist), str(target)],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(resign.returncode, 0, resign.stderr)
+        with self.assertRaises(ctflab_app.AppBuildError) as raised:
+            ctflab_app.verify_app(app, check_signature=False)
+        self.assertIn("entitlements", str(raised.exception))
+
+
+class KaliE2EGuardTests(unittest.TestCase):
+    """Task 6.3A 必须避免把 GRUB 当登录界面，也不能绕过来宾侧验收。"""
+
+    def test_grub_menu_is_not_login_ready(self) -> None:
+        text = "Kali GNU/Linux\nAdvanced options for Kali\nUEFI Firmware Settings\nBooting in 4 seconds"
+        result = ctflab_app_kali_e2e.classify_kali_screen(text)
+        self.assertEqual(result["classification"], "boot_progress")
+        self.assertNotEqual(result["classification"], "login_ready")
+
+    def test_lightdm_text_is_login_ready(self) -> None:
+        result = ctflab_app_kali_e2e.classify_kali_screen(
+            "KALI Linux\nUsername\nPassword\nLog In"
+        )
+        self.assertEqual(result["classification"], "login_ready")
+
+    def test_measured_lightdm_ocr_degradation_is_login_ready(self) -> None:
+        result = ctflab_app_kali_e2e.classify_kali_screen("Log!\nKALI")
+        self.assertEqual(result["classification"], "login_ready")
+
+    def test_kali_brand_alone_is_not_login_ready(self) -> None:
+        result = ctflab_app_kali_e2e.classify_kali_screen("Kali GNU/Linux")
+        self.assertNotEqual(result["classification"], "login_ready")
+
+    def test_guest_password_is_stdin_only_for_poweroff(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            ssh = ctflab_app_kali_e2e.GuestSSH(pathlib.Path(temp), "secret")
+            with mock.patch.object(ctflab_app_kali_e2e, "run", return_value={}) as mocked:
+                ssh.command("sudo -S poweroff", input_text="secret\n")
+            command = mocked.call_args.args[0]
+            self.assertNotIn("secret", " ".join(command))
+            self.assertEqual(mocked.call_args.kwargs["input_text"], "secret\n")
+            self.assertEqual(mocked.call_args.kwargs["redact"], ["secret"])
+
+    def test_missing_password_fails_before_app_verification(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            app = root / "CTFLab.app"
+            launcher = app / ctflab_app.LAUNCHER_REL
+            launcher.parent.mkdir(parents=True)
+            launcher.write_text("#!/bin/sh\n", encoding="utf-8")
+            workdir = root / "evidence"
+            with mock.patch.dict(os.environ, {"CTFLAB_KALI_PASSWORD": ""}, clear=False):
+                result = ctflab_app_kali_e2e.main([
+                    "--app", str(app), "--workdir", str(workdir),
+                ])
+            self.assertEqual(result, 1)
+            evidence = json.loads((workdir / "kali-e2e-evidence.json").read_text(encoding="utf-8"))
+            self.assertEqual(evidence["result"], "失败")
+            self.assertEqual(evidence["steps"][0]["step"], "guest-password")
 
 
 class RuntimeSelectionTests(unittest.TestCase):

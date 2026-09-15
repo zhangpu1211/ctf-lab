@@ -438,6 +438,17 @@ health（DHCP+SSH）→ stop → reset → 无残留 → app 树哈希不变 →
 未随附、`dtc` 许可证文本缺失（`missing-in-keg`）——禁止公开发布，详见
 `docs/ctflab-task6-app-runtime-design.md` 与 `docs/verification-task6-2-2026-09-15.md`。
 
+2026-09-15（Task 6.3A）证据：用含受控运行时的 `CTFLab.app` 完成 Kali ARM64 + UEFI 的
+import/run/health/reboot/stop/reset 全链路（29/29 条记录通过）：最小 PATH（无 `/opt/homebrew/bin`）下
+doctor 显示 bundled 运行时；`sandbox-exec` 拒绝 `/opt/homebrew` 后 App 内 QEMU + 固件仍可启动；
+UEFI 首次与重启均到图形登录界面（独立截图经 OCR 登录专属信号与人工复核，未进入 UEFI Shell）；
+派生 NVRAM 可写而 App 模板与用户原始 RAW NVRAM
+哈希不变；Kali 在隔离网内可达 smoke/basic（HTTP 200）且无默认路由、公网不可达；重启后再次健康；
+reset 后无残留、App 树哈希不变、`qemu-img check` 通过。过程中定位并修复 6.2 的
+entitlement 丢失缺陷（HVF `HV_NO_DEVICE`），并在复核中收紧为 entitlement 键和值完全一致。
+**仍未做** Developer ID 签名与公证。详见
+`docs/verification-task6-3a-2026-09-15.md`。
+
 ## 7. 第一阶段验收清单
 
 以下项目全部通过，第一阶段才可以宣布完成。每条只写一个主状态标签，位于复选框之后、说明冒号之前（例如 `已验证：…`）：

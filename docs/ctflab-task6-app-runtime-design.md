@@ -62,7 +62,10 @@ CTFLab.app/
 - 复制到 `runtime/lib/`，文件名沿用加载器期望的 soname；
 - `install_name_tool` 改写：程序 → `@loader_path/../lib/<name>`；dylib 自身 id 与依赖 →
   `@loader_path/<name>`；删除指向宿主安装位置的 LC_RPATH；
-- 改写后所有 Mach-O 逐个签名（默认 ad-hoc），再计算 MANIFEST 哈希；
+- 改写后所有 Mach-O 逐个签名（默认 ad-hoc）并**原样保留源二进制的 entitlements**
+  （`com.apple.security.hypervisor` 是 HVF 的硬前提；丢失会以 `HV_NO_DEVICE` 创建 VGIC 失败告终），
+  签名后断言副本的 entitlement 键和值与源文件完全一致，并把键集合与规范化值摘要记入
+  `MANIFEST.json.runtime.entitlements`，再计算 MANIFEST 哈希；
 - 打包后自检：任何 `otool -L` 非系统依赖必须落在 `runtime/lib/` 内、且不得残留
   `/opt/homebrew`、`/usr/local`、`/Users/`、`conda` 字符串；LC_RPATH 与 install id 同样纳入校验。
 
@@ -109,12 +112,14 @@ CTFLab.app/
 
 ## 9. 验收方式
 
-- 单元测试 `tools/tests/test_ctflab_app.py`（33 项，用 clang 现场编译的最小 QEMU 替身，不依赖 Homebrew）；
+- 单元测试 `tools/tests/test_ctflab_app.py`（43 项，用 clang 现场编译的最小 QEMU 替身，不依赖 Homebrew；
+  含 entitlement 键和值摘要、GRUB/LightDM 分类、口令必填与标准输入传递守卫）；
 - 真实 E2E `tools/ctflab_app_e2e.py`：独立 HOME + 最小 PATH（**不含 `/opt/homebrew/bin`**）下
   校验 app → doctor（bundled 运行时）→ venv 安装 PyYAML → `sandbox-exec` 固件来源证明 →
   import → run --headless → health（DHCP/SSH）→ stop → reset → 无残留 → app 树哈希不变 →
   `codesign --verify --deep --strict` 按实际级别记录；过程中从进程命令行证明 QEMU 来自 `.app`。
-- 证据与结论见 `docs/verification-task6-2-2026-09-15.md`。
+- 证据与结论见 `docs/verification-task6-2-2026-09-15.md`；Kali ARM64 + UEFI 的真实运行验收见
+  `docs/verification-task6-3a-2026-09-15.md`（该记录同时给出 entitlement 丢失缺陷的定位与修复）。
 
 ## 10. 仍需决策
 

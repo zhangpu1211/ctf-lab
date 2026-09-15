@@ -348,13 +348,52 @@ def list_codesign_identities() -> list[str]:
     return re.findall(r'"([^"]+)"', result.stdout)
 
 
-def codesign_path(path: Path, identity: str) -> None:
+def codesign_path(path: Path, identity: str, entitlements_path: Path | None = None) -> None:
     _expect(shutil.which("codesign"), "需要 macOS codesign 来签名。")
     command = ["codesign", "--force", "--sign", identity]
     if identity == "-":
         command.append("--timestamp=none")
+    if entitlements_path is not None:
+        command += ["--entitlements", str(entitlements_path)]
     command.append(str(path))
     _run_tool(command)
+
+
+def read_entitlements(path: Path) -> dict[str, Any] | None:
+    """读取 Mach-O 的 entitlements；没有则返回 None（HVF 依赖 com.apple.security.hypervisor）。"""
+    result = _run_tool(["codesign", "-d", "--entitlements", ":-", str(path)], check=False)
+    text = result.stdout or ""
+    if "<plist" not in text:
+        return None
+    try:
+        parsed = plistlib.loads(text.encode("utf-8"))
+    except Exception as exc:  # noqa: BLE001  损坏的 entitlement 不能静默当成“不存在”
+        raise AppBuildError(f"无法解析 {path.name} 的 entitlements：{exc}") from exc
+    _expect(isinstance(parsed, dict), f"{path.name} 的 entitlements 不是字典。")
+    return parsed
+
+
+def entitlement_record(entitlements: dict[str, Any]) -> dict[str, Any]:
+    """生成不暴露 entitlement 值的可复核摘要；校验时仍比较完整值。"""
+    payload = plistlib.dumps(entitlements, fmt=plistlib.FMT_BINARY, sort_keys=True)
+    return {
+        "keys": sorted(entitlements),
+        "sha256": hashlib.sha256(payload).hexdigest(),
+    }
+
+
+def sign_with_entitlements(path: Path, identity: str, entitlements: dict[str, Any] | None) -> None:
+    """重签名时保留源二进制的 entitlements（否则 HVF/虚拟化能力会丢失）。"""
+    if not entitlements:
+        codesign_path(path, identity)
+        return
+    handle = tempfile.NamedTemporaryFile("wb", suffix=".plist", delete=False)
+    try:
+        handle.write(plistlib.dumps(entitlements))
+        handle.close()
+        codesign_path(path, identity, entitlements_path=Path(handle.name))
+    finally:
+        Path(handle.name).unlink(missing_ok=True)
 
 
 def codesign_verify(app: Path) -> dict[str, Any]:
@@ -437,14 +476,16 @@ def _copy_ctflab_sources(source_root: Path, destination: Path) -> list[str]:
     return copied
 
 
-def _sign_macho_files(runtime_bin: Path, runtime_lib: Path, identity: str) -> list[str]:
+def _sign_macho_files(runtime_bin: Path, runtime_lib: Path, identity: str,
+                      entitlements: dict[str, dict[str, Any]] | None = None) -> list[str]:
+    entitlements = entitlements or {}
     signed: list[str] = []
     for directory in (runtime_lib, runtime_bin):
         if not directory.is_dir():
             continue
         for path in sorted(directory.iterdir()):
             if path.is_file() and not path.name.startswith("."):
-                codesign_path(path, identity)
+                sign_with_entitlements(path, identity, entitlements.get(path.name))
                 signed.append(str(path))
     return signed
 
@@ -665,12 +706,16 @@ def build_app(
         # 2) CTFLab 源码镜像
         _copy_ctflab_sources(source_root, resources / "ctflab")
 
-        # 3) QEMU 程序与资源
+        # 3) QEMU 程序与资源（同时采集源二进制 entitlements：HVF 等能力不能丢）
+        source_entitlements: dict[str, dict[str, Any]] = {}
         for name in QEMU_BINARIES:
             source = qemu_root / "bin" / name
             _expect(source.is_file(), f"缺少 QEMU 程序：{source}")
             shutil.copy2(source, runtime_bin / name)
             (runtime_bin / name).chmod(0o755)
+            found = read_entitlements(source)
+            if found:
+                source_entitlements[name] = found
         copied_share = copy_qemu_share(qemu_root, runtime_share, share_files)
 
         # 4) 动态库闭包与 install_name 改写
@@ -678,12 +723,30 @@ def build_app(
         for name, source in sorted(libs_sources.items()):
             shutil.copy2(source, runtime_lib / name)
             (runtime_lib / name).chmod(0o755)
+            found = read_entitlements(source)
+            if found:
+                source_entitlements[name] = found
         libs_targets = {name: runtime_lib / name for name in libs_sources}
         _rewrite_install_names([runtime_bin / name for name in QEMU_BINARIES], libs_targets)
 
         # 5) 签名 Mach-O（install_name_tool 之后必须重新签名；没有身份时 ad-hoc）
         if not unsigned:
-            _sign_macho_files(runtime_bin, runtime_lib, sign_identity or "-")
+            _sign_macho_files(runtime_bin, runtime_lib, sign_identity or "-", source_entitlements)
+            # 断言：源二进制的能力（例如 com.apple.security.hypervisor）必须在副本上保留，
+            # 否则 HVF 会在启动时拒绝创建 VGIC（HV_NO_DEVICE）。
+            for name, expected in source_entitlements.items():
+                directory = runtime_bin if name in QEMU_BINARIES else runtime_lib
+                actual = read_entitlements(directory / name) or {}
+                _expect(actual == expected,
+                        f"{name} 重签名后的 entitlements 与源二进制不一致"
+                        "（键和值都必须原样保留，虚拟化能力不能被降级）")
+
+        bundled_entitlements: dict[str, dict[str, Any]] = {}
+        for name in source_entitlements:
+            directory = runtime_bin if name in QEMU_BINARIES else runtime_lib
+            actual = read_entitlements(directory / name)
+            if actual:
+                bundled_entitlements[name] = actual
 
         # 6) 许可证文本
         licenses_dir = resources / "licenses"
@@ -743,6 +806,10 @@ def build_app(
                 "share_files": copied_share,
                 "qemu_version": _qemu_version(qemu_root / "bin" / "qemu-system-aarch64"),
                 "source": f"Homebrew qemu {_formula_version('qemu') or '?'}",
+                "entitlements": {
+                    name: entitlement_record(value)
+                    for name, value in sorted(bundled_entitlements.items())
+                },
             },
             "signature": dict(signature_plan),
             "license": {
@@ -906,6 +973,28 @@ def verify_app(app_path: Path, *, check_signature: bool = True) -> dict[str, Any
 
     problems = verify_runtime_references(app_path)
     _expect(not problems, "运行时引用检查失败：\n" + "\n".join(problems))
+
+    runtime_section = manifest.get("runtime", {})
+    runtime_entitlements = runtime_section.get("entitlements", {})
+    _expect(isinstance(runtime_entitlements, dict),
+            "MANIFEST.runtime.entitlements 必须是字典。")
+    allowed_entitlement_files = set(QEMU_BINARIES) | set(runtime_section.get("dylibs", []))
+    for name, recorded in runtime_entitlements.items():
+        _expect(isinstance(name, str) and name in allowed_entitlement_files,
+                f"MANIFEST.runtime.entitlements 含未知文件：{name!r}")
+        _expect(isinstance(recorded, dict), f"{name} 的 entitlement 摘要格式无效。")
+        keys = recorded.get("keys")
+        _expect(isinstance(keys, list) and keys == sorted(keys)
+                and all(isinstance(key, str) for key in keys),
+                f"{name} 的 entitlement 键清单无效。")
+        _expect(isinstance(recorded.get("sha256"), str)
+                and re.fullmatch(r"[0-9a-f]{64}", recorded["sha256"]),
+                f"{name} 的 entitlement 摘要哈希无效。")
+        directory = (app_path / RUNTIME_REL / "bin") if name in QEMU_BINARIES \
+            else (app_path / RUNTIME_REL / "lib")
+        actual = read_entitlements(directory / name) or {}
+        _expect(entitlement_record(actual) == recorded,
+                f"{name} 的 entitlements 与清单摘要不一致（键或值已变化）")
 
     seen_entries: set[str] = set()
     for entry in manifest["files"]:

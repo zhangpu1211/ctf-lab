@@ -19,6 +19,7 @@
 !/docs/verification-task6-1-2026-09-15.md
 !/docs/ctflab-task6-app-runtime-design.md
 !/docs/verification-task6-2-2026-09-15.md
+!/docs/verification-task6-3a-2026-09-15.md
 
 /tools/*
 !/tools/ctflab
@@ -30,6 +31,7 @@
 !/tools/ctflab_acceptance.py
 !/tools/ctflab_app.py
 !/tools/ctflab_app_e2e.py
+!/tools/ctflab_app_kali_e2e.py
 !/tools/ctflab_utm_fixture.json
 !/tools/ctflab_profiles/
 !/tools/guest_fixes/

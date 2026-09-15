@@ -7,15 +7,15 @@
 
 | 交付物 | 位置 | 状态 |
 |---|---|---|
-| `CTFLab.app`（含受控 QEMU 运行时） | `~/Downloads/ctflab-app-build-20260915-final2/CTFLab.app` | 已验证（限定范围） |
-| 旁车校验文件 | `~/Downloads/ctflab-app-build-20260915-final2/CTFLab.app.sha256` | 已验证 |
+| 当前 `CTFLab.app`（含受控 QEMU 运行时） | `~/Downloads/ctflab-app-build-20260915-final5/CTFLab.app` | 已验证（限定范围） |
+| 当前旁车校验文件 | `~/Downloads/ctflab-app-build-20260915-final5/CTFLab.app.sha256` | 已验证 |
 | 构建/校验模块 | `tools/ctflab_app.py`、CLI `ctflab app build/verify` | 已验证 |
 | E2E 脚本 | `tools/ctflab_app_e2e.py` | 已验证 |
-| 单元测试 | `tools/tests/test_ctflab_app.py`（33 项） | 已验证 |
+| 单元测试 | `tools/tests/test_ctflab_app.py`（43 项） | 已验证 |
 | 设计文档 | `docs/ctflab-task6-app-runtime-design.md` | 已验证 |
 
-关键记录：app 树 SHA-256 `2d5a950e9ef33f295aca6e56d100e81eb10d46bdf55f3ffa83a723024ae35c98`；
-`MANIFEST.json` SHA-256 `c4678661579642178ee8ff29e2dce0bc5044527b256675f09f3314ff285b28d3`；
+当前候选关键记录：app 树 SHA-256 `108a93b09f3447ccb174defead46c154f9dac7bcb26eb03f9d457528c9bc6343`；
+`MANIFEST.json` SHA-256 `cdd3fb847bc3cb31195f21dc94093cf536038d1ebd91b238aa075df67198b892`；
 138 个登记文件；QEMU 11.1.0（arm64 原生：`qemu-system-aarch64`/`qemu-system-x86_64`/`qemu-img`）；
 28 个非系统动态库闭包；50 个运行时资源（firmware/ROM/keymaps）；签名级别 **ad-hoc**。
 
@@ -47,7 +47,7 @@
 
 ## 3. 单元测试（已验证）
 
-`tools/tests/test_ctflab_app.py` 33 项，用一个**用 clang 现场编译的最小 QEMU 替身**（3 个可执行 +
+`tools/tests/test_ctflab_app.py` 43 项，用一个**用 clang 现场编译的最小 QEMU 替身**（3 个可执行 +
 两级 dylib 依赖 + 假 firmware），不依赖 Homebrew、不联网，覆盖：必需目录与 Info.plist；启动器无开发机
 绝对路径且导出 `CTFLAB_RUNTIME_ROOT`，SBOM 不泄露构建机绝对路径；三个 QEMU 程序存在且可执行；
 firmware/ROM 可解析，可选资源只在来源存在时复制；
@@ -59,7 +59,7 @@ unsigned 记录为 unsigned、未知签名身份直接失败；运行时选择�
 并断言受控运行时缺件时不得回退宿主 PATH；源码发布包必须包含 `ctflab_app.py`；旁车缺失/篡改、
 禁止 RPATH、SBOM 构建机绝对路径、App/旁车并发发布、非法版本和损坏元数据均会被拒绝。
 
-全量回归 280 项通过（247 项其他回归 + 33 项 Task 6.2 App 测试）。
+当前全量回归计数见主验证记录；Task 6.2/6.3A 的 App 测试现为 43 项。
 
 2026-09-15 Codex 提交前复核修正：原实现的源码 release 白名单漏带 `ctflab_app.py`，App 目录使用
 普通 `os.rename`、旁车直写且 `app verify` 未复核旁车，生产校验未检查 LC_RPATH，SBOM 记录了构建机
@@ -68,8 +68,8 @@ unsigned 记录为 unsigned、未知签名身份直接失败；运行时选择�
 ## 4. 范围与限制（不得跨类宣称）
 
 - **部分验证：干净环境可用性**——E2E 覆盖 Smoke（x86_64 BIOS）的导入/启动/健康/停止/重置；
-  Kali（aarch64 + UEFI）经 `.app` 的完整启动、以及 `probe --matrix` 的 OVMF 路径**未在本轮 E2E 中执行**
-  （仅验证了固件随包存在、aarch64 程序存在且可执行）；
+  Kali（aarch64 + UEFI）经 `.app` 的启动、重启、健康与隔离网已在 Task 6.3A 完成；
+  `probe --matrix` 的 x86 OVMF 路径仍未执行；
 - PyYAML 仍需联网 `pip install`（未内置解释器与依赖），因此“零手工依赖的完整安装”仍是后续任务；
 - **未交付**：Developer ID 正式签名、公证、`.pkg`/DMG 安装器；公证状态一律记录为“未验证/后续任务”；
   ad-hoc 签名不代表任何开发者身份；
@@ -81,6 +81,14 @@ unsigned 记录为 unsigned、未知签名身份直接失败；运行时选择�
 - 未触碰 UTM 与任何虚拟机；app 内不含虚拟磁盘、凭据、日志、截图或 PCAP；
 - 路径 A 的 UTM 结论不受本轮影响（Smoke/Basic 静态控制台 E2E 限定范围内通过；动态分辨率重启后
   复测失败、显示链路不稳定、当前包仅保证固定显示可用；路径 B 未实现）。
+
+## 4.1 后续发现（2026-09-15，Task 6.3A）
+
+Task 6.3A 用 Kali ARM64 + UEFI（HVF）验收时发现：本记录 §1 的 App 在重签名时丢失了源二进制的
+`com.apple.security.hypervisor` entitlement，导致 App 内 QEMU 无法创建 HVF 平台 VGIC
+（`HV_NO_DEVICE`）。6.2 的 Smoke E2E 走 x86_64 TCG，未覆盖该路径。修复（保留并断言 entitlements）
+与重建后的完整验收见 `docs/verification-task6-3a-2026-09-15.md`；本记录中的 App 树哈希
+`2d5a950e…` 属**已作废**的候选产物；当前候选与复核证据见 6.3A 记录。
 
 ## 5. 停止条件复核
 
