@@ -60,6 +60,8 @@ python3 -m py_compile tools/ctflab.py tools/ctflab_inspect.py tools/ctflab_netwo
 - [UTM 导出包验证：Basic Pentesting 2（2026-09-14）](docs/verification-utm-basic-pentesting-2-2026-09-14.md)
 - [Task 6.1 打包设计：可分发安装包与 .ctflab 内容包](docs/ctflab-task6-packaging-design.md)
 - [Task 6.1 验证记录（2026-09-15）](docs/verification-task6-1-2026-09-15.md)
+- [Task 6.2 设计：受控 QEMU 运行时的 CTFLab.app](docs/ctflab-task6-app-runtime-design.md)
+- [Task 6.2 验证记录（2026-09-15）](docs/verification-task6-2-2026-09-15.md)
 
 ## 安全边界
 

@@ -399,9 +399,12 @@ qemu-img create -f qcow2 -F qcow2 \
 
 ### Task 6：封装与交付
 
-- [ ] 打包 `CTFLab.app`、受控 QEMU 运行时和所需动态库。
-- [ ] 将运行时数据移出 `.app`，避免运行破坏签名。
-- [ ] 修复所有动态库为 `@loader_path` 相对路径。
+- [x] 打包 `CTFLab.app`、受控 QEMU 运行时和所需动态库（2026-09-15：本地构建，含 aarch64/x86_64 QEMU
+  + qemu-img + 28 个动态库闭包 + firmware/ROM/keymaps；未签名分发）。
+- [x] 将运行时数据移出 `.app`，避免运行破坏签名（2026-09-15：状态/镜像/overlay/日志均在
+  `~/Library/Application Support/CTFLab`；E2E 复核运行前后 app 树哈希一致）。
+- [x] 修复所有动态库为 `@loader_path` 相对路径（2026-09-15：`install_name_tool` 改写 + 删除宿主
+  LC_RPATH；打包后自检与 `otool -l` 全量扫描无 Homebrew/conda/用户路径）。
 - [x] 生成 SBOM、许可证说明、SHA-256 和版本信息（2026-09-15：源码级安装包与两个内容包已生成
   `MANIFEST.json`/`SBOM.json`/`THIRD_PARTY_LICENSES.md`/`SHA256SUMS` 与 `.sha256` 旁车；
   `CTFLab.app` 内部的版本信息随 Task 6.2 交付，项目许可证未声明并如实标注 `undeclared`）。
@@ -424,6 +427,16 @@ reset → 无残留）。范围限制：`.app`、
 受控 QEMU 运行时、动态库、签名与公证**均未实现**；PyYAML 一步为联网 `pip install`，不是零手工
 依赖的完整安装；项目许可证未声明（`undeclared`），对外分发前必须补充。详见
 `docs/ctflab-task6-packaging-design.md` 与 `docs/verification-task6-1-2026-09-15.md`。
+
+2026-09-15（Task 6.2）证据：交付含受控 QEMU 运行时的 `CTFLab.app` 本地构建
+（树哈希 `2d5a950e…`，138 个登记文件，QEMU 11.1.0 arm64，ad-hoc 签名；
+`CTFLAB_RUNTIME_ROOT` / `.app` 布局优先，PATH 仅作开发回退）。真实 E2E 在
+最小 PATH（**不含 `/opt/homebrew/bin`**）下 15/15 步通过：doctor 显示 bundled 运行时 →
+`sandbox-exec` 拒绝 `/opt/homebrew` 后 app 内 QEMU 仍可启动（固件来自 app）→ import → run →
+health（DHCP+SSH）→ stop → reset → 无残留 → app 树哈希不变 → `codesign --verify --deep --strict`
+返回 0（级别 ad-hoc，**公证未执行**）。**分发阻塞**：项目许可证 `undeclared`、QEMU GPL 源码义务
+未随附、`dtc` 许可证文本缺失（`missing-in-keg`）——禁止公开发布，详见
+`docs/ctflab-task6-app-runtime-design.md` 与 `docs/verification-task6-2-2026-09-15.md`。
 
 ## 7. 第一阶段验收清单
 

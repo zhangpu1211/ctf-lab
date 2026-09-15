@@ -48,6 +48,9 @@ RELEASE_TOOL_FILES = (
     "tools/ctflab_utm_fixture.json",
     "tools/ctflab_package.py",
     "tools/ctflab_acceptance.py",
+    # `ctflab.py app build/verify` 会在运行时导入该模块；源码发布包必须一起带上，
+    # 否则安装后的 CLI 虽然暴露 app 子命令，却会在真正执行时 ModuleNotFoundError。
+    "tools/ctflab_app.py",
 )
 RELEASE_DOC_FILES = (
     "README.md",

@@ -1,0 +1,549 @@
+#!/usr/bin/env python3
+"""Task 6.2 单元测试：`CTFLab.app` 结构、运行时闭包、清单、SBOM 与签名分级。
+
+测试用一个**用 clang 现场编译的最小 QEMU 替身**（3 个可执行 + 两级 dylib 依赖 + 假 firmware），
+因此不依赖本机 Homebrew QEMU，也不需要网络；真实 QEMU 的 E2E 由
+`tools/ctflab_app_e2e.py` 覆盖（见 `docs/verification-task6-2-2026-09-15.md`）。
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import pathlib
+import plistlib
+import shutil
+import subprocess
+import sys
+import tempfile
+import unittest
+from unittest import mock
+
+TOOLS_DIR = pathlib.Path(__file__).resolve().parents[1]
+PROJECT_ROOT = TOOLS_DIR.parent
+sys.path.insert(0, str(TOOLS_DIR))
+
+import ctflab  # noqa: E402
+import ctflab_app  # noqa: E402
+import ctflab_package  # noqa: E402
+
+CLANG = shutil.which("clang")
+FAKE_SHARE_FILES = ("firmware-a.fd", "firmware-b.fd", "bios-test.bin", "rom-test.rom",
+                    "edk2-licenses.txt")
+
+MAIN_C = """#include <stdio.h>
+int stub_answer(void);
+int main(void) { printf("%d\\n", stub_answer()); return 0; }
+"""
+LIB_C = "int stub_answer(void) { return 42; }\n"
+LIB2_C = "int stub_answer(void); int layer2(void) { return stub_answer() + 1; }\n"
+
+
+class FakeRuntime:
+    """用 clang 构造最小 Mach-O 运行时：绝对路径依赖 → 必须被改写为 @loader_path。"""
+
+    def __init__(self, root: pathlib.Path) -> None:
+        self.root = root
+        self.bin_dir = root / "bin"
+        self.lib_dir = root / "lib"
+        self.share_dir = root / "share" / "qemu"
+
+    def build(self) -> "FakeRuntime":
+        self.bin_dir.mkdir(parents=True, exist_ok=True)
+        self.lib_dir.mkdir(parents=True, exist_ok=True)
+        self.share_dir.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory() as temp:
+            temp_path = pathlib.Path(temp)
+            (temp_path / "main.c").write_text(MAIN_C, encoding="utf-8")
+            (temp_path / "lib.c").write_text(LIB_C, encoding="utf-8")
+            (temp_path / "lib2.c").write_text(LIB2_C, encoding="utf-8")
+            stub = self.lib_dir / "libstub.dylib"
+            layer2 = self.lib_dir / "liblayer2.dylib"
+            self._clang(["-dynamiclib", "-o", str(stub), "-install_name", str(stub),
+                         str(temp_path / "lib.c")])
+            self._clang(["-dynamiclib", "-o", str(layer2), "-install_name", str(layer2),
+                         str(temp_path / "lib2.c"), str(stub)])
+            for name in ctflab_app.QEMU_BINARIES:
+                binary = self.bin_dir / name
+                self._clang(["-o", str(binary), str(temp_path / "main.c"), str(layer2), str(stub)])
+        for name in FAKE_SHARE_FILES + ctflab_app.QEMU_OPTIONAL_SHARE_FILES:
+            (self.share_dir / name).write_bytes(f"fake-{name}\n".encode())
+        keymaps = self.share_dir / "keymaps"
+        keymaps.mkdir(exist_ok=True)
+        (keymaps / "en-us").write_text("keymap\n", encoding="utf-8")
+        return self
+
+    @staticmethod
+    def _clang(args: list[str]) -> None:
+        result = subprocess.run([CLANG, *args], capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr)
+
+
+def make_source_root(path: pathlib.Path, *, with_decoys: bool = False) -> pathlib.Path:
+    """最小 CTFLab 源码树（用于 app 内的 tools/ 镜像）。"""
+    path.mkdir(parents=True, exist_ok=True)
+    (path / "tools" / "ctflab_profiles").mkdir(parents=True, exist_ok=True)
+    (path / "tools" / "guest_fixes" / "smoke").mkdir(parents=True, exist_ok=True)
+    for rel in ctflab_package.RELEASE_TOOL_FILES:
+        target = path / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(f"# stub {target.name}\n", encoding="utf-8")
+    (path / "tools" / "ctflab_profiles" / "smoke.yaml").write_text(
+        (PROJECT_ROOT / "tools" / "ctflab_profiles" / "smoke.yaml").read_text(encoding="utf-8"),
+        encoding="utf-8")
+    (path / "tools" / "guest_fixes" / "smoke" / "interfaces").write_text("auto lo\n", encoding="utf-8")
+    (path / "README.md").write_text("# stub\n", encoding="utf-8")
+    if with_decoys:
+        (path / "tools" / "guest_fixes" / "smoke" / "evil.qcow2").write_bytes(b"disk")
+        (path / "tools" / "guest_fixes" / "smoke" / "guest-credentials.txt").write_bytes(b"secret")
+        (path / "tools" / "guest_fixes" / "smoke" / "capture.pcap").write_bytes(b"pcap")
+        (path / "tools" / "logs").mkdir(parents=True, exist_ok=True)
+        (path / "tools" / "logs" / "run.log").write_text("log\n", encoding="utf-8")
+    return path
+
+
+@unittest.skipUnless(CLANG, "需要 clang 构造最小 Mach-O 运行时")
+class AppTestCase(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._class_temp = tempfile.TemporaryDirectory()
+        base = pathlib.Path(cls._class_temp.name)
+        cls.fake_runtime = FakeRuntime(base / "fakeqemu").build().root
+        cls.source_root = make_source_root(base / "src")
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls._class_temp.cleanup()
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.out = pathlib.Path(self.temp.name) / "out"
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    def build(self, **kwargs):
+        params = {
+            "version": "0.1.0",
+            "source_root": self.source_root,
+            "qemu_root": self.fake_runtime,
+            "generated_at": "2026-09-15T00:00:00Z",
+            "allow_incomplete_license_texts": True,
+            "unsigned": True,
+            "share_files": FAKE_SHARE_FILES,
+        }
+        params.update(kwargs)
+        return ctflab_app.build_app(self.out, **params)
+
+
+class StructureTests(AppTestCase):
+    def test_required_structure_and_info_plist(self) -> None:
+        result = self.build()
+        app = pathlib.Path(result["app"])
+        for rel in ("Contents/Info.plist", "Contents/MacOS/CTFLab",
+                    "Contents/Resources/ctflab/tools/ctflab.py",
+                    "Contents/Resources/MANIFEST.json", "Contents/Resources/SBOM.json",
+                    "Contents/Resources/THIRD_PARTY_LICENSES.md",
+                    "Contents/Resources/licenses",
+                    "Contents/Resources/runtime/bin", "Contents/Resources/runtime/lib",
+                    "Contents/Resources/runtime/share/qemu"):
+            self.assertTrue((app / rel).exists(), f"缺少 {rel}")
+        info = plistlib.loads((app / "Contents/Info.plist").read_bytes())
+        self.assertEqual(info["CFBundleExecutable"], "CTFLab")
+        self.assertEqual(info["CFBundleIdentifier"], ctflab_app.BUNDLE_IDENTIFIER)
+        self.assertEqual(info["CFBundleShortVersionString"], "0.1.0")
+
+    def test_launcher_has_no_developer_paths(self) -> None:
+        result = self.build()
+        launcher = (pathlib.Path(result["app"]) / ctflab_app.LAUNCHER_REL).read_text(encoding="utf-8")
+        self.assertIn("CTFLAB_RUNTIME_ROOT", launcher)
+        self.assertIn("command -v python3", launcher)
+        for needle in ("/opt/homebrew", "/usr/local", "/Users/", "conda"):
+            self.assertNotIn(needle, launcher)
+
+    def test_runtime_binaries_present_and_executable(self) -> None:
+        result = self.build()
+        app = pathlib.Path(result["app"])
+        for name in ctflab_app.QEMU_BINARIES:
+            binary = app / ctflab_app.RUNTIME_REL / "bin" / name
+            self.assertTrue(binary.is_file(), name)
+            self.assertTrue(os.access(binary, os.X_OK), name)
+        share = app / ctflab_app.RUNTIME_REL / "share" / "qemu"
+        for name in FAKE_SHARE_FILES:
+            self.assertTrue((share / name).is_file(), name)
+        self.assertTrue((share / "keymaps").is_dir())
+
+    def test_optional_qemu_share_file_is_copied_when_present(self) -> None:
+        destination = pathlib.Path(self.temp.name) / "share-copy"
+        destination.mkdir()
+        with mock.patch.object(ctflab_app, "QEMU_SHARE_FILES", ("firmware-a.fd",)), \
+             mock.patch.object(ctflab_app, "QEMU_OPTIONAL_SHARE_FILES", ("sgabios.bin",)), \
+             mock.patch.object(ctflab_app, "QEMU_SHARE_DIRS", ()):
+            copied = ctflab_app.copy_qemu_share(self.fake_runtime, destination)
+        self.assertEqual(copied, ["firmware-a.fd", "sgabios.bin"])
+        self.assertTrue((destination / "sgabios.bin").is_file())
+
+
+class RuntimeClosureTests(AppTestCase):
+    def test_dylib_closure_copied_inside_app(self) -> None:
+        result = self.build()
+        app = pathlib.Path(result["app"])
+        lib_dir = app / ctflab_app.RUNTIME_REL / "lib"
+        names = {path.name for path in lib_dir.iterdir()}
+        self.assertIn("libstub.dylib", names)
+        self.assertIn("liblayer2.dylib", names, "传递依赖（第二级）也必须随包")
+        self.assertEqual(result["manifest"]["runtime"]["dylibs"], sorted(names))
+
+    def test_otool_references_have_no_absolute_developer_paths(self) -> None:
+        result = self.build()
+        app = pathlib.Path(result["app"])
+        runtime = app / ctflab_app.RUNTIME_REL
+        for path in [*(runtime / "bin").iterdir(), *(runtime / "lib").iterdir()]:
+            listing = subprocess.run(["otool", "-l", str(path)], capture_output=True, text=True).stdout
+            for needle in ("/opt/homebrew", "/usr/local", "/Users/", "conda"):
+                self.assertNotIn(needle, listing, f"{path.name} 含 {needle}")
+            for dep in ctflab_app.otool_deps(path):
+                if ctflab_app.is_system_library(dep):
+                    continue
+                self.assertTrue(dep.startswith("@loader_path/"),
+                                f"{path.name} 的非系统依赖未相对化：{dep}")
+                target = (path.parent / dep[len("@loader_path/"):]).resolve()
+                self.assertTrue(target.is_file(), f"{path.name} 依赖缺失：{dep}")
+
+    def test_unresolvable_dependency_stops_build(self) -> None:
+        """依赖指向不存在的位置时必须失败，不允许猜测或跳过。"""
+        broken = FakeRuntime(pathlib.Path(self.temp.name) / "brokenqemu").build().root
+        (broken / "lib" / "libstub.dylib").unlink()
+        with self.assertRaises(ctflab_app.AppBuildError) as raised:
+            self.build(qemu_root=broken)
+        self.assertIn("依赖不存在", str(raised.exception))
+
+    def test_verify_rejects_forbidden_rpath(self) -> None:
+        result = self.build()
+        app = pathlib.Path(result["app"])
+        binary = app / ctflab_app.RUNTIME_REL / "bin" / "qemu-img"
+        subprocess.run(
+            ["install_name_tool", "-add_rpath", "/opt/homebrew/forbidden", str(binary)],
+            check=True, capture_output=True, text=True,
+        )
+        with self.assertRaises(ctflab_app.AppBuildError) as raised:
+            ctflab_app.verify_app(app, check_signature=False)
+        self.assertIn("rpath", str(raised.exception).lower())
+
+
+class ManifestAndSbomTests(AppTestCase):
+    def test_manifest_hashes_cover_app_and_verify_detects_tamper(self) -> None:
+        result = self.build()
+        app = pathlib.Path(result["app"])
+        report = ctflab_app.verify_app(app, check_signature=False)
+        self.assertEqual(report["file_count"], len(result["manifest"]["files"]))
+        target = app / ctflab_app.RUNTIME_REL / "share" / "qemu" / FAKE_SHARE_FILES[0]
+        target.write_bytes(b"tampered\n")
+        with self.assertRaises(ctflab_app.AppBuildError) as raised:
+            ctflab_app.verify_app(app, check_signature=False)
+        self.assertIn("哈希不符", str(raised.exception))
+
+    def test_unlisted_extra_file_is_rejected(self) -> None:
+        result = self.build()
+        app = pathlib.Path(result["app"])
+        (app / "Contents" / "Resources" / "extra.bin").write_bytes(b"x")
+        with self.assertRaises(ctflab_app.AppBuildError) as raised:
+            ctflab_app.verify_app(app, check_signature=False)
+        self.assertIn("未登记文件", str(raised.exception))
+
+    def test_sbom_bundled_entries_match_files(self) -> None:
+        result = self.build()
+        app = pathlib.Path(result["app"])
+        sbom = json.loads((app / ctflab_app.SBOM_REL).read_text(encoding="utf-8"))
+        bundled_files = []
+        for component in sbom["components"]:
+            if not component.get("bundled"):
+                continue
+            if component.get("file"):
+                bundled_files.append(component["file"])
+            for binary in component.get("binaries", []):
+                bundled_files.append(binary["file"])
+        self.assertTrue(bundled_files)
+        for rel in bundled_files:
+            self.assertTrue((app / rel).is_file(), rel)
+        qemu = next(c for c in sbom["components"] if c["name"] == "QEMU")
+        self.assertTrue(qemu["distribution_obligations"], "QEMU 分发义务必须单独列出")
+        self.assertTrue(all(b["bundled"] is True for b in qemu["binaries"]))
+        non_qemu = [c for c in sbom["components"] if c.get("file")]
+        self.assertTrue(all(c["bundled"] is True for c in non_qemu),
+                        "随包动态库必须标为 bundled=true")
+        serialized = json.dumps(sbom, ensure_ascii=False)
+        for needle in ("/opt/homebrew", "/usr/local/", "/Users/", "conda"):
+            self.assertNotIn(needle, serialized, "SBOM 不得泄露构建机绝对路径")
+
+    def test_missing_bundled_file_fails_verification(self) -> None:
+        result = self.build()
+        app = pathlib.Path(result["app"])
+        (app / ctflab_app.RUNTIME_REL / "lib" / "libstub.dylib").unlink()
+        with self.assertRaises(ctflab_app.AppBuildError):
+            ctflab_app.verify_app(app, check_signature=False)
+
+    def test_sidecar_is_required_and_verified(self) -> None:
+        result = self.build()
+        app = pathlib.Path(result["app"])
+        sidecar = pathlib.Path(result["sidecar"])
+        sidecar.unlink()
+        with self.assertRaises(ctflab_app.AppBuildError) as raised:
+            ctflab_app.verify_app(app, check_signature=False)
+        self.assertIn("旁车", str(raised.exception))
+        sidecar.write_text("0" * 64 + "  CTFLab.app\n", encoding="utf-8")
+        with self.assertRaises(ctflab_app.AppBuildError) as raised:
+            ctflab_app.verify_app(app, check_signature=False)
+        self.assertIn("旁车校验不一致", str(raised.exception))
+
+    def test_malformed_manifest_is_reported_as_app_error(self) -> None:
+        result = self.build()
+        app = pathlib.Path(result["app"])
+        (app / ctflab_app.MANIFEST_REL).write_text("{broken", encoding="utf-8")
+        with self.assertRaises(ctflab_app.AppBuildError) as raised:
+            ctflab_app.verify_app(app, check_signature=False)
+        self.assertIn("元数据无法解析", str(raised.exception))
+
+    def test_malformed_sbom_shape_is_reported_as_app_error(self) -> None:
+        result = self.build()
+        app = pathlib.Path(result["app"])
+        sbom_path = app / ctflab_app.SBOM_REL
+        sbom = json.loads(sbom_path.read_text(encoding="utf-8"))
+        sbom["components"] = ["not-an-object"]
+        sbom_path.write_text(json.dumps(sbom), encoding="utf-8")
+        # 同步 MANIFEST 中 SBOM 哈希，让测试抵达结构校验而不是先被普通篡改检查拦截。
+        manifest_path = app / ctflab_app.MANIFEST_REL
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        for entry in manifest["files"]:
+            if entry["path"] == ctflab_app.SBOM_REL:
+                entry["sha256"] = ctflab_app.sha256_file(sbom_path)
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        with self.assertRaises(ctflab_app.AppBuildError) as raised:
+            ctflab_app.verify_app(app, check_signature=False)
+        self.assertIn("SBOM.components", str(raised.exception))
+
+    def test_symlink_app_is_rejected(self) -> None:
+        result = self.build()
+        app = pathlib.Path(result["app"])
+        alias = self.out / "Alias.app"
+        alias.symlink_to(app, target_is_directory=True)
+        with self.assertRaises(ctflab_app.AppBuildError) as raised:
+            ctflab_app.verify_app(alias, check_signature=False)
+        self.assertIn("普通 .app", str(raised.exception))
+
+
+class ForbiddenContentTests(AppTestCase):
+    def test_disks_credentials_logs_never_enter_app(self) -> None:
+        decoy_source = make_source_root(pathlib.Path(self.temp.name) / "decoy-src", with_decoys=True)
+        result = self.build(source_root=decoy_source, allow_incomplete_license_texts=True)
+        app = pathlib.Path(result["app"])
+        names = [path.name for path in app.rglob("*")]
+        for banned in ("evil.qcow2", "guest-credentials.txt", "capture.pcap", "run.log"):
+            self.assertNotIn(banned, names, f"app 内出现禁止文件：{banned}")
+        self.assertEqual([p for p in app.rglob("*.qcow2")], [])
+        self.assertEqual([p for p in app.rglob("*.pcap")], [])
+        self.assertEqual([p for p in app.rglob("credentials*.txt")], [])
+
+    def test_state_directory_stays_outside_app(self) -> None:
+        result = self.build()
+        app = pathlib.Path(result["app"]).resolve()
+        default_state = ctflab.DEFAULT_STATE_DIR.expanduser()
+        self.assertFalse(str(default_state).startswith(str(app)),
+                         "默认状态目录必须在 app 之外")
+        launcher = (app / ctflab_app.LAUNCHER_REL).read_text(encoding="utf-8")
+        self.assertNotIn("--state-dir", launcher)
+
+
+class PublishTests(AppTestCase):
+    def test_existing_target_is_refused(self) -> None:
+        self.build()
+        with self.assertRaises(ctflab_app.AppBuildError) as raised:
+            self.build()
+        self.assertIn("拒绝覆盖", str(raised.exception))
+
+    def test_failed_build_leaves_no_partial_output(self) -> None:
+        incomplete = pathlib.Path(self.temp.name) / "incompleteqemu"
+        shutil.copytree(self.fake_runtime, incomplete)
+        (incomplete / "share" / "qemu" / FAKE_SHARE_FILES[0]).unlink()
+        with self.assertRaises(ctflab_app.AppBuildError):
+            self.build(qemu_root=incomplete)
+        self.assertFalse((self.out / "CTFLab.app").exists(), "失败后不得留下最终 app")
+        leftovers = [p for p in self.out.iterdir() if p.name.startswith(".CTFLab.app.")]
+        self.assertEqual(leftovers, [], "失败后必须清理临时目录")
+
+    def test_tree_hash_is_stable_and_sensitive(self) -> None:
+        result = self.build()
+        app = pathlib.Path(result["app"])
+        first = ctflab_app.app_tree_hash(app)
+        self.assertEqual(first, ctflab_app.app_tree_hash(app))
+        self.assertEqual(first, result["tree_sha256"])
+        sidecar = pathlib.Path(result["sidecar"]).read_text(encoding="utf-8")
+        self.assertIn(first, sidecar)
+        target = app / ctflab_app.RUNTIME_REL / "bin" / "qemu-img"
+        target.write_bytes(target.read_bytes() + b"\0")
+        self.assertNotEqual(first, ctflab_app.app_tree_hash(app))
+
+    def test_concurrent_app_target_is_preserved(self) -> None:
+        original = ctflab_app._exclusive_publish_directory
+
+        def race(source, destination):
+            destination.mkdir()
+            (destination / "external.txt").write_text("keep", encoding="utf-8")
+            return original(source, destination)
+
+        with mock.patch.object(ctflab_app, "_exclusive_publish_directory", side_effect=race):
+            with self.assertRaises(ctflab_app.AppBuildError):
+                self.build()
+        self.assertEqual((self.out / "CTFLab.app" / "external.txt").read_text(), "keep")
+        self.assertFalse((self.out / "CTFLab.app.sha256").exists())
+
+    def test_concurrent_sidecar_rolls_back_only_published_app(self) -> None:
+        def race(_source, destination):
+            destination.write_text("external\n", encoding="utf-8")
+            raise ctflab_app.AppBuildError("旁车并发创建")
+
+        with mock.patch.object(ctflab_app, "_exclusive_publish_file", side_effect=race):
+            with self.assertRaises(ctflab_app.AppBuildError):
+                self.build()
+        self.assertFalse((self.out / "CTFLab.app").exists())
+        self.assertEqual((self.out / "CTFLab.app.sha256").read_text(), "external\n")
+
+    def test_requested_version_must_match_runtime_version(self) -> None:
+        with self.assertRaises(ctflab_app.AppBuildError) as raised:
+            self.build(version="9.9.9")
+        self.assertIn("必须与 CTFLAB_VERSION 一致", str(raised.exception))
+
+
+class SigningTests(AppTestCase):
+    def test_adhoc_signing_reports_adhoc_level(self) -> None:
+        result = self.build(unsigned=False)
+        self.assertEqual(result["signature"]["level"], "ad-hoc")
+        report = ctflab_app.verify_app(pathlib.Path(result["app"]))
+        self.assertEqual(report["signature"]["level"], "ad-hoc")
+        self.assertFalse(report["signature"]["notarized"])
+        self.assertIn("未验证", report["signature"]["notarization_status"])
+
+    def test_unsigned_build_reports_unsigned(self) -> None:
+        result = self.build(unsigned=True)
+        self.assertEqual(result["signature"]["level"], "unsigned")
+        report = ctflab_app.verify_app(pathlib.Path(result["app"]))
+        self.assertEqual(report["signature"]["level"], "unsigned")
+
+    def test_unknown_sign_identity_is_refused(self) -> None:
+        with self.assertRaises(ctflab_app.AppBuildError) as raised:
+            self.build(unsigned=False, sign_identity="Developer ID Application: Nobody (0000000000)")
+        self.assertIn("未找到签名身份", str(raised.exception))
+
+
+class RuntimeSelectionTests(unittest.TestCase):
+    """运行时的选择规则：CTFLAB_RUNTIME_ROOT 与 .app 布局优先，PATH 仅作开发回退。"""
+
+    def test_app_layout_derives_runtime_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            app = pathlib.Path(temp) / "CTFLab.app"
+            (app / "Contents" / "Resources" / "runtime" / "bin").mkdir(parents=True)
+            (app / "Contents" / "Resources" / "runtime" / "bin" / "qemu-img").write_text("x")
+            os.chmod(app / "Contents" / "Resources" / "runtime" / "bin" / "qemu-img", 0o755)
+            # 把真实模块复制进 .app 布局，才能验证 PROJECT_ROOT 推导出的 runtime 路径。
+            fake_tools = app / "Contents" / "Resources" / "ctflab" / "tools"
+            fake_tools.mkdir(parents=True)
+            for name in ("ctflab.py", "ctflab_inspect.py", "ctflab_network.py",
+                         "ctflab_utm.py", "ctflab_utm_fixture.json"):
+                shutil.copy2(TOOLS_DIR / name, fake_tools / name)
+            shutil.copytree(TOOLS_DIR / "ctflab_profiles", fake_tools / "ctflab_profiles")
+            fake_module = fake_tools / "ctflab.py"
+            code = (
+                "import sys, pathlib;"
+                f"sys.path.insert(0, {str(fake_module.parent)!r});"
+                "import ctflab;"
+                "print(ctflab.runtime_root());"
+                "print(ctflab.resolve_tool('qemu-img'))"
+            )
+            result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
+                                    env={**os.environ, "CTFLAB_RUNTIME_ROOT": ""})
+            lines = result.stdout.strip().splitlines()
+            expected_runtime = (app / "Contents" / "Resources" / "runtime").resolve()
+            self.assertEqual(lines[0], str(expected_runtime))
+            self.assertEqual(lines[1], str(expected_runtime / "bin" / "qemu-img"))
+
+    def test_env_override_takes_precedence(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp) / "runtime"
+            (root / "bin").mkdir(parents=True)
+            (root / "bin" / "qemu-img").write_text("x")
+            os.chmod(root / "bin" / "qemu-img", 0o755)
+            result = subprocess.run(
+                [sys.executable, "-c",
+                 "import sys; sys.path.insert(0, %r); import ctflab; print(ctflab.runtime_root());"
+                 "print(ctflab.resolve_tool('qemu-img'))" % str(TOOLS_DIR)],
+                capture_output=True, text=True,
+                env={**os.environ, "CTFLAB_RUNTIME_ROOT": str(root)})
+            lines = result.stdout.strip().splitlines()
+            self.assertEqual(lines[0], str(root))
+            self.assertEqual(lines[1], str(root / "bin" / "qemu-img"))
+
+    def test_no_runtime_falls_back_to_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            bin_dir = pathlib.Path(temp) / "bin"
+            bin_dir.mkdir()
+            (bin_dir / "qemu-img").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            os.chmod(bin_dir / "qemu-img", 0o755)
+            result = subprocess.run(
+                [sys.executable, "-c",
+                 "import sys; sys.path.insert(0, %r); import ctflab; print(ctflab.runtime_root());"
+                 "print(ctflab.resolve_tool('qemu-img'))" % str(TOOLS_DIR)],
+                capture_output=True, text=True,
+                env={**os.environ, "CTFLAB_RUNTIME_ROOT": "", "PATH": f"{bin_dir}:/usr/bin:/bin"})
+            lines = result.stdout.strip().splitlines()
+            self.assertEqual(lines[0], "None")
+            self.assertEqual(lines[1], str(bin_dir / "qemu-img"))
+
+    def test_active_runtime_missing_tool_does_not_fall_back_to_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            base = pathlib.Path(temp)
+            runtime = base / "runtime"
+            host_bin = base / "host-bin"
+            (runtime / "bin").mkdir(parents=True)
+            host_bin.mkdir()
+            host_tool = host_bin / "qemu-img"
+            host_tool.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            host_tool.chmod(0o755)
+            result = subprocess.run(
+                [sys.executable, "-c",
+                 "import sys; sys.path.insert(0, %r); import ctflab; "
+                 "print(ctflab.resolve_tool('qemu-img'))" % str(TOOLS_DIR)],
+                capture_output=True, text=True,
+                env={**os.environ, "CTFLAB_RUNTIME_ROOT": str(runtime),
+                     "PATH": f"{host_bin}:/usr/bin:/bin"},
+            )
+            self.assertEqual(result.stdout.strip(), "None")
+
+
+class CliSurfaceTests(unittest.TestCase):
+    def test_app_subcommands_exist_and_baseline_commands_remain(self) -> None:
+        parser = ctflab.build_parser()
+        subcommands: dict[str, object] = {}
+        for action in parser._subparsers._group_actions:
+            subcommands.update(action.choices)
+        for name in ("doctor", "import", "run", "stop", "reset", "package", "content", "app"):
+            self.assertIn(name, subcommands)
+        app_choices = {}
+        for action in subcommands["app"]._subparsers._group_actions:  # type: ignore[attr-defined]
+            app_choices.update(action.choices)
+        self.assertEqual(set(app_choices), {"build", "verify"})
+
+    def test_source_release_contains_app_module_used_by_cli(self) -> None:
+        self.assertIn("tools/ctflab_app.py", ctflab_package.RELEASE_TOOL_FILES)
+        with tempfile.TemporaryDirectory() as temp:
+            result = ctflab_package.build_release_bundle(
+                pathlib.Path(temp), source_root=PROJECT_ROOT,
+                generated_at="2026-09-15T00:00:00Z",
+            )
+            paths = {entry["path"] for entry in result["manifest"]["files"]}
+            self.assertIn("tools/ctflab_app.py", paths)
+            ctflab_package.verify_release_bundle(pathlib.Path(result["bundle"]))
+
+
+if __name__ == "__main__":
+    unittest.main()

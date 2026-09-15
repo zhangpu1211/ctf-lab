@@ -447,9 +447,19 @@ def build_plist_config(fixture: dict[str, Any], variant: str, profile: dict[str,
     return structure
 
 
+def _qemu_img_tool() -> str | None:
+    """qemu-img 解析：受控运行时（.app）优先，其次 PATH（开发环境回退）。"""
+    try:
+        import ctflab  # noqa: PLC0415  函数内导入，避免循环依赖
+    except ImportError:
+        return shutil.which("qemu-img")
+    # 受控运行时激活但缺少 qemu-img 时必须失败，不能被宿主 PATH 静默补齐。
+    return ctflab.resolve_tool("qemu-img")
+
+
 def qemu_img_convert(source: Path, destination: Path) -> None:
-    qemu_img = shutil.which("qemu-img")
-    _expect(qemu_img, "未找到 qemu-img，请先安装 QEMU（brew install qemu）。")
+    qemu_img = _qemu_img_tool()
+    _expect(qemu_img, "未找到 qemu-img：请安装 QEMU 或使用自带运行时的 CTFLab.app。")
     result = subprocess.run(
         [qemu_img, "convert", "-f", "qcow2", "-O", "qcow2", str(source), str(destination)],
         capture_output=True,
@@ -462,8 +472,8 @@ def qemu_img_convert(source: Path, destination: Path) -> None:
 
 def qemu_img_convert_nvram(source: Path, destination: Path) -> None:
     """把 CTFLab 的 RAW UEFI NVRAM 转换为 UTM 使用的 QCOW2 变量盘。"""
-    qemu_img = shutil.which("qemu-img")
-    _expect(qemu_img, "未找到 qemu-img，请先安装 QEMU（brew install qemu）。")
+    qemu_img = _qemu_img_tool()
+    _expect(qemu_img, "未找到 qemu-img：请安装 QEMU 或使用自带运行时的 CTFLab.app。")
     result = subprocess.run(
         [qemu_img, "convert", "-f", "raw", "-O", "qcow2", str(source), str(destination)],
         capture_output=True,
@@ -475,8 +485,8 @@ def qemu_img_convert_nvram(source: Path, destination: Path) -> None:
 
 
 def qemu_img_info(path: Path) -> dict[str, Any]:
-    qemu_img = shutil.which("qemu-img")
-    _expect(qemu_img, "未找到 qemu-img，请先安装 QEMU（brew install qemu）。")
+    qemu_img = _qemu_img_tool()
+    _expect(qemu_img, "未找到 qemu-img：请安装 QEMU 或使用自带运行时的 CTFLab.app。")
     result = subprocess.run([qemu_img, "info", "--output=json", str(path)], capture_output=True, text=True)
     if result.returncode != 0:
         raise UTMExportError(f"qemu-img info 失败：{(result.stderr or result.stdout).strip() or result.returncode}")
@@ -487,8 +497,8 @@ def qemu_img_info(path: Path) -> dict[str, Any]:
 
 
 def qemu_img_check(path: Path) -> None:
-    qemu_img = shutil.which("qemu-img")
-    _expect(qemu_img, "未找到 qemu-img，请先安装 QEMU（brew install qemu）。")
+    qemu_img = _qemu_img_tool()
+    _expect(qemu_img, "未找到 qemu-img：请安装 QEMU 或使用自带运行时的 CTFLab.app。")
     result = subprocess.run([qemu_img, "check", str(path)], capture_output=True, text=True)
     if result.returncode != 0:
         detail = (result.stdout or result.stderr or "").strip()

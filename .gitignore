@@ -17,6 +17,8 @@
 !/docs/verification-utm-basic-pentesting-2-2026-09-14.md
 !/docs/ctflab-task6-packaging-design.md
 !/docs/verification-task6-1-2026-09-15.md
+!/docs/ctflab-task6-app-runtime-design.md
+!/docs/verification-task6-2-2026-09-15.md
 
 /tools/*
 !/tools/ctflab
@@ -26,6 +28,8 @@
 !/tools/ctflab_utm.py
 !/tools/ctflab_package.py
 !/tools/ctflab_acceptance.py
+!/tools/ctflab_app.py
+!/tools/ctflab_app_e2e.py
 !/tools/ctflab_utm_fixture.json
 !/tools/ctflab_profiles/
 !/tools/guest_fixes/

@@ -37,10 +37,22 @@ def sha256_file(path: Path, chunk_size: int = 8 * 1024 * 1024) -> str:
     return digest.hexdigest()
 
 
+def _qemu_img() -> str | None:
+    """qemu-img 解析：受控运行时（.app）优先，其次 PATH（开发环境回退）。"""
+    try:
+        import ctflab  # noqa: PLC0415  函数内导入，避免与主 CLI 循环依赖
+    except ImportError:  # 独立复制该模块使用时，才允许退回 PATH。
+        return shutil.which("qemu-img")
+    # `ctflab.resolve_tool` 会区分“受控运行时缺件”与“开发环境 PATH 回退”；
+    # 这里不能在返回 None 后再次查 PATH，否则会破坏 app 的受控运行时边界。
+    return ctflab.resolve_tool("qemu-img")
+
+
 def qemu_info(path: Path) -> dict[str, Any]:
-    qemu_img = shutil.which("qemu-img")
+    qemu_img = _qemu_img()
     if not qemu_img:
-        raise InspectionError("未找到 qemu-img，请先安装 QEMU（brew install qemu）。")
+        raise InspectionError(
+            "未找到 qemu-img：请安装 QEMU 或使用自带运行时的 CTFLab.app。")
     process = subprocess.run(
         [qemu_img, "info", "--output=json", str(path)],
         check=False,
@@ -203,7 +215,7 @@ def read_descriptor_hints(path: Path) -> dict[str, str]:
 
 
 def read_partition_hints(path: Path) -> dict[str, Any]:
-    qemu_img = shutil.which("qemu-img")
+    qemu_img = _qemu_img()
     if not qemu_img:
         return {"scheme": "unknown", "warning": "未找到 qemu-img"}
     with tempfile.NamedTemporaryFile(prefix="ctflab-header-", suffix=".raw") as output:

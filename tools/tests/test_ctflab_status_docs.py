@@ -220,11 +220,12 @@ class VerificationRecordTests(unittest.TestCase):
         # 不钉死细分数字（测试集会增长），但必须带复核日期与当前总数，陈旧计数不得残留
         self.assertIn("本次完整回归", self.text)
         self.assertIn("2026-09-15 复核", self.text)
-        self.assertIn("245 项通过", self.text)
-        self.assertIn("51 项验收状态与设计边界守卫测试", self.text)
+        self.assertIn("280 项通过", self.text)
+        self.assertIn("53 项验收状态与设计边界守卫测试", self.text)
         self.assertIn("82 项路径 A `utm-export` 单元测试", self.text)
         self.assertIn("37 项 Task 6.1 打包测试", self.text)
-        for stale in ("66 项通过", "当前完整回归", "174 项通过", "161 项通过", "202 项", "205 项", "235 项", "242 项", "243 项", "244 项", "48 项", "95 项"):
+        self.assertIn("33 项 Task 6.2 app 受控运行时测试", self.text)
+        for stale in ("66 项通过", "当前完整回归", "174 项通过", "161 项通过", "202 项", "205 项", "235 项", "245 项", "279 项", "278 项", "269 项", "267 项", "242 项", "243 项", "244 项", "48 项", "95 项"):
             self.assertNotIn(stale, self.text)
 
     def test_matrix_wording_avoids_adapted_claim(self) -> None:
@@ -632,6 +633,31 @@ class Task61PackagingDocsTests(unittest.TestCase):
         flat = normalized(self.text)
         self.assertIn("不改变默认 QEMU 命令", flat)
         self.assertIn("run/stop/reset", flat)
+
+
+class Task62AppRuntimeDocsTests(unittest.TestCase):
+    """Task 6.2 设计/验证文档：范围与限制必须写清，不得宣称未交付能力。"""
+
+    APP_DESIGN = PROJECT_ROOT / "docs" / "ctflab-task6-app-runtime-design.md"
+    APP_RECORD = PROJECT_ROOT / "docs" / "verification-task6-2-2026-09-15.md"
+
+    def test_design_and_record_state_limits(self) -> None:
+        for path in (self.APP_DESIGN, self.APP_RECORD):
+            flat = normalized(path.read_text(encoding="utf-8"))
+            self.assertIn("未验证", flat, path.name)
+            self.assertIn("undeclared", flat, path.name)
+            self.assertIn("dtc", flat, path.name)
+            self.assertIn("禁止公开发布", flat, path.name)
+
+    def test_no_fake_signing_or_notarization_claims(self) -> None:
+        for path in (self.APP_DESIGN, self.APP_RECORD):
+            for sentence in sentences(path.read_text(encoding="utf-8")):
+                if "公证" in sentence and "未" not in sentence and "不得" not in sentence:
+                    self.fail(f"{path.name} 疑似声称已公证：{sentence[:90]}")
+        flat = normalized(self.APP_RECORD.read_text(encoding="utf-8"))
+        self.assertIn("ad-hoc", flat)
+        self.assertNotIn("Developer ID 签名通过", flat)
+        self.assertNotIn("公证通过", flat)
 
 
 if __name__ == "__main__":

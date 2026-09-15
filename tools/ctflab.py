@@ -76,9 +76,43 @@ def run_command(command: list[str], *, capture: bool = True) -> subprocess.Compl
         raise CTFLabError(f"命令执行失败：{' '.join(command)}\n{detail}") from exc
 
 
+def runtime_root() -> Path | None:
+    """受控 QEMU 运行时根目录。
+
+    优先 `CTFLAB_RUNTIME_ROOT`（.app 启动器导出），其次识别 `.app` 布局
+    （`Contents/Resources/ctflab/tools/ctflab.py` → `Contents/Resources/runtime`）。
+    两者都不存在时返回 None（开发环境按 PATH 解析；代码里不写死任何安装路径）。
+    """
+    env = os.environ.get("CTFLAB_RUNTIME_ROOT")
+    if env:
+        candidate = Path(env).expanduser()
+        if (candidate / "bin").is_dir():
+            return candidate
+    # .app 布局：Contents/Resources/ctflab/tools/ctflab.py → Contents/Resources/runtime
+    for ancestor in Path(__file__).resolve().parents:
+        if ancestor.name == "Resources" and (ancestor / "runtime" / "bin").is_dir():
+            return ancestor / "runtime"
+    return None
+
+
+def resolve_tool(name: str) -> str | None:
+    """工具解析顺序：受控运行时，或未激活受控运行时时使用 PATH。
+
+    受控运行时一旦激活就不回退到宿主 PATH。这样 app 缺件会明确失败，不会被开发机
+    恰好安装的 Homebrew QEMU 掩盖，也不会把“使用 bundled runtime”误报为成功。
+    """
+    root = runtime_root()
+    if root is not None:
+        candidate = root / "bin" / name
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+        return None
+    return shutil.which(name)
+
+
 def which_any(names: Iterable[str]) -> str | None:
     for name in names:
-        path = shutil.which(name)
+        path = resolve_tool(name)
         if path:
             return path
     return None
@@ -112,9 +146,10 @@ def write_json(path: Path, value: Any) -> None:
 
 
 def qemu_img_path() -> str:
-    path = shutil.which("qemu-img")
+    path = resolve_tool("qemu-img")
     if not path:
-        raise CTFLabError("未找到 qemu-img，请先安装 QEMU（brew install qemu）。")
+        raise CTFLabError(
+            "未找到 qemu-img：请安装 QEMU（brew install qemu），或使用自带运行时的 CTFLab.app。")
     return path
 
 
@@ -401,6 +436,11 @@ def bool_pid_alive(pid: int | None) -> bool:
 
 
 def find_firmware(name: str) -> Path | None:
+    """固件查找：受控运行时优先；运行时激活时**不回退**宿主路径，避免掩盖缺件。"""
+    root = runtime_root()
+    if root is not None:
+        candidate = root / "share" / "qemu" / name
+        return candidate if candidate.exists() else None
     candidates = [
         Path("/opt/homebrew/share/qemu") / name,
         Path("/usr/local/share/qemu") / name,
@@ -2084,9 +2124,12 @@ def cmd_doctor(manager: LabManager, _args: argparse.Namespace) -> int:
             "需要 macOS Apple Silicon（Darwin arm64）",
         ),
         ("python", sys.executable, True, "需要 Python 3.10+；推荐使用自带 PyYAML 的解释器"),
-        ("qemu-img", shutil.which("qemu-img"), True, "请安装 QEMU：brew install qemu"),
-        ("qemu-system-x86_64", which_any(QEMU_X86_NAMES), True, "请安装 QEMU：brew install qemu"),
-        ("qemu-system-aarch64", which_any(QEMU_ARM_NAMES), True, "请安装 QEMU：brew install qemu"),
+        ("qemu-img", resolve_tool("qemu-img"), True,
+         "请安装 QEMU：brew install qemu，或使用自带运行时的 CTFLab.app"),
+        ("qemu-system-x86_64", which_any(QEMU_X86_NAMES), True,
+         "请安装 QEMU：brew install qemu，或使用自带运行时的 CTFLab.app"),
+        ("qemu-system-aarch64", which_any(QEMU_ARM_NAMES), True,
+         "请安装 QEMU：brew install qemu，或使用自带运行时的 CTFLab.app"),
         (
             "utmctl",
             shutil.which("utmctl"),
@@ -2099,8 +2142,8 @@ def cmd_doctor(manager: LabManager, _args: argparse.Namespace) -> int:
             True,
             "缺少 PyYAML 时无法读写配置：python3 -m pip install pyyaml，或改用自带 PyYAML 的 Python",
         ),
-        ("ARM64 UEFI", str(find_firmware("edk2-aarch64-code.fd")) if find_firmware("edk2-aarch64-code.fd") else None, True, "Homebrew QEMU 应自带 edk2-aarch64-code.fd"),
-        ("ARM64 UEFI NVRAM", str(find_firmware("edk2-arm-vars.fd")) if find_firmware("edk2-arm-vars.fd") else None, True, "Homebrew QEMU 应自带 edk2-arm-vars.fd"),
+        ("ARM64 UEFI", str(find_firmware("edk2-aarch64-code.fd")) if find_firmware("edk2-aarch64-code.fd") else None, True, "运行时应自带 edk2-aarch64-code.fd（QEMU 或 CTFLab.app）"),
+        ("ARM64 UEFI NVRAM", str(find_firmware("edk2-arm-vars.fd")) if find_firmware("edk2-arm-vars.fd") else None, True, "运行时应自带 edk2-arm-vars.fd（QEMU 或 CTFLab.app）"),
         ("bsdtar", shutil.which("bsdtar") or shutil.which("tar"), True, "macOS 自带 bsdtar；缺失时请安装 libarchive"),
         ("cpio", shutil.which("cpio"), True, "macOS 自带 cpio；缺失时请安装"),
         (
@@ -2116,6 +2159,15 @@ def cmd_doctor(manager: LabManager, _args: argparse.Namespace) -> int:
         marker = "OK  " if ok else "MISS" if required else "OPT "
         print(f"{marker} {name}: {value if ok else hint}")
         failed |= required and not ok
+    root = runtime_root()
+    if root is not None:
+        print(f"运行时：bundled（{root}）")
+        for name in ("qemu-img", "qemu-system-x86_64", "qemu-system-aarch64"):
+            path = resolve_tool(name)
+            if path:
+                print(f"  {name}: {path}（bundled runtime）")
+    else:
+        print("运行时：PATH（未使用 app 内运行时；开发环境回退，等价于 brew 安装的 QEMU）")
     print(f"状态目录：{manager.state_dir}")
     return 1 if failed else 0
 
@@ -2316,6 +2368,52 @@ def cmd_content_unpack(_manager: LabManager, args: argparse.Namespace) -> int:
     print(f"已解包 {len(written)} 个文件到：{Path(args.out).expanduser()}")
     for path in written:
         print(f"  {path.name}")
+    return 0
+
+
+def cmd_app_build(_manager: LabManager, args: argparse.Namespace) -> int:
+    """Task 6.2：构建包含受控 QEMU 运行时的 CTFLab.app。"""
+    import ctflab_app  # noqa: PLC0415
+
+    try:
+        result = ctflab_app.build_app(
+            args.out,
+            version=args.version,
+            qemu_root=args.qemu_root,
+            sign_identity=args.sign_identity,
+            allow_incomplete_license_texts=args.allow_incomplete_license_texts,
+            unsigned=args.unsigned,
+        )
+    except ctflab_app.AppBuildError as exc:
+        raise CTFLabError(str(exc)) from exc
+    signature = result["signature"]
+    print(f"CTFLab.app 已生成：{result['app']}")
+    print(f"版本 {result['manifest']['version']}，{len(result['manifest']['files'])} 个登记文件；"
+          f"QEMU：{result['manifest']['runtime']['qemu_version']}")
+    print(f"动态库 {len(result['manifest']['runtime']['dylibs'])} 个，"
+          f"运行时资源 {len(result['manifest']['runtime']['share_files'])} 个")
+    print(f"签名级别：{signature['level']}；公证：{signature['notarization_status']}")
+    if result["missing_license_texts"]:
+        print("警告：以下组件在 Homebrew keg 中没有许可证文本：" + ", ".join(result["missing_license_texts"]))
+    for blocker in result["manifest"]["license"]["distribution_blockers"]:
+        print(f"分发阻塞（禁止公开发布）：{blocker}")
+    return 0
+
+
+def cmd_app_verify(_manager: LabManager, args: argparse.Namespace) -> int:
+    import ctflab_app  # noqa: PLC0415
+
+    try:
+        report = ctflab_app.verify_app(args.app)
+    except ctflab_app.AppBuildError as exc:
+        raise CTFLabError(str(exc)) from exc
+    print(f"app 校验通过：{report['app']}")
+    print(f"版本 {report['version']}，{report['file_count']} 个登记文件；"
+          f"QEMU：{report['runtime']['qemu_version']}")
+    print(f"签名级别：{report['signature']['level']}；公证：{report['signature']['notarization_status']}")
+    print(f"许可证文本完整性：{report['license_texts_complete']}")
+    for blocker in report["distribution_blockers"]:
+        print(f"分发阻塞（禁止公开发布）：{blocker}")
     return 0
 
 
@@ -2624,6 +2722,24 @@ def build_parser() -> argparse.ArgumentParser:
         "unpack", help="校验后解包到目标目录（逐文件复核哈希；不覆盖既有文件）")
     content_unpack.add_argument("package", type=Path)
     content_unpack.add_argument("--out", type=Path, required=True)
+
+    app_parser = subparsers.add_parser(
+        "app", help="构建/校验含受控 QEMU 运行时的 CTFLab.app（Task 6.2；本地构建，不做公证）")
+    app_sub = app_parser.add_subparsers(dest="app_command", required=True)
+    app_build = app_sub.add_parser("build", help="构建 CTFLab.app（排他发布；默认 ad-hoc 签名）")
+    app_build.add_argument("--out", type=Path, required=True, help="输出目录；目标已存在时一律拒绝覆盖")
+    app_build.add_argument("--version", help=f"覆盖版本号，默认 {CTFLAB_VERSION}")
+    app_build.add_argument("--qemu-root", type=Path,
+                           help="QEMU 安装根目录（含 bin/ 与 share/qemu/）；默认从 PATH 探测")
+    app_build.add_argument("--sign-identity",
+                           help="codesign 身份；缺省为 ad-hoc（-）。本机不存在的身份会直接失败")
+    app_build.add_argument("--unsigned", action="store_true",
+                           help="不签名（仅诊断用；Apple Silicon 上可能无法运行）")
+    app_build.add_argument("--allow-incomplete-license-texts", action="store_true",
+                           help="允许许可证文本缺失（本地测试用；会在 MANIFEST 记录分发阻塞）")
+    app_verify = app_sub.add_parser(
+        "verify", help="校验 CTFLab.app：结构、清单哈希、运行时引用与签名分级")
+    app_verify.add_argument("app", type=Path)
     return parser
 
 
@@ -2651,6 +2767,7 @@ def main(argv: list[str] | None = None) -> int:
     package_handlers = {"build": cmd_package_build, "verify": cmd_package_verify}
     content_handlers = {"pack": cmd_content_pack, "verify": cmd_content_verify,
                         "unpack": cmd_content_unpack}
+    app_handlers = {"build": cmd_app_build, "verify": cmd_app_verify}
     try:
         # 纯打包/校验命令不需要运行状态；避免仅执行 package/content 时在默认
         # 状态目录创建 locks/ 等运行时目录，保持该类操作的只读/构建边界。
@@ -2658,6 +2775,8 @@ def main(argv: list[str] | None = None) -> int:
             return package_handlers[args.package_command](None, args)  # type: ignore[arg-type]
         if args.command == "content":
             return content_handlers[args.content_command](None, args)  # type: ignore[arg-type]
+        if args.command == "app":
+            return app_handlers[args.app_command](None, args)  # type: ignore[arg-type]
         manager = LabManager(args.state_dir)
         if args.command == "stop" and not args.all and not args.profiles:
             parser.error("stop 需要提供配置名，或使用 --all")
