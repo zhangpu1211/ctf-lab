@@ -12,20 +12,19 @@
 - **已验证**：`CTFLab.app` 内置 Python 运行时与 PyYAML——最小 PATH + 独立 HOME 下首次 `doctor`
   即 0 退出（**无 venv、无 pip、无联网**）；`sandbox-exec` 拒绝 `/usr/bin/python3`、
   `/opt/homebrew`、`/opt/miniconda3`、`/usr/local`、`Python.framework` 后仍通过；
-  真实 smoke E2E 15/15 条记录通过；运行后 App 树哈希不变、无新增 `__pycache__`。
+  smoke E2E 15/15 与 Kali ARM64 + UEFI E2E 29/29 条记录通过；运行后 App 树哈希不变、
+  无新增 `__pycache__`。
 - **发现并修复 3 个缺陷**（详见 §3）：`_formula_version` 的 Cellar 层级判断错误（SBOM 来源
   字段自 6.2 起静默降级为 `?`）；旧启动器未禁用字节码写入（真实运行会在已签名 bundle 内写
   `__pycache__`，破坏清单与签名，旧 E2E 靠环境变量掩盖）；E2E 新增的字节码检查最初把发行版
   自带预编译缓存误报为"运行写入"（检查改为运行前后对比）。
 - **未验证/后续任务**：Developer ID 签名与公证（本轮不做，Gatekeeper 需接收者手动放行一次）；
-  面向学生的**基盘镜像分发渠道与校验**（内容包不含虚拟磁盘，尚未有交付方案）；
-  Kali ARM64 的 6.3B 回归（`tools/ctflab_app_kali_e2e.py` 已改造完成，需要来宾口令；
-  本轮只完成 smoke E2E）。
+  面向学生的**基盘镜像分发渠道与校验**（内容包不含虚拟磁盘，尚未有交付方案）。
 
 ## 1. 基线
 
 - 分支 `feature/license-and-bundled-python`（基线 `main@bb25fb2`，Task 6.3A 成果已先提交）；
-- 完整回归 **312 项通过**（新增 19 项：许可证合规、Python 运行时、Cellar 解析与 6.3B 文档守卫）；
+- 完整回归 **313 项通过**（新增 20 项：许可证合规、Python 运行时、Cellar 解析与 6.3B 文档守卫）；
 - 本轮提交：`fd1ddc1`（许可证与 GPL 义务）、`bbfa1fe`（内置 Python/PyYAML）、本记录所在提交。
 
 ## 2. 交付物与证据
@@ -80,6 +79,28 @@ python3 tools/ctflab.py app build --out <out> \
 | no-bytecode-writes | 运行后无新增 `__pycache__`（`-B` 生效；随包预编译缓存 1 处保持原样） |
 | codesign-verify | `codesign --verify --deep --strict` 返回 0；级别 ad-hoc；公证未执行 |
 
+### 2.4 Kali ARM64 + UEFI E2E（`tools/ctflab_app_kali_e2e.py`，29/29 通过）
+
+证据：`~/Downloads/ctflab-app-kali-e2e-20260915-r5/kali-e2e-evidence.json`（来宾口令只经
+标准输入传入，不进入证据与命令行）。
+
+| 步骤 | 结果 |
+|---|---|
+| verify-app / app-runtime-assets | 720 文件、旁车一致；四个 QEMU/固件资产的哈希与登记值一致 |
+| doctor-zero-setup | 最小 PATH 下**首次即 0 退出**：内置解释器 + PyYAML + App 内固件 |
+| host-python-denied | 拒绝宿主 Python 与开发路径后 `doctor` 仍通过 |
+| firmware-provenance | 拒绝 `/opt/homebrew` 后 App 内 `qemu-system-aarch64` + 固件仍可启动 |
+| asset-baseline / copies | 基盘 `ca1034606a82…`、RAW NVRAM `8639a3fb43dd…` 与登记值一致，副本哈希一致 |
+| import ×3 | kali-arm64（NVRAM 模板指向原始 RAW 副本）、smoke、basic-pentesting-2 |
+| run / uefi-boot | QEMU 来自 App 内运行时；截屏分类 `login_ready`（未进入 UEFI Shell） |
+| nvram-derivation | 派生 NVRAM 可写；App 模板与原始 RAW 未变 |
+| health ×3 + guest-lab-warmup | 三节点健康检查通过；隔离网可达 |
+| guest-connectivity | Kali 可达 smoke/basic（HTTP 200）、无默认路由、公网不可达（来宾内验证） |
+| guest-poweroff / stop-1 / reboot / reboot-boot / health-after-reboot / stop-2 / reset | 正常关机、重启后再次到登录界面并健康、停止与重置完成 |
+| residue-check / hash-invariants | 无残留；App 树、App 固件模板、原始基盘与原始 RAW NVRAM 哈希均未变化 |
+| no-bytecode-writes | 运行后无新增字节码缓存（`-B` 生效） |
+| qemu-img-check | App 内 `qemu-img check` 通过 |
+
 ## 3. 发现的缺陷与修复
 
 1. **`_formula_version` Cellar 层级错误**（`tools/ctflab_app.py`）：判断写为
@@ -102,8 +123,6 @@ python3 tools/ctflab.py app build --out <out> \
   该摩擦属于 6.3B 已知边界，不是许可证或运行时问题。
 - **基盘镜像分发**：内容包不含虚拟磁盘（沿用 6.1 边界），面向学生的镜像分发渠道与校验
   方式**未验证**，属后续任务。
-- **Kali E2E**：`tools/ctflab_app_kali_e2e.py` 已按 6.3B 改造（零手工依赖 + 宿主 Python
-  拒绝 + 无字节码写入），但本轮**未执行**（需要来宾口令）；不得据本记录宣称 Kali 侧同样通过。
 - **体积**：App 从 218MB（6.3A）增至 264MB，主要来自内置解释器与 stdlib；裁剪清单已记录，
   未做进一步压缩。
 - 内置 Python 来自 python-build-standalone 的官方构建（PSF-2.0，许可证文本随包），
@@ -126,7 +145,7 @@ python3 tools/ctflab.py app build --out <out> \
 ## 6. 复现命令
 
 ```bash
-python3 -m unittest discover -s tools/tests          # 312 项
+python3 -m unittest discover -s tools/tests          # 313 项
 
 python3 tools/ctflab.py app build --out <out> \
   --python-runtime <pbs install_only_stripped .tar.gz> --pyyaml <pyyaml .whl>
