@@ -220,12 +220,12 @@ class VerificationRecordTests(unittest.TestCase):
         # 不钉死细分数字（测试集会增长），但必须带复核日期与当前总数，陈旧计数不得残留
         self.assertIn("本次完整回归", self.text)
         self.assertIn("2026-09-15 复核", self.text)
-        self.assertIn("313 项通过", self.text)
+        self.assertIn("331 项通过", self.text)
         self.assertIn("56 项验收状态与设计边界守卫测试", self.text)
         self.assertIn("82 项路径 A `utm-export` 单元测试", self.text)
         self.assertIn("37 项 Task 6.1 打包测试", self.text)
         self.assertIn("58 项 Task 6.2/6.3A/6.3B app 受控运行时、许可证与验收守卫测试", self.text)
-        for stale in ("66 项通过", "当前完整回归", "174 项通过", "161 项通过", "202 项", "205 项", "235 项", "245 项", "280 项", "283 项", "286 项", "279 项", "278 项", "269 项", "267 项", "242 项", "243 项", "244 项", "48 项", "95 项", "293 项", "309 项", "312 项", "43 项 Task 6.2"):
+        for stale in ("66 项通过", "当前完整回归", "174 项通过", "161 项通过", "202 项", "205 项", "235 项", "245 项", "280 项", "283 项", "286 项", "279 项", "278 项", "269 项", "267 项", "242 项", "243 项", "244 项", "48 项", "95 项", "293 项", "309 项", "312 项", "313 项", "43 项 Task 6.2"):
             self.assertNotIn(stale, self.text)
 
     def test_matrix_wording_avoids_adapted_claim(self) -> None:

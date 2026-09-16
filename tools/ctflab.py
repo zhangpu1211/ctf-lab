@@ -832,13 +832,68 @@ class LabManager:
             raise CTFLabError("目录中有多个候选磁盘，请直接传入具体文件路径：\n" + "\n".join(str(item) for item in matches))
         return matches[0]
 
-    def import_image(self, profile_id: str, source_arg: str) -> dict[str, Any]:
+    def import_image(self, profile_id: str, source_arg: str, *, expect_sha256: str | None = None,
+                     manifest: str | Path | None = None,
+                     nvram: str | Path | None = None) -> dict[str, Any]:
         with self.operation_lock(f"导入 {profile_id}"):
-            return self._import_image_unlocked(profile_id, source_arg)
+            return self._import_image_unlocked(profile_id, source_arg, expect_sha256=expect_sha256,
+                                               manifest=manifest, nvram=nvram)
 
-    def _import_image_unlocked(self, profile_id: str, source_arg: str) -> dict[str, Any]:
+    def distribution_expectations(self, profile_id: str, expect_sha256: str | None,
+                                  manifest: str | Path | None,
+                                  nvram: str | Path | None) -> dict[str, Any]:
+        """解析来源校验计划：显式哈希与分发清单必须一致；不一致立即失败，不做取舍。"""
+        import ctflab_dist  # noqa: PLC0415
+
+        plan: dict[str, Any] = {"expect_sha256": None, "manifest": None, "nvram": None,
+                                "nvram_expected": None, "method": None, "nvram_manifest": None}
+        manifest_path = Path(manifest).expanduser() if manifest else None
+        if manifest_path is not None:
+            try:
+                data = ctflab_dist.load_manifest(manifest_path)
+            except ctflab_dist.DistError as exc:
+                raise CTFLabError(str(exc)) from exc
+            entry = ctflab_dist.expected_for_profile(data, profile_id, ctflab_dist.BASE_ROLE)
+            if entry is None:
+                available = ", ".join(sorted({str(item.get("profile")) for item in data["entries"]}))
+                raise CTFLabError(
+                    f"分发清单中没有 {profile_id} 的基盘条目：{manifest_path}（清单内 profile：{available or '无'}）")
+            plan["expect_sha256"] = str(entry["sha256"]).lower()
+            plan["manifest"] = manifest_path
+            plan["method"] = "manifest"
+            nvram_entry = ctflab_dist.expected_for_profile(data, profile_id, ctflab_dist.NVRAM_ROLE)
+            if nvram_entry is not None:
+                plan["nvram"] = manifest_path.parent / str(nvram_entry["file"])
+                plan["nvram_expected"] = str(nvram_entry["sha256"]).lower()
+                plan["nvram_manifest"] = manifest_path
+        if expect_sha256:
+            value = expect_sha256.strip().lower()
+            if not re.fullmatch(r"[0-9a-f]{64}", value):
+                raise CTFLabError(f"--expect-sha256 必须是 64 位十六进制摘要：{expect_sha256!r}")
+            if plan["expect_sha256"] and plan["expect_sha256"] != value:
+                raise CTFLabError(
+                    "--expect-sha256 与分发清单登记的期望值不一致，拒绝导入：\n"
+                    f"  清单：{plan['expect_sha256']}\n  参数：{value}")
+            plan["expect_sha256"] = value
+            if plan["method"] is None:
+                plan["method"] = "expect-sha256"
+        if nvram:
+            explicit = Path(nvram).expanduser()
+            if plan["nvram"] is not None and explicit != plan["nvram"]:
+                raise CTFLabError(
+                    "--nvram 与分发清单登记的 NVRAM 模板不一致，拒绝导入：\n"
+                    f"  清单：{plan['nvram']}\n  参数：{explicit}")
+            plan["nvram"] = explicit
+            plan["nvram_expected"] = plan["nvram_expected"] if plan["nvram_manifest"] else None
+        return plan
+
+    def _import_image_unlocked(self, profile_id: str, source_arg: str, *,
+                               expect_sha256: str | None = None,
+                               manifest: str | Path | None = None,
+                               nvram: str | Path | None = None) -> dict[str, Any]:
         profile_id = PROFILE_ALIASES.get(profile_id, profile_id)
         profile = load_profile(profile_id)
+        plan = self.distribution_expectations(profile_id, expect_sha256, manifest, nvram)
         source = self.discover_source(Path(source_arg))
         source_for_convert = source
         temporary_dir: tempfile.TemporaryDirectory[str] | None = None
@@ -856,6 +911,34 @@ class LabManager:
                     archive.extract(member, temporary_dir.name)
                     source_for_convert = Path(temporary_dir.name) / member.name
             source_hash = sha256_file(source)
+            updates: dict[str, Any] = {}
+            if plan["expect_sha256"]:
+                if source_hash != plan["expect_sha256"]:
+                    raise CTFLabError(
+                        "来源镜像 SHA-256 与期望值不一致，拒绝导入（请重新下载，不要跳过校验）：\n"
+                        f"  文件：{source}\n"
+                        f"  期望：{plan['expect_sha256']}\n"
+                        f"  实际：{source_hash}")
+                updates["source_verification"] = {
+                    "expected_sha256": plan["expect_sha256"],
+                    "actual_sha256": source_hash,
+                    "method": plan["method"],
+                    "manifest": str(plan["manifest"]) if plan["manifest"] else None,
+                    "verified_at": now_iso(),
+                }
+            if plan["nvram"]:
+                nvram_path = Path(plan["nvram"]).expanduser()
+                if not nvram_path.is_file():
+                    raise CTFLabError(f"UEFI NVRAM 模板不存在：{nvram_path}")
+                nvram_hash = sha256_file(nvram_path)
+                if plan["nvram_expected"] and nvram_hash != plan["nvram_expected"]:
+                    raise CTFLabError(
+                        "UEFI NVRAM 模板 SHA-256 与分发清单不一致，拒绝导入：\n"
+                        f"  文件：{nvram_path}\n"
+                        f"  期望：{plan['nvram_expected']}\n"
+                        f"  实际：{nvram_hash}")
+                updates["uefi_vars_path"] = str(nvram_path)
+                updates["uefi_vars_sha256"] = nvram_hash
             existing = self.image_state(profile_id)
             if (
                 existing
@@ -864,7 +947,8 @@ class LabManager:
             ):
                 # 同一来源的重复导入必须是幂等的，尤其不能把已验证的来宾修复基盘
                 # 悄悄切回最初转换出的未修复基盘；同时不得静默信任缺少 base_sha256 的旧基盘。
-                return self._reuse_existing_base(profile_id, existing, source_for_convert)
+                return self._reuse_existing_base(profile_id, existing, source_for_convert,
+                                                 updates=updates)
             info = qemu_info(source_for_convert)
             source_format = str(info.get("format") or "")
             if not source_format:
@@ -900,6 +984,7 @@ class LabManager:
                 "virtual_size": destination_info.get("virtual-size"),
                 "imported_at": now_iso(),
                 "guest": profile.get("guest", {}),
+                **updates,
             }
             write_json(self.image_state_path(profile_id), state)
             return state
@@ -907,7 +992,19 @@ class LabManager:
             if temporary_dir is not None:
                 temporary_dir.cleanup()
 
-    def _reuse_existing_base(self, profile_id: str, existing: dict[str, Any], source_for_convert: Path) -> dict[str, Any]:
+    def _apply_state_updates(self, profile_id: str, state: dict[str, Any],
+                             updates: dict[str, Any] | None) -> dict[str, Any]:
+        """把来源校验/NVRAM 等幂等元数据写回状态；没有变化时不写盘。"""
+        if not updates:
+            return state
+        merged = dict(state)
+        merged.update(updates)
+        if merged != state:
+            write_json(self.image_state_path(profile_id), merged)
+        return merged
+
+    def _reuse_existing_base(self, profile_id: str, existing: dict[str, Any], source_for_convert: Path,
+                             *, updates: dict[str, Any] | None = None) -> dict[str, Any]:
         """重复导入：已登记则核对；未登记则只在内容比对证明一致时补登记。"""
         base_path = Path(str(existing.get("base_path")))
         registered = str(existing.get("base_sha256") or "")
@@ -917,7 +1014,7 @@ class LabManager:
                     f"{profile_id} 的基础镜像与登记 base_sha256 不一致；拒绝静默重新登记。"
                     "请人工核对，或等待后续专门的完整性迁移流程。"
                 )
-            return existing
+            return self._apply_state_updates(profile_id, existing, updates)
         source_format = str(existing.get("source_format") or "")
         if not source_format:
             source_format = str(qemu_info(source_for_convert).get("format") or "")
@@ -929,6 +1026,7 @@ class LabManager:
         state = dict(existing)
         state["base_sha256"] = sha256_file(base_path)
         state["base_sha256_evidence"] = "qemu-img-compare"
+        state.update(updates or {})
         base_path.chmod(0o444)
         write_json(self.image_state_path(profile_id), state)
         return state
@@ -2279,11 +2377,81 @@ def cmd_onboard(manager: LabManager, args: argparse.Namespace) -> int:
 
 
 def cmd_import(manager: LabManager, args: argparse.Namespace) -> int:
-    state = manager.import_image(args.profile, args.source)
+    state = manager.import_image(args.profile, args.source,
+                                 expect_sha256=args.expect_sha256,
+                                 manifest=args.manifest,
+                                 nvram=args.nvram)
     print(f"导入完成：{args.profile}")
     print(f"基础镜像：{state['base_path']}")
     print(f"SHA-256：{state['source_sha256']}")
+    verification = state.get("source_verification")
+    if verification:
+        print(f"来源校验：通过（{verification['method']}；期望 {verification['expected_sha256'][:12]}…）")
+    else:
+        print("来源校验：未提供期望哈希（可用 --manifest 或 --expect-sha256 校验下载文件）")
+    if state.get("uefi_vars_path"):
+        print(f"UEFI NVRAM 模板：{state['uefi_vars_path']}")
     return 0
+
+
+def cmd_dist_prepare(manager: LabManager, args: argparse.Namespace) -> int:
+    """为一个 profile 生成分发文件（压缩基盘 + 可选 NVRAM 模板）并合并分发清单。"""
+    import ctflab_dist  # noqa: PLC0415
+
+    profile_id = PROFILE_ALIASES.get(args.profile, args.profile)
+    profile = load_profile(profile_id)
+    state = manager.image_state(profile_id) or {}
+    source = Path(args.source).expanduser() if args.source else Path(str(state.get("base_path") or ""))
+    if not source.is_file():
+        raise CTFLabError(
+            f"{profile_id} 没有已导入的基盘（或 --source 指向的文件不存在）：{source or '（未登记）'}；"
+            "先执行 ctflab import，或用 --source 显式指定")
+    try:
+        base_entry = ctflab_dist.prepare_image_entry(
+            args.out, profile_id=profile_id, source=source, qemu_img=qemu_img_path(),
+            compress=not args.no_compress, base_sha256=state.get("base_sha256"))
+        nvram_entry = None
+        architecture = str(profile.get("guest", {}).get("architecture") or "")
+        if architecture == "aarch64" and not args.no_nvram:
+            nvram_source = Path(args.nvram).expanduser() if args.nvram \
+                else Path(str(state.get("uefi_vars_path") or ""))
+            if not nvram_source.is_file():
+                raise CTFLabError(
+                    f"{profile_id} 是 aarch64：需要随包分发 UEFI NVRAM 模板"
+                    "（用 --nvram 指定，或先用 ctflab import --nvram 登记；"
+                    "确认不需要时用 --no-nvram 明确跳过）")
+            nvram_entry = ctflab_dist.prepare_nvram_entry(
+                args.out, profile_id=profile_id, source=nvram_source)
+    except ctflab_dist.DistError as exc:
+        raise CTFLabError(str(exc)) from exc
+    print(f"分发文件已写入：{Path(args.out).expanduser()}")
+    print(f"  {base_entry['file']}（{base_entry['compression']} 压缩，"
+          f"{ctflab_dist.human_size(int(base_entry['size']))}，sha256 {base_entry['sha256'][:12]}…）")
+    if nvram_entry:
+        print(f"  {nvram_entry['file']}（{ctflab_dist.human_size(int(nvram_entry['size']))}，"
+              f"sha256 {nvram_entry['sha256'][:12]}…）")
+    if base_entry.get("source_base_sha256"):
+        print(f"  source_base_sha256：{base_entry['source_base_sha256'][:12]}…"
+              "（该 profile 验证记录中的基盘哈希，供交叉核对）")
+    print(f"清单：{ctflab_dist.MANIFEST_NAME} / {ctflab_dist.SUMS_NAME} / {ctflab_dist.README_NAME}")
+    return 0
+
+
+def cmd_dist_verify(_manager: LabManager, args: argparse.Namespace) -> int:
+    """复核分发目录：逐文件大小与 SHA-256 与清单一致。"""
+    import ctflab_dist  # noqa: PLC0415
+
+    try:
+        report = ctflab_dist.verify_distribution(args.dir)
+    except ctflab_dist.DistError as exc:
+        raise CTFLabError(str(exc)) from exc
+    if report["ok"]:
+        print(f"分发目录校验通过：{Path(args.dir).expanduser()}"
+              f"（{len(report['entries'])} 个文件与清单一致）")
+        return 0
+    for problem in report["problems"]:
+        print(f"不一致：{problem}", file=sys.stderr)
+    raise CTFLabError(f"分发目录校验失败：{len(report['problems'])} 项不一致")
 
 
 def cmd_utm_export(manager: LabManager, args: argparse.Namespace) -> int:
@@ -2661,6 +2829,29 @@ def build_parser() -> argparse.ArgumentParser:
     import_parser = subparsers.add_parser("import", help="导入 VMDK/QCOW2/OVA 等镜像")
     import_parser.add_argument("profile", choices=profile_choices)
     import_parser.add_argument("source", help="磁盘文件或包含单个磁盘的目录")
+    import_parser.add_argument("--expect-sha256",
+                               help="期望的来源镜像 SHA-256（下载后校验；不一致拒绝导入）")
+    import_parser.add_argument("--manifest", type=Path,
+                               help="分发清单 DISTRIBUTION.json：按 profile 核对哈希，并自动套用配套 NVRAM 模板")
+    import_parser.add_argument("--nvram", type=Path,
+                               help="UEFI NVRAM 模板（aarch64 已安装系统）；使用 --manifest 时自动解析")
+
+    dist_parser = subparsers.add_parser(
+        "dist", help="分发准备（路线 A）：压缩基盘并生成 DISTRIBUTION.json/SHA256SUMS/README")
+    dist_sub = dist_parser.add_subparsers(dest="dist_command", required=True)
+    dist_prepare = dist_sub.add_parser(
+        "prepare", help="为一个 profile 生成分发文件；可多次执行合并进同一清单")
+    dist_prepare.add_argument("--profile", choices=profile_choices, required=True)
+    dist_prepare.add_argument("--out", type=Path, required=True, help="分发目录（写入/合并清单）")
+    dist_prepare.add_argument("--source", type=Path, help="基盘来源；缺省用该 profile 当前已导入的基盘")
+    dist_prepare.add_argument("--nvram", type=Path, help="UEFI NVRAM 模板；缺省用已导入的登记值")
+    dist_prepare.add_argument("--no-nvram", action="store_true",
+                              help="明确不登记 NVRAM 模板（aarch64 不推荐：跳过的是已验证的启动路径）")
+    dist_prepare.add_argument("--no-compress", action="store_true",
+                              help="不压缩（仅小镜像或诊断用）")
+    dist_verify = dist_sub.add_parser(
+        "verify", help="复核分发目录：逐文件大小与 SHA-256 与清单一致")
+    dist_verify.add_argument("--dir", type=Path, required=True)
 
     install_parser = subparsers.add_parser("install", help="从 ARM64 安装 ISO 创建 Kali 基础镜像")
     install_parser.add_argument("profile", choices=profile_choices)
@@ -2806,6 +2997,7 @@ def main(argv: list[str] | None = None) -> int:
     content_handlers = {"pack": cmd_content_pack, "verify": cmd_content_verify,
                         "unpack": cmd_content_unpack}
     app_handlers = {"build": cmd_app_build, "verify": cmd_app_verify}
+    dist_handlers = {"prepare": cmd_dist_prepare, "verify": cmd_dist_verify}
     try:
         # 纯打包/校验命令不需要运行状态；避免仅执行 package/content 时在默认
         # 状态目录创建 locks/ 等运行时目录，保持该类操作的只读/构建边界。
@@ -2815,6 +3007,9 @@ def main(argv: list[str] | None = None) -> int:
             return content_handlers[args.content_command](None, args)  # type: ignore[arg-type]
         if args.command == "app":
             return app_handlers[args.app_command](None, args)  # type: ignore[arg-type]
+        if args.command == "dist" and args.dist_command == "verify":
+            # verify 只读分发目录，不需要运行状态；不要在默认状态目录创建 locks/。
+            return dist_handlers[args.dist_command](None, args)  # type: ignore[arg-type]
         manager = LabManager(args.state_dir)
         if args.command == "stop" and not args.all and not args.profiles:
             parser.error("stop 需要提供配置名，或使用 --all")
@@ -2827,6 +3022,8 @@ def main(argv: list[str] | None = None) -> int:
             # 整体持锁才能避免两个终端生成重复地址或覆盖中间状态。
             with manager.operation_lock(f"接入 {args.id}"):
                 return handlers[args.command](manager, args)
+        if args.command == "dist":
+            return dist_handlers[args.dist_command](manager, args)  # type: ignore[arg-type]
         return handlers[args.command](manager, args)
     except CTFLabError as exc:
         print(f"错误：{exc}", file=sys.stderr)

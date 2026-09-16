@@ -69,6 +69,8 @@ python3 -m py_compile tools/ctflab.py tools/ctflab_inspect.py tools/ctflab_netwo
 - [Task 6.2 验证记录（2026-09-15）](docs/verification-task6-2-2026-09-15.md)
 - [Task 6.3A 验证记录：Kali ARM64 + UEFI 真实验收（2026-09-15）](docs/verification-task6-3a-2026-09-15.md)
 - [Task 6.3B 验证记录：许可证闭环与内置 Python 运行时（2026-09-15）](docs/verification-task6-3b-2026-09-15.md)
+- [基盘分发指南（路线 A：网盘 / 课程资料区）](docs/ctflab-distribution-guide.md)
+- [分发链验证记录：压缩基盘与可校验导入（2026-09-16）](docs/verification-distribution-2026-09-16.md)
 
 ## 许可证
 

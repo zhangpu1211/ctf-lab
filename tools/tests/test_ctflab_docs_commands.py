@@ -48,6 +48,17 @@ def command_spec() -> tuple[dict[str, argparse.ArgumentParser], dict[str, argpar
     return subcommands, global_options
 
 
+def nested_choices(parser: argparse.ArgumentParser) -> dict[str, argparse.ArgumentParser]:
+    """两级子命令（`app build`、`dist prepare`、`content unpack` 等）的下一级解析器。"""
+    group = getattr(parser, "_subparsers", None)
+    if group is None:
+        return {}
+    choices: dict[str, argparse.ArgumentParser] = {}
+    for action in group._group_actions:
+        choices.update(action.choices)
+    return choices
+
+
 def arity(action: argparse.Action) -> tuple[int, float]:
     nargs = action.nargs
     if nargs is None:
@@ -132,9 +143,14 @@ class DocumentedCommandTests(unittest.TestCase):
     def setUp(self) -> None:
         self.subcommands, self.global_options = command_spec()
 
-    def allowed_options(self, name: str) -> set[str]:
+    def allowed_options(self, name: str, tail: str = "") -> set[str]:
         allowed = set(self.global_options)
-        for action in self.subcommands[name]._actions:
+        parser = self.subcommands[name]
+        nested = nested_choices(parser)
+        first = tail.strip().split()[0] if tail.strip() else ""
+        if nested and first in nested:
+            parser = nested[first]
+        for action in parser._actions:
             allowed.update(action.option_strings)
         return allowed
 
@@ -149,7 +165,7 @@ class DocumentedCommandTests(unittest.TestCase):
                 if name not in self.subcommands:
                     problems.append(f"{path.name}: 未知子命令 ctflab {name}")
                     continue
-                allowed = self.allowed_options(name)
+                allowed = self.allowed_options(name, tail)
                 for flag in re.findall(r"(?<![\w-])--?[A-Za-z][A-Za-z0-9-]*", tail):
                     if flag not in allowed:
                         problems.append(f"{path.name}: ctflab {name} 不支持 {flag}")
@@ -175,7 +191,12 @@ class DocumentedCommandTests(unittest.TestCase):
                 if name not in self.subcommands:
                     continue  # 已由上一个用例报告
                 seen += 1
-                found = check_command(self.subcommands[name], rest, self.global_options)
+                parser_under_test = self.subcommands[name]
+                nested = nested_choices(parser_under_test)
+                if nested and rest and rest[0] in nested:
+                    parser_under_test = nested[rest[0]]
+                    rest = rest[1:]
+                found = check_command(parser_under_test, rest, self.global_options)
                 found += extra_rules(name, rest)
                 for problem in found:
                     problems.append(f"{path.name}: ctflab {name}：{problem}")

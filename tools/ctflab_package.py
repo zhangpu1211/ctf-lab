@@ -59,6 +59,8 @@ RELEASE_TOOL_FILES = (
     # `ctflab.py app build/verify` 会在运行时导入该模块；源码发布包必须一起带上，
     # 否则安装后的 CLI 虽然暴露 app 子命令，却会在真正执行时 ModuleNotFoundError。
     "tools/ctflab_app.py",
+    # `ctflab import --manifest` 与 `ctflab dist prepare/verify` 依赖该模块。
+    "tools/ctflab_dist.py",
 )
 RELEASE_DOC_FILES = (
     "LICENSE",

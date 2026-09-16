@@ -568,7 +568,10 @@ Mac M MVP 的合理预期为约一周。现有外部 Kali 兼容、Windows/Linux
 **工作项：**
 
 - [ ] 建立签名内容索引、镜像元数据、版本、依赖和弃用策略；
-- [ ] 下载断点续传、校验、镜像缓存和可恢复导入；
+- [ ] 下载断点续传、校验、镜像缓存和可恢复导入（2026-09-16 部分实现：`ctflab dist prepare/verify`
+  生成压缩基盘与 `DISTRIBUTION.json`/`SHA256SUMS`，`ctflab import --manifest/--expect-sha256`
+  强制校验来源哈希并把证据写入 `image.json`；断点续传与镜像缓存未做。见
+  `docs/ctflab-distribution-guide.md`）；
 - [ ] 生成 SBOM、许可证清单、来源和完整性证明；
 - [ ] 提供 PCAP 录制、基础流量筛选和靶场事件时间线；
 - [ ] 提供实验说明、账号、入口、提示与一键恢复初始状态；
