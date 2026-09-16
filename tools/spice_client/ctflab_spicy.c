@@ -3,7 +3,8 @@
  *
  * 这个小客户端只接收运行器传入的固定 --uri 参数，不接受 QEMU 参数；关键的
  * resize-guest 属性显式设为 TRUE，使 spice-gtk 在窗口尺寸变化时向来宾发送
- * monitors config。显式关闭客户端剪贴板共享、USB 自动重定向与文件拖入。
+ * monitors config。剪贴板必须由运行器显式传入 --clipboard 才开启；USB 自动
+ * 重定向与文件拖入始终关闭。
  *
  * 项目代码按 MIT 发布；编译时动态链接系统中的 spice-gtk/GTK，随 App 打包时
  * 由构建器收集并校验对应的第三方动态库与许可证文本。
@@ -47,6 +48,16 @@ static const char *uri_argument(int argc, char **argv)
     return NULL;
 }
 
+static gboolean clipboard_argument(int argc, char **argv)
+{
+    for (int index = 1; index < argc; index++) {
+        if (strcmp(argv[index], "--clipboard") == 0) {
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
 #ifdef CTFLAB_E2E_TEST
 static gboolean resize_test_window(gpointer user_data)
 {
@@ -84,8 +95,9 @@ static void display_ready_for_resize(GObject *display,
 int main(int argc, char **argv)
 {
     const char *uri = uri_argument(argc, argv);
+    gboolean allow_clipboard = clipboard_argument(argc, argv);
     if (uri == NULL || *uri == '\0') {
-        fprintf(stderr, "用法：ctflab-spicy --uri spice+unix:///path/to/display.sock\n");
+        fprintf(stderr, "用法：ctflab-spicy --uri spice+unix:///path/to/display.sock [--clipboard]\n");
         return 2;
     }
 
@@ -94,9 +106,10 @@ int main(int argc, char **argv)
     SpiceSession *session = spice_session_new();
     g_object_set(session, "uri", uri, "enable-audio", FALSE,
                  "enable-usbredir", FALSE, NULL);
-    /* SpiceDisplay 内部也会取得 GtkSession，必须显式关闭共享默认值。 */
+    /* SpiceDisplay 内部也会取得 GtkSession；剪贴板只接受运行器的显式授权。 */
     SpiceGtkSession *gtk_session = spice_gtk_session_get(session);
-    g_object_set(gtk_session, "auto-clipboard", FALSE, "auto-usbredir", FALSE, NULL);
+    g_object_set(gtk_session, "auto-clipboard", allow_clipboard,
+                 "auto-usbredir", FALSE, NULL);
 
     /* connect 同步建立 main channel 对象，再创建 display，避免空通道尺寸更新。 */
     if (!spice_session_connect(session)) {

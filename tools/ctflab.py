@@ -148,6 +148,17 @@ def spice_client_path() -> str | None:
     return shutil.which(SPICE_CLIENT_NAMES[0]) or shutil.which(SPICE_CLIENT_NAMES[1])
 
 
+def spice_client_command(client: str, endpoint: Path, clipboard: bool = False) -> list[str]:
+    """构造受控客户端命令；只有显式 `--clipboard` 才打开客户端剪贴板。"""
+    client_uri = f"spice+unix://{endpoint}"
+    if Path(client).name == "spicy":
+        command = [client, "--uri", client_uri]
+        if clipboard:
+            command.append("--clipboard")
+        return command
+    return [client, client_uri]
+
+
 def sha256_file(path: Path, chunk_size: int = 8 * 1024 * 1024) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -1984,10 +1995,7 @@ class LabManager:
                     self._stop_unlocked([profile_id])
                     reason = "SPICE socket 未建立" if not endpoint.exists() else "本地 SPICE 客户端不可用"
                     raise CTFLabError(f"{reason}；已清理本次 QEMU 启动，不会自动回退 Cocoa。")
-                client_uri = f"spice+unix://{endpoint}"
-                client_command = ([client, "--uri", client_uri]
-                                  if Path(client).name == "spicy"
-                                  else [client, client_uri])
+                client_command = spice_client_command(client, endpoint, clipboard)
                 client_log = self.logs_dir / f"{profile_id}-spice-client.log"
                 with client_log.open("a", encoding="utf-8") as client_handle:
                     try:

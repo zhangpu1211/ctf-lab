@@ -516,6 +516,16 @@ class SpiceDisplayCliTests(unittest.TestCase):
             with self.assertRaisesRegex(ctflab.CTFLabError, "只能单独启动 kali-arm64"):
                 manager.run(["smoke"], display="spice")
 
+    def test_spice_client_clipboard_requires_explicit_flag(self) -> None:
+        endpoint = pathlib.Path("/tmp/ctflab/display.sock")
+        disabled = ctflab.spice_client_command("/tmp/spicy", endpoint)
+        enabled = ctflab.spice_client_command("/tmp/spicy", endpoint, clipboard=True)
+        self.assertNotIn("--clipboard", disabled)
+        self.assertIn("--clipboard", enabled)
+        self.assertEqual(disabled[:3], ["/tmp/spicy", "--uri", "spice+unix:///tmp/ctflab/display.sock"])
+        source = (pathlib.Path(__file__).resolve().parents[2] / "tools" / "spice_client" / "ctflab_spicy.c").read_text(encoding="utf-8")
+        self.assertIn('"auto-clipboard", allow_clipboard', source)
+
 
 class DeliveryClaimGuardTests(unittest.TestCase):
     """交付语义守卫：设计文档、验证记录与两份交付说明都不得出现未加限定的升级宣称。

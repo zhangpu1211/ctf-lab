@@ -14,8 +14,8 @@
 | 单元测试 | `tools/tests/test_ctflab_gui.py`（21 项：Swift 核心断言 + CLI JSON 契约 + 构建集成 + 文档守卫） | 已验证 |
 | 测试构建产物 | `/Users/pufei/Downloads/ctflab-app-build-gui-20260916/CTFLab.app`（树 SHA-256 `b282b31dec1fa1fd…`，MANIFEST SHA-256 `2fb5d19f801a4a8e…`，ad-hoc 签名，725 个登记文件） | 已验证 |
 
-未覆盖既有最终产物：`/Users/pufei/Downloads/ctflab-app-build-20260916/CTFLab.app` 与分发目录
-`/Users/pufei/Downloads/ctflab-dist-20260916/` 均未被修改（分发目录按只读方式使用）。
+本次 GUI 验证未覆盖既有旧产物：`/Users/pufei/Downloads/ctflab-app-build-20260916/CTFLab.app` 与旧分发目录
+`/Users/pufei/Downloads/ctflab-dist-20260916/`；二者已由后续清理移除，验证截图与 JSON 证据保留。
 
 ## 2. 实际点击验证（GUI E2E，截图见 `~/Downloads/ctflab-gui-verify-20260916/`）
 

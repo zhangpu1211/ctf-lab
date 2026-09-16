@@ -3,7 +3,8 @@
 > 当前实现状态：路径 B 的 CLI/GUI 能力门禁、QEMU 11.x SPICE 参数、可选运行时打包和 Kali XFCE
 > 显示适配已接入。2026-09-16 已用带 SPICE 的 QEMU 与内置 `spicy` 完成 server/client/agent
 > 连接、冷启动恢复，以及 1000×700 / 800×600 窗口对应来宾 2000×1400 / 1600×1200 的实际跟随验证。
-> 旧分发基盘需补装 `configure.sh --display-only`；详细证据见 `verification-display-network-2026-09-16.md`。
+> 旧分发基盘已清理；新版分发目录已包含 `configure.sh --display-only` 的适配结果。
+> 详细证据见 `verification-display-network-2026-09-16.md`。
 
 > 状态：**路径 A 的 `utm-export` 已实现并通过单元测试；UTM 4.7.5 必需段与必需键已按上游源码
 > 补齐。2026-09-14：首次导入（R1）因缺必需段失败；补齐后导出 `CTFLab-Kali-E2E-20260914-R2`，
@@ -350,7 +351,7 @@ failure:
 
 | 维度 | A：独立 UTM 导出 | B：带 SPICE 的 QEMU + 本地客户端 |
 |---|---|---|
-| 动态分辨率证据 | UTM 显示机制 PoC 已验证（2026-09-14）；Smoke/Basic（x86_64 固定显示）的静态控制台 E2E 已在限定范围内通过；Kali 包动态分辨率重启后复测失败，仅保证固定显示可用 | 带 SPICE QEMU + 受控客户端 + XFCE 适配已验证两档窗口的实际 `xrandr` 跟随；旧基盘需补装适配 |
+| 动态分辨率证据 | UTM 显示机制 PoC 已验证（2026-09-14）；Smoke/Basic（x86_64 固定显示）的静态控制台 E2E 已在限定范围内通过；Kali 包动态分辨率重启后复测失败，仅保证固定显示可用 | 带 SPICE QEMU + 受控客户端 + XFCE 适配已验证两档窗口的实际 `xrandr` 跟随；新版分发基盘已包含适配 |
 | 网络默认与隔离 | 默认无网卡；未来 Host Only 需固定键集 + “Isolate Guest from Host” | 保持 CTFLab 实验网与现有隔离语义 |
 | 剪贴板默认 | 关闭 UTM Clipboard Sharing；宿主/来宾双向负向 E2E | agent transport 始终保留；按 `--clipboard` 条件开关（未授权禁用复制粘贴/文件传输 + 客户端关闭共享；授权允许文本） |
 | 端点与鉴权 | 不适用（UTM 管理） | 两种互斥模式：UNIX socket（0700 目录，优先）或 TCP `127.0.0.1` + 每次运行鉴权 |

@@ -365,7 +365,7 @@ qemu-img create -f qcow2 -F qcow2 \
 - [x] 验证 XFCE 登录、键盘、鼠标、1920×1080 手动显示及 Firefox/Burp/Wireshark 主界面。
 - [x] 验证 XFCE 登录、窗口缩放、键盘、鼠标和至少 1920×1080 显示。
 - [x] 安装/验证 guest agent 的文本剪贴板：Mac↔Kali 双向（英文/中文/多行）、关闭通道不共享、重启后可用。
-- [ ] 动态分辨率：默认路径（QEMU 11.1 + cocoa + virtio-gpu）没有让来宾分辨率跟随窗口的通道（2026-09-13 证据）。UTM 路线 A 的动态链路重启后复测失败，旧包仅保证固定显示可用；路径 B 已接入 `run --display spice`、受控客户端与 XFCE 适配，已验证两档窗口跟随及冷启动后适配自动启动。待更新旧分发基盘，并补齐剪贴板负向和客户端鉴权 E2E。按 `docs/ctflab-dynamic-resolution-design.md` 第 5 节继续验收。
+- [ ] 动态分辨率：默认路径（QEMU 11.1 + cocoa + virtio-gpu）没有让来宾分辨率跟随窗口的通道（2026-09-13 证据）。UTM 路线 A 的动态链路重启后复测失败，旧包仅保证固定显示可用；路径 B 已接入 `run --display spice`、受控客户端与 XFCE 适配，已验证两档窗口跟随及冷启动后适配自动启动。新版分发目录已包含显示适配，仍需补齐剪贴板负向和客户端鉴权 E2E；默认课堂路径保持不变。按 `docs/ctflab-dynamic-resolution-design.md` 第 5 节继续验收。
 - [x] 明确显示窗口关闭策略：确认框 + ACPI 电源键，来宾确认后正常关机；不提供隐藏后台（需要后台请用 `--headless`）。
 
 2026-09-07：`--headless` 已实现，窗口关闭策略、动态缩放和剪贴板仍未验收。新增 `install/install-status/stop-install/finalize-install`，以及只允许 Kali 独占运行的 `--internet` 维护模式；`--from-runtime` 可保留旧盘并固化维护成果。独立重装实例已验证无需手工修复即可 DHCP/SSH 登录。Ghidra 已安装并出现项目窗口，但首次帮助页报错，不能列为完整工具验收通过。

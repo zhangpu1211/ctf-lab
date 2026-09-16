@@ -14,7 +14,7 @@
 当前开发机已生成的实际位置是：
 
 ```text
-/Users/pufei/Downloads/ctflab-app-build-spice-release-20260916/CTFLab.app
+/Users/pufei/Downloads/ctflab-app-build-spice-clipboard-release2-20260916/CTFLab.app
 /Users/pufei/Downloads/ctflab-dist-spice-release-20260916/
 ```
 
@@ -32,8 +32,8 @@ basic-pentesting-2-base.qcow2
 
 这两个绝对路径是本机产物位置，不是学生机器上的固定路径。复制或下载后，后续命令只需要把
 `APP_DIR` 和 `DIST_DIR` 改成实际位置。分发目录约 9.2GB，`.app` 约 264MB；不要把这些
-虚拟磁盘提交到 Git 仓库。当前新版 App 约 302MB；旧的无 SPICE 产物和旧分发目录仍保留，但不含本轮
-Kali 显示适配，课堂使用应以这里列出的新版路径为准。
+虚拟磁盘提交到 Git 仓库。当前新版 App 约 302MB；旧的无 SPICE 产物和旧分发目录已清理，课堂使用
+应以这里列出的新版路径为准。
 
 ## 2. 图形界面流程（推荐：双击打开）
 
@@ -76,7 +76,7 @@ CLI="$APP_DIR/Contents/Resources/bin/CTFLab"
 例如，直接使用当前开发机产物：
 
 ```zsh
-APP_DIR="/Users/pufei/Downloads/ctflab-app-build-spice-release-20260916/CTFLab.app"
+APP_DIR="/Users/pufei/Downloads/ctflab-app-build-spice-clipboard-release2-20260916/CTFLab.app"
 DIST_DIR="/Users/pufei/Downloads/ctflab-dist-spice-release-20260916"
 CLI="$APP_DIR/Contents/Resources/bin/CTFLab"
 ```
@@ -261,6 +261,13 @@ Retina 屏的窗口逻辑尺寸与来宾像素尺寸可能为 1:2，例如 1000�
 
 ```zsh
 "$CLI" run kali-arm64 --display spice
+```
+
+如需在 SPICE 图形会话中显式开启文本剪贴板，追加 `--clipboard`；不追加时客户端和来宾通道均保持关闭：
+
+```zsh
+"$CLI" stop --all
+"$CLI" run kali-arm64 --display spice --clipboard
 ```
 
 该模式要求 SPICE-capable QEMU、`spicevmc`/`virtserialport` 和本地 SPICE 客户端；缺任一项会在启动前

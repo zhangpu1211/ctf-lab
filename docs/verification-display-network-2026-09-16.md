@@ -9,8 +9,9 @@
 
 - 根因：SPICE 已更新 virtio-gpu 首选模式，XFCE 未自动应用，实际分辨率卡在 1280×800。
   来宾日志还出现 Mutter DBus 无 owner；同类现象见 [Debian #1065434](https://bugs.debian.org/1065434)。
-- 客户端：`tools/spice_client/ctflab_spicy.c` 显式开启 `resize-guest`，关闭剪贴板、USB、音频与拖入文件。
-  主通道先建立再创建显示控件。测试缩放钩子仅在 `CTFLAB_E2E_TEST` 编译中存在。
+- 客户端：`tools/spice_client/ctflab_spicy.c` 显式开启 `resize-guest`；只有运行器传入 `--clipboard`
+  时才开启客户端剪贴板，USB、音频与拖入文件始终关闭。主通道先建立再创建显示控件；测试缩放
+  钩子仅在 `CTFLAB_E2E_TEST` 编译中存在。
 - 来宾：`configure.sh --display-only` 安装 XFCE 自启动适配；仅在 SPICE 端口存在的 X11 会话中，
   自动应用 `Virtual-*` 输出的有界首选模式，使用会话锁去重。它不修改持久分辨率配置和网络。
 - 实测：16:52:29 来宾 `current 2000 x 1400`；16:52:49 来宾 `current 1600 x 1200`。
@@ -18,10 +19,10 @@
 - 冷启动复测：生产客户端登录后自动达到 2000×1400；适配由 XFCE 自动启动。
   重连同源码的测试客户端后，16:57:29 为 2000×1400，16:57:53 自动变为 1600×1200。
   同次启动还验证 `--internet --display spice` 联用，维护路由为 eth1，经域名访问 Debian HTTPS 返回 200。
-- 交付 App：`/Users/pufei/Downloads/ctflab-app-build-spice-release-20260916/CTFLab.app`。
+- 交付 App：`/Users/pufei/Downloads/ctflab-app-build-spice-clipboard-release2-20260916/CTFLab.app`。
   生产客户端不包含自动缩放测试钩子。QEMU 11.1.0、797 个登记文件、70 个动态库。
-- 当前 Kali 的派生磁盘已安装适配；原始基盘及旧分发目录未修改。旧镜像重新导入或重置后需补装，
-  新版无人值守安装自动包含。尚未做公证及跨用户客户端连接拒绝 E2E。
+- 当前 Kali 的派生磁盘已安装适配；原始基盘未修改。旧分发目录已由后续清理移除，新版无人值守安装
+  和新版分发目录均包含该适配。尚未做公证及跨用户客户端连接拒绝 E2E。
 
 客户端可复现构建（macOS 已安装 spice-gtk / GTK3 开发依赖）：
 
@@ -36,7 +37,7 @@ clang -Wall -Wextra -Werror tools/spice_client/ctflab_spicy.c -o /tmp/ctflab-spi
 使用已导入的 Kali 基盘，先确认其他节点均停止，再执行：
 
 ```zsh
-CTFLAB_APP="/Users/pufei/Downloads/ctflab-app-build-spice-release-20260916/CTFLab.app"
+CTFLAB_APP="/Users/pufei/Downloads/ctflab-app-build-spice-clipboard-release2-20260916/CTFLab.app"
 "$CTFLAB_APP/Contents/Resources/bin/ctflab-cli" --state-dir "$HOME/Library/Application Support/CTFLab" run kali-arm64 --internet --headless
 "$CTFLAB_APP/Contents/Resources/bin/ctflab-cli" --state-dir "$HOME/Library/Application Support/CTFLab" health kali-arm64 --json
 "$CTFLAB_APP/Contents/Resources/bin/ctflab-cli" --state-dir "$HOME/Library/Application Support/CTFLab" stop --all
@@ -71,7 +72,7 @@ CTFLAB_APP="/Users/pufei/Downloads/ctflab-app-build-spice-release-20260916/CTFLa
 
 本轮用 QEMU 11.1.0 源码构建了带 SPICE 的 arm64 运行时，并把 `spicy` 及其动态库闭包纳入最终 App：
 
-- 验收 App：`/Users/pufei/Downloads/ctflab-app-build-spice-release-20260916/CTFLab.app`；
+- 验收 App：`/Users/pufei/Downloads/ctflab-app-build-spice-clipboard-release2-20260916/CTFLab.app`；
 - `app verify`：797 个登记文件、70 个动态库、许可证文本完整性 `True`；
 - 内置 QEMU `-display help` 含 `spice-app`，`-device help` 含 `virtserialport`；
 - `run kali-arm64 --display spice` 实际启动成功，0700 runtime 目录下 UNIX socket 建立，内置 `spicy`
@@ -85,9 +86,9 @@ CTFLAB_APP="/Users/pufei/Downloads/ctflab-app-build-spice-release-20260916/CTFLa
   `1600x1200`。
 - 该过程未由测试者手工执行 `xrandr` 设置命令；生产客户端不含测试缩放钩子。
 
-当前仍保留的边界：`--clipboard` 正向与未授权剪贴板负向、未授权客户端连接拒绝，以及 TCP 回退模式
+当前仍保留的边界：`--clipboard` 正向/未授权剪贴板负向、未授权客户端连接拒绝，以及 TCP 回退模式
 尚未完成独立 E2E。默认 Cocoa 路径不改变，也不会因为 SPICE 缺件自动回退。旧分发目录
-`/Users/pufei/Downloads/ctflab-dist-20260916/` 未修改；已另生成包含显示适配的新版目录
+旧分发目录已清理；现用包含显示适配的新版目录
 `/Users/pufei/Downloads/ctflab-dist-spice-release-20260916/`，其 `dist verify --json` 已通过 4/4，
 Kali 基盘哈希为 `974a319f596170d171e75a5ee3e0f0fd4d28439ab10373c14f0fd9348b396315`。
 
