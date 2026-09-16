@@ -60,8 +60,21 @@ $ ctflab import smoke .../basic-pentesting-2-base.qcow2 --manifest .../DISTRIBUT
 （退出码 2；未写入任何导入状态）
 ```
 
-## 3. 发现的缺陷与修复
+### 2.5 `.app` 侧复核（学生实际使用的载体）
 
+本轮功能进入 CLI 后重新构建了 `CTFLab.app`（`~/Downloads/ctflab-app-build-20260916/CTFLab.app`，
+721 个登记文件；其余与 6.3B 构建一致：内置 Python 3.12.14 + PyYAML 6.0.3、ad-hoc 签名、
+许可证文本完整），并在**最小 PATH（`/usr/bin:/bin`）+ 独立 HOME** 下用 App 启动器复核：
+
+| 步骤 | 结果 |
+|---|---|
+| `app verify` | 通过（721 文件，ad-hoc，`codesign --verify --deep --strict` 返回 0） |
+| `dist verify --dir <dist>`（App 内） | 通过（4 个文件与清单一致） |
+| `import smoke <基盘> --manifest DISTRIBUTION.json`（App 内） | 导入完成、来源校验通过并记录 |
+| 用 smoke 基盘冒充 basic-pentesting-2 导入 | 拒绝（期望 `f3fe2a8a…`、实际 `7620acab…`），退出码 2 |
+| smoke 全流程 E2E（`tools/ctflab_app_e2e.py`） | 15/15 通过（证据 JSON 见 `~/Downloads/ctflab-app-e2e-20260916/`） |
+
+## 3. 发现的缺陷与修复
 - **严格模式 compare 不适用于压缩产物**：`qemu-img compare -s` 除内容外还比较块的分配状态；
   `convert -c` 会重排分配布局，因此对任何压缩产物必然报
   `Strict mode: Offset … block status mismatch!`（实测 smoke 基盘）。修复：先 `qemu-img check`，
