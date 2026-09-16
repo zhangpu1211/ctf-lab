@@ -2,6 +2,21 @@
 
 第一阶段提供一个不依赖 UTM GUI 的 QEMU 运行器。它负责把镜像导入为只读基础镜像，启动时创建 qcow2 overlay，并让 Kali、Smoke、Basic Pentesting 2 加入同一个隔离实验网。
 
+## 0. 先选交付方式
+
+- **课堂/学生**：用打包好的 `CTFLab.app`（内置 QEMU 与 Python，不需要任何环境）+
+  课程分发目录里的压缩基盘与 `DISTRIBUTION.json`。完整步骤见
+  [基盘分发指南](ctflab-distribution-guide.md)；首次打开 App 需在“系统设置 → 隐私与安全性”
+  手动放行一次（本地 ad-hoc 构建，未做 Developer ID 公证）。
+- **开发/本机维护**：按下文从源码运行。
+
+```bash
+# 学生侧（拿到分发目录后）
+shasum -a 256 -c SHA256SUMS
+CTFLab.app/Contents/MacOS/CTFLab import kali-arm64 kali-arm64-base.qcow2 --manifest DISTRIBUTION.json
+CTFLab.app/Contents/MacOS/CTFLab run kali-arm64
+```
+
 ## 1. 检查环境
 
 ```bash
@@ -18,6 +33,18 @@ cd /path/to/ctf-lab
 ./tools/ctflab import smoke /path/to/Smoke/smoke.qcow2
 ./tools/ctflab import basic-pentesting-2 /path/to/basic_pentesting_2/basic_pentesting_2-disk001.vmdk
 ```
+
+拿到的文件附有分发清单时，导入会强制核对来源哈希（不一致拒绝导入），并自动套用配套的
+UEFI NVRAM 模板：
+
+```bash
+./tools/ctflab import kali-arm64 kali-arm64-base.qcow2 --manifest DISTRIBUTION.json
+./tools/ctflab import smoke smoke-base.qcow2 --expect-sha256 <sha256>
+./tools/ctflab import kali-arm64 kali-arm64-base.qcow2 --nvram kali-arm64-uefi-vars.fd
+```
+
+校验结果写入 `~/Library/Application Support/CTFLab/images/<id>/image.json` 的
+`source_verification` 字段；重复导入同一文件是幂等的，不会覆盖已验证的基盘。
 
 基础镜像保存在 `~/Library/Application Support/CTFLab/images/`，不会覆盖源文件。VMDK、QCOW2 和 OVA 均会先经 `qemu-img` 转成独立 QCOW2。
 

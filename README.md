@@ -15,13 +15,27 @@ CTFLab 是面向 Apple Silicon Mac 的本地虚拟靶场运行器。它使用 QE
 - Kali 默认隔离运行；独占联网维护模式可补装软件，并禁止同时启动脆弱靶机；
 - 不覆盖原始镜像，运行时写入独立 QCOW2 overlay；
 - 跨进程文件锁保护导入、启动、停止、重置和候选配置生成，避免多终端竞争；
-- 回环 TCP 二层交换机提供固定 DHCP、MAC 学习、逐连接限速和可选 PCAP，默认不把脆弱靶机接入物理局域网。
+- 回环 TCP 二层交换机提供固定 DHCP、MAC 学习、逐连接限速和可选 PCAP，默认不把脆弱靶机接入物理局域网；
+- `CTFLab.app` 自带受控 QEMU 与 Python 运行时（含 PyYAML），目标机器无需安装任何环境；
+- 基盘分发链（路线 A）：`dist prepare/verify` 生成 zstd 压缩基盘、`DISTRIBUTION.json`、`SHA256SUMS`
+  与分发说明；`import --manifest/--expect-sha256` 强制核对下载文件哈希并把校验证据写入导入记录。
 
 ## 快速开始
 
 **用打包好的 `.app`（推荐给使用靶场的人）**：`CTFLab.app` 已内置受控 QEMU 与 Python 运行时
 （含 PyYAML），目标机器**不需要**安装 Python、pip 或 Homebrew QEMU。拿到 app 后首次打开需在
 “系统设置 → 隐私与安全性”手动放行一次（当前为本地 ad-hoc 构建，未做 Developer ID 公证）。
+
+**学生拿到课程分发目录后**（基盘 + 清单，见[分发指南](docs/ctflab-distribution-guide.md)）：
+
+```bash
+shasum -a 256 -c SHA256SUMS                     # 1) 校验下载完整性
+ctflab import kali-arm64 kali-arm64-base.qcow2 --manifest DISTRIBUTION.json
+                                                # 2) 清单自动核对哈希并套用配套 NVRAM 模板
+ctflab run kali-arm64                           # 3) 启动
+```
+
+哈希不一致时导入会直接失败并打印期望值与实际值：重新下载，不要绕过校验。
 
 **从源码运行（开发用）**：环境要求 macOS Apple Silicon、Python 3.10+、PyYAML、Homebrew QEMU。
 推荐安装 Tesseract 以自动区分登录界面、UEFI Shell、内核错误和无启动盘；未安装时会安全降级为人工复核。
