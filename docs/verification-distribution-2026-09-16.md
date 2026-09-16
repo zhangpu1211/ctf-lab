@@ -14,9 +14,11 @@
 - **发现并修复 1 个缺陷**：压缩产物的内容校验最初用 `qemu-img compare -s`（严格模式），
   它对压缩后重排的块分配布局报 `block status mismatch` 误报；改为"容量显式核对 +
   非严格 `qemu-img compare`（宾客可见内容）"，并加单元测试锁定语义（见 §3）。
-- **未验证/后续任务**：学生侧大文件下载体验（网盘限速、分卷重组）未实测；断点续传与镜像
-  缓存未实现；VulnHub 靶盘的再分发条款未逐个确认；Kali 的压缩基盘未再跑一遍完整 E2E
-  （内容等价由 `qemu-img compare` 证明，Kali E2E 29/29 见 6.3B 记录）。
+- **已验证**：最终分发目录中的三个压缩基盘与 NVRAM 已通过 App 侧目录复核，并按 `--manifest`
+  完成 Kali ARM64 + UEFI 29/29 端到端验收；证据见
+  `/Users/pufei/Downloads/ctflab-dist-e2e-20260916/kali-e2e-evidence.json`。
+- **未验证/后续任务**：学生侧大文件下载体验（网盘限速、分卷重组）未实测；断点续传与镜像缓存未实现；
+  VulnHub 靶盘的再分发条款未逐个确认。
 
 ## 1. 交付物
 
@@ -73,6 +75,7 @@ $ ctflab import smoke .../basic-pentesting-2-base.qcow2 --manifest .../DISTRIBUT
 | `import smoke <基盘> --manifest DISTRIBUTION.json`（App 内） | 导入完成、来源校验通过并记录 |
 | 用 smoke 基盘冒充 basic-pentesting-2 导入 | 拒绝（期望 `f3fe2a8a…`、实际 `7620acab…`），退出码 2 |
 | smoke 全流程 E2E（`tools/ctflab_app_e2e.py`） | 15/15 通过（证据 JSON 见 `~/Downloads/ctflab-app-e2e-20260916/`） |
+| 最终分发目录 Kali 全流程 E2E（`tools/ctflab_app_kali_e2e.py --distribution-dir`） | 29/29 通过（证据 JSON 见 `~/Downloads/ctflab-dist-e2e-20260916/`） |
 
 ## 3. 发现的缺陷与修复
 - **严格模式 compare 不适用于压缩产物**：`qemu-img compare -s` 除内容外还比较块的分配状态；
@@ -84,11 +87,9 @@ $ ctflab import smoke .../basic-pentesting-2-base.qcow2 --manifest .../DISTRIBUT
 
 ## 4. 范围与限制（不得跨类宣称）
 
-- **下载体验未验证**：本机是文件系统拷贝，网盘限速、断点续传、分卷重组的真实体验未测试；
-  指南给出分卷方案（`split` + 重组后重新校验），但本期不宣称"学生下载一次必成功"。
-- **Kali 压缩基盘未跑完整 E2E**：内容等价由 `qemu-img compare` 证明；Kali ARM64 + UEFI 的
-  29/29 验收是在未压缩基盘上完成的（6.3B 记录）。导入路径（`--manifest` + 自动 NVRAM 模板）
-  在 smoke 上真实跑通、NVRAM 附加与校验由单元测试覆盖。
+- **真实下载体验未验证**：本次 29/29 使用最终分发目录的本地文件，已覆盖三个压缩基盘、NVRAM
+  自动附加、清单导入和完整 Kali 主流程；但没有模拟网盘限速、上传/下载损坏、分卷重组或断点续传，
+  因此不宣称“学生下载一次必成功”。
 - **第三方镜像条款**：VulnHub 等靶盘能否随课程资料区再分发，需逐个确认；指南给出"改为学生
   自行下载 + `--expect-sha256`"的替代路径。
 - **未实现**：断点续传、镜像缓存、内容索引签名（Phase 4 其余项）。
@@ -105,4 +106,7 @@ python3 tools/ctflab.py dist verify --dir <dist>
 
 python3 tools/ctflab.py --state-dir <fresh> import smoke <dist>/smoke-base.qcow2 \
   --manifest <dist>/DISTRIBUTION.json
+
+python3 tools/ctflab_app_kali_e2e.py --app <app>/CTFLab.app \
+  --distribution-dir <dist> --workdir <e2e-dir> --password <口令>
 ```

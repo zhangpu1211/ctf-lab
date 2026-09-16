@@ -38,6 +38,7 @@ sys.path.insert(0, str(TOOLS_DIR))
 
 import ctflab  # noqa: E402
 import ctflab_app  # noqa: E402
+import ctflab_dist  # noqa: E402
 
 HOST_STATE_DIR = pathlib.Path.home() / "Library" / "Application Support" / "CTFLab"
 MINIMAL_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
@@ -254,6 +255,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="CTFLab Task 6.3A：.app 的 Kali ARM64+UEFI 验收")
     parser.add_argument("--app", type=pathlib.Path, required=True, help="CTFLab.app 路径")
     parser.add_argument("--workdir", type=pathlib.Path, help="工作目录（默认临时目录，保留证据）")
+    parser.add_argument("--distribution-dir", type=pathlib.Path,
+                        help="最终分发目录；校验清单后使用其中的三个压缩基盘与 Kali NVRAM")
     parser.add_argument("--password", help="kali 来宾 SSH 口令（默认从环境变量 CTFLAB_KALI_PASSWORD 读取）")
     parser.add_argument("--boot-timeout", type=int, default=420, help="等待 Kali 登录界面的秒数")
     parser.add_argument("--timeout", type=int, default=900, help="单步超时秒数")
@@ -266,6 +269,8 @@ def main(argv: list[str] | None = None) -> int:
     home.mkdir(exist_ok=True)
     state_dir = workdir / "state"
     app = pathlib.Path(args.app).expanduser().resolve()
+    distribution_dir = (args.distribution_dir.expanduser().resolve()
+                        if args.distribution_dir else None)
     launcher = app / ctflab_app.LAUNCHER_REL
     evidence_path = workdir / "kali-e2e-evidence.json"
     password = args.password or os.environ.get("CTFLAB_KALI_PASSWORD", "")
@@ -299,6 +304,7 @@ def main(argv: list[str] | None = None) -> int:
             "generated_at": ctflab_app.now_iso(),
             "app": str(app),
             "workdir": str(workdir),
+            "distribution_dir": str(distribution_dir) if distribution_dir else None,
             "minimal_path": MINIMAL_PATH,
             "steps": recorder.steps,
             "result": "失败" if recorder.failed else "通过",
@@ -410,70 +416,154 @@ def main(argv: list[str] | None = None) -> int:
     if not sandbox_ok:
         return finish()
 
-    # --- 4. 复用经哈希验证的 kali 基盘与原始 RAW NVRAM（副本） ---
-    host_image_state = HOST_STATE_DIR / "images" / "kali-arm64" / "image.json"
-    if not host_image_state.is_file():
-        recorder.record("asset-source", "失败", f"未找到真实 kali 导入记录：{host_image_state}")
-        return finish()
-    host_state = json.loads(host_image_state.read_text(encoding="utf-8"))
-    host_base = pathlib.Path(str(host_state.get("base_path", "")))
-    host_raw = pathlib.Path(str(host_state.get("uefi_vars_path", "")))
-    host_base_sha = sha256(host_base)
-    host_raw_sha = sha256(host_raw)
-    recorded_base = str(host_state.get("base_sha256", ""))
-    recorded_raw = str(host_state.get("uefi_vars_sha256", ""))
-    assets_ok = (host_base_sha == recorded_base and host_raw_sha == recorded_raw)
-    recorder.record("asset-baseline", "通过" if assets_ok else "失败",
-                    f"基盘 {host_base.name} {host_base_sha[:12]}…；RAW NVRAM {host_raw.name} "
-                    f"{host_raw_sha[:12]}…；与登记值{'一致' if assets_ok else '不一致'}",
-                    base_path=str(host_base), base_sha256=host_base_sha,
-                    raw_path=str(host_raw), raw_sha256=host_raw_sha)
-    if not assets_ok:
-        return finish()
+    # --- 4. 选择经哈希验证的来源：最终分发目录，或本机已登记基盘（副本） ---
+    distribution_manifest_path: pathlib.Path | None = None
+    distribution_entries: dict[tuple[str, str], dict] = {}
+    distribution_verify: dict | None = None
+    if distribution_dir is not None:
+        # 先由 App 内 CLI 复核目录，再由本脚本读取清单选择文件；两层校验避免把
+        # “清单存在”误当成“清单登记的实际文件未被替换”。源文件始终只读使用，不复制 8GB 基盘。
+        distribution_manifest_path = distribution_dir / ctflab_dist.MANIFEST_NAME
+        try:
+            distribution_manifest = ctflab_dist.load_manifest(distribution_dir)
+            distribution_verify = run(ctflab_cmd("dist", "verify", "--dir", str(distribution_dir)),
+                                      env=env, timeout=args.timeout)
+            local_verify = ctflab_dist.verify_distribution(distribution_dir)
+            distribution_entries = {
+                (str(entry.get("profile")), str(entry.get("role"))): entry
+                for entry in distribution_manifest.get("entries", [])
+            }
+            required = [(profile_id, ctflab_dist.BASE_ROLE)
+                        for profile_id in ("kali-arm64", "smoke", "basic-pentesting-2")]
+            required.append(("kali-arm64", ctflab_dist.NVRAM_ROLE))
+            entries_ok = all(key in distribution_entries for key in required)
+            app_verify_ok = distribution_verify["returncode"] == 0
+            if not (local_verify["ok"] and app_verify_ok and entries_ok):
+                recorder.record(
+                    "asset-baseline", "失败",
+                    "最终分发目录校验失败，或缺少三个基盘/NVRAM 条目；未开始来宾启动验收",
+                    distribution_verify=distribution_verify,
+                    local_verify=local_verify,
+                    required_entries=required,
+                )
+                return finish()
+        except (ctflab_dist.DistError, OSError, ValueError, KeyError) as exc:
+            recorder.record("asset-baseline", "失败", f"最终分发目录无法复核：{exc}",
+                            distribution_verify=distribution_verify)
+            return finish()
 
-    local_base = workdir / host_base.name
-    local_raw = workdir / host_raw.name
-    if not local_base.exists():
-        shutil.copy2(host_base, local_base)
-    if not local_raw.exists():
-        shutil.copy2(host_raw, local_raw)
-    copies_ok = sha256(local_base) == host_base_sha and sha256(local_raw) == host_raw_sha
-    recorder.record("asset-copies", "通过" if copies_ok else "失败",
-                    "基盘与 RAW NVRAM 副本哈希与原始一致")
-    if not copies_ok:
-        return finish()
+        def distribution_path(profile_id: str, role: str) -> tuple[pathlib.Path, dict]:
+            entry = distribution_entries[(profile_id, role)]
+            path = distribution_dir / str(entry["file"])
+            return path, entry
 
-    import_result = run(ctflab_cmd("import", "kali-arm64", str(local_base)), env=env, timeout=args.timeout)
+        host_base, base_entry = distribution_path("kali-arm64", ctflab_dist.BASE_ROLE)
+        host_raw, raw_entry = distribution_path("kali-arm64", ctflab_dist.NVRAM_ROLE)
+        host_base_sha = sha256(host_base)
+        host_raw_sha = sha256(host_raw)
+        recorded_base = str(base_entry["sha256"])
+        recorded_raw = str(raw_entry["sha256"])
+        assets_ok = (host_base_sha == recorded_base and host_raw_sha == recorded_raw)
+        recorder.record(
+            "asset-baseline", "通过" if assets_ok else "失败",
+            f"分发清单基盘 {host_base.name} {host_base_sha[:12]}…；NVRAM {host_raw.name} "
+            f"{host_raw_sha[:12]}…；与清单{'一致' if assets_ok else '不一致'}",
+            base_path=str(host_base), base_sha256=host_base_sha,
+            raw_path=str(host_raw), raw_sha256=host_raw_sha,
+            distribution_manifest=str(distribution_manifest_path),
+            app_distribution_verify=distribution_verify,
+        )
+        if not assets_ok:
+            return finish()
+        # 分发文件已在其目录中完成全量哈希校验，保持只读，不再复制大型 qcow2。
+        local_base, local_raw = host_base, host_raw
+        copies_ok = sha256(local_base) == host_base_sha and sha256(local_raw) == host_raw_sha
+        recorder.record("asset-copies", "通过" if copies_ok else "失败",
+                        "分发基盘与 NVRAM 留在只读目录，哈希与清单一致")
+        if not copies_ok:
+            return finish()
+    else:
+        host_image_state = HOST_STATE_DIR / "images" / "kali-arm64" / "image.json"
+        if not host_image_state.is_file():
+            recorder.record("asset-source", "失败", f"未找到真实 kali 导入记录：{host_image_state}")
+            return finish()
+        host_state = json.loads(host_image_state.read_text(encoding="utf-8"))
+        host_base = pathlib.Path(str(host_state.get("base_path", "")))
+        host_raw = pathlib.Path(str(host_state.get("uefi_vars_path", "")))
+        host_base_sha = sha256(host_base)
+        host_raw_sha = sha256(host_raw)
+        recorded_base = str(host_state.get("base_sha256", ""))
+        recorded_raw = str(host_state.get("uefi_vars_sha256", ""))
+        assets_ok = (host_base_sha == recorded_base and host_raw_sha == recorded_raw)
+        recorder.record("asset-baseline", "通过" if assets_ok else "失败",
+                        f"基盘 {host_base.name} {host_base_sha[:12]}…；RAW NVRAM {host_raw.name} "
+                        f"{host_raw_sha[:12]}…；与登记值{'一致' if assets_ok else '不一致'}",
+                        base_path=str(host_base), base_sha256=host_base_sha,
+                        raw_path=str(host_raw), raw_sha256=host_raw_sha)
+        if not assets_ok:
+            return finish()
+
+        local_base = workdir / host_base.name
+        local_raw = workdir / host_raw.name
+        if not local_base.exists():
+            shutil.copy2(host_base, local_base)
+        if not local_raw.exists():
+            shutil.copy2(host_raw, local_raw)
+        copies_ok = sha256(local_base) == host_base_sha and sha256(local_raw) == host_raw_sha
+        recorder.record("asset-copies", "通过" if copies_ok else "失败",
+                        "基盘与 RAW NVRAM 副本哈希与原始一致")
+        if not copies_ok:
+            return finish()
+
+    kali_import_args = ["import", "kali-arm64", str(local_base)]
+    if distribution_manifest_path is not None:
+        kali_import_args += ["--manifest", str(distribution_manifest_path)]
+    import_result = run(ctflab_cmd(*kali_import_args), env=env, timeout=args.timeout)
     if import_result["returncode"] != 0:
         recorder.record("import", "失败", "导入失败", evidence=import_result)
         return finish()
-    # 按 install/finalize-install 的登记形状补上 NVRAM 来源（指向 RAW 副本），
-    # 使 ensure_uefi_vars 以原始 RAW 为模板派生实例 NVRAM。
-    image_json = state_dir / "images" / "kali-arm64" / "image.json"
-    image_state = json.loads(image_json.read_text(encoding="utf-8"))
-    image_state["uefi_vars_path"] = str(local_raw)
-    image_state["uefi_vars_sha256"] = host_raw_sha
-    image_json.write_text(json.dumps(image_state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    if distribution_manifest_path is None:
+        # 旧路径没有分发清单，按 install/finalize-install 的登记形状补上 NVRAM 来源；
+        # 分发路径则由 --manifest 自动登记，避免验收脚本绕开学生实际导入链。
+        image_json = state_dir / "images" / "kali-arm64" / "image.json"
+        image_state = json.loads(image_json.read_text(encoding="utf-8"))
+        image_state["uefi_vars_path"] = str(local_raw)
+        image_state["uefi_vars_sha256"] = host_raw_sha
+        image_json.write_text(json.dumps(image_state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    nvram_detail = ("NVRAM 模板由 --manifest 自动附加（来源为分发目录）"
+                    if distribution_manifest_path is not None
+                    else "NVRAM 模板指向原始 RAW 副本")
     recorder.record("import", "通过",
                     f"已导入 {local_base.name}（base_sha256 {sha256(local_base)[:12]}…）；"
-                    "NVRAM 模板指向原始 RAW 副本", evidence=import_result)
+                    f"{nvram_detail}", evidence=import_result)
 
     # 靶机同样从宿主经哈希验证的基盘副本导入（隔离网连通性验证需要它们运行）
     for target_id in ("smoke", "basic-pentesting-2"):
-        target_state_path = HOST_STATE_DIR / "images" / target_id / "image.json"
-        if not target_state_path.is_file():
-            recorder.record(f"import-{target_id}", "失败", f"未找到真实导入记录：{target_state_path}")
-            return finish()
-        target_state = json.loads(target_state_path.read_text(encoding="utf-8"))
-        target_base = pathlib.Path(str(target_state.get("base_path", "")))
-        target_sha = sha256(target_base)
-        if target_sha != str(target_state.get("base_sha256", "")):
-            recorder.record(f"import-{target_id}", "失败", "宿主基盘哈希与登记值不一致")
-            return finish()
-        local_target = workdir / target_base.name
-        if not local_target.exists():
-            shutil.copy2(target_base, local_target)
-        result = run(ctflab_cmd("import", target_id, str(local_target)), env=env, timeout=args.timeout)
+        if distribution_manifest_path is not None:
+            target_base, target_entry = distribution_path(target_id, ctflab_dist.BASE_ROLE)
+            target_sha = sha256(target_base)
+            if target_sha != str(target_entry["sha256"]):
+                recorder.record(f"import-{target_id}", "失败", "分发基盘哈希与清单不一致")
+                return finish()
+            local_target = target_base
+            target_import_args = ["import", target_id, str(local_target),
+                                  "--manifest", str(distribution_manifest_path)]
+        else:
+            target_state_path = HOST_STATE_DIR / "images" / target_id / "image.json"
+            if not target_state_path.is_file():
+                recorder.record(f"import-{target_id}", "失败", f"未找到真实导入记录：{target_state_path}")
+                return finish()
+            target_state = json.loads(target_state_path.read_text(encoding="utf-8"))
+            target_base = pathlib.Path(str(target_state.get("base_path", "")))
+            target_sha = sha256(target_base)
+            if target_sha != str(target_state.get("base_sha256", "")):
+                recorder.record(f"import-{target_id}", "失败", "宿主基盘哈希与登记值不一致")
+                return finish()
+            local_target = workdir / target_base.name
+            if not local_target.exists():
+                shutil.copy2(target_base, local_target)
+            target_import_args = ["import", target_id, str(local_target)]
+        result = run(ctflab_cmd(*target_import_args), env=env, timeout=args.timeout)
         recorder.record(f"import-{target_id}", "通过" if result["returncode"] == 0 else "失败",
                         f"{target_base.name} {target_sha[:12]}…", evidence=result)
         if result["returncode"] != 0:

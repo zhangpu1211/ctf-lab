@@ -69,6 +69,7 @@ python3 -m py_compile tools/ctflab.py tools/ctflab_inspect.py tools/ctflab_netwo
 ## 文档
 
 - [第一阶段快速使用](docs/ctflab-phase1-quickstart.md)
+- [学生分发版使用教程：校验、导入、启动与重置](docs/ctflab-student-distribution-tutorial.md)
 - [完整实施计划与路线图](docs/ctflab-mac-mvp-implementation-plan.md)
 - [动态分辨率设计：UTM 导出与 SPICE 路径对比（Smoke/Basic 的 x86_64 固定显示、静态控制台 E2E 已在限定范围内通过；动态分辨率仍不稳定；路径 B 未实现）](docs/ctflab-dynamic-resolution-design.md)
 - [2026-09-06 Mac M 回归验证](docs/verification-2026-09-06.md)

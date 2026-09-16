@@ -163,10 +163,10 @@ class PlanAcceptanceTests(unittest.TestCase):
         self.assertTrue(line.startswith("- [ ]"), line)
         self.assertEqual(primary_status(line), "未验证")
 
-    def test_clean_environment_install_is_not_passed(self) -> None:
+    def test_clean_environment_delivery_is_partial(self) -> None:
         line = find_all_lines(plan_acceptance_section(), "干净的 Mac M 用户环境")[0]
         self.assertTrue(line.startswith("- [ ]"), line)
-        self.assertEqual(primary_status(line), "后续任务")
+        self.assertEqual(primary_status(line), "部分验证")
         self.assertIn("Task 6", line)
 
     def test_task3_dynamic_resolution_item_is_unchecked(self) -> None:
