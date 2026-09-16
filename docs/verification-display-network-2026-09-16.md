@@ -94,7 +94,7 @@ Kali 基盘哈希为 `974a319f596170d171e75a5ee3e0f0fd4d28439ab10373c14f0fd9348b
 
 ## 4. 回归
 
-- 最终完整回归：`python3 -m unittest discover -s tools/tests -q`，输出 `Ran 359 tests ... OK (skipped=5)`；即 354 项实际执行通过、5 项按历史 UTM 交付目录缺失规则跳过。负向口令用例输出的 `FAIL guest-password` 是预期失败样本，不是 unittest 失败；
+- 最终完整回归：`python3 -m unittest discover -s tools/tests -q`，输出 `Ran 360 tests ... OK (skipped=5)`；即 355 项实际执行通过、5 项按历史 UTM 交付目录缺失规则跳过。负向口令用例输出的 `FAIL guest-password` 是预期失败样本，不是 unittest 失败；
 - `python3 -m py_compile tools/ctflab.py tools/ctflab_app.py tools/ctflab_dist.py`：通过；
 - Swift 核心测试：通过；
 - 定向 CLI/GUI/安装器测试：通过；
