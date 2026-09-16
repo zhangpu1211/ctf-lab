@@ -1,6 +1,7 @@
 # 当前 Git 仓库只同步 CTFLab 本身；同目录中的课程题库、成绩表、报告和缓存不入库。
 /*
 !/.gitignore
+!/AGENTS.md
 !/README.md
 !/LICENSE
 !/docs/
