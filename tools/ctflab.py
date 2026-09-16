@@ -50,6 +50,7 @@ CTFLAB_VERSION = "0.1.0"
 MIN_PYTHON = (3, 10)
 QEMU_X86_NAMES = ("qemu-system-x86_64",)
 QEMU_ARM_NAMES = ("qemu-system-aarch64",)
+SPICE_CLIENT_NAMES = ("remote-viewer", "spicy")
 PROFILE_ALIASES = {"kali": "kali-arm64"}
 NETWORK_SCRIPT = PROJECT_ROOT / "tools" / "ctflab_network.py"
 KALI_SETUP_SCRIPT = PROJECT_ROOT / "tools" / "guest_fixes" / "kali-arm64" / "configure.sh"
@@ -123,6 +124,28 @@ def which_any(names: Iterable[str]) -> str | None:
         if path:
             return path
     return None
+
+
+def spice_client_path() -> str | None:
+    """查找受控 SPICE 客户端；不把任意外部命令或参数透传给 QEMU。
+
+    `CTFLAB_SPICE_CLIENT` 只用于本机开发/验收时指定已审计的客户端路径；分发包应把
+    客户端放进自己的 runtime/bin 后再由这里解析。没有客户端时，显式 spice 请求必须
+    在启动 QEMU 前失败，不能退回 Cocoa。
+    """
+    override = os.environ.get("CTFLAB_SPICE_CLIENT")
+    if override:
+        candidate = Path(override).expanduser()
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+    root = runtime_root()
+    if root is not None:
+        for name in SPICE_CLIENT_NAMES:
+            candidate = root / "bin" / name
+            if candidate.is_file() and os.access(candidate, os.X_OK):
+                return str(candidate)
+        return None
+    return shutil.which(SPICE_CLIENT_NAMES[0]) or shutil.which(SPICE_CLIENT_NAMES[1])
 
 
 def sha256_file(path: Path, chunk_size: int = 8 * 1024 * 1024) -> str:
@@ -1596,7 +1619,108 @@ class LabManager:
         profile = load_profile(profile_id)
         return leases.get(profile.get("network", {}).get("mac"))
 
-    def qemu_command(self, profile_id: str, profile: dict[str, Any], overlay: Path, lab_port: int, headless: bool, allow_internet: bool = False, clipboard: bool = False) -> tuple[list[str], dict[str, int]]:
+    @staticmethod
+    def probe_spice(qemu: str) -> dict[str, Any]:
+        """探测当前 QEMU 是否具备路径 B 所需的 SPICE 能力。
+
+        `-display help` 负责显示后端；`-device help` 负责 virtio-serialport；最后用
+        一个暂停的最小实例验证 `spicevmc` chardev。探测只读取帮助/启动参数，不运行
+        来宾，也不创建持久状态。结果故意保留错误文本，供 CLI 给出可操作的失败原因。
+        """
+        result: dict[str, Any] = {
+            "qemu": qemu,
+            "spice_display": False,
+            "spicevmc": False,
+            "virtserialport": False,
+            "client": bool(spice_client_path()),
+            "errors": [],
+        }
+        try:
+            display = subprocess.run([qemu, "-display", "help"], check=False,
+                                     capture_output=True, text=True, timeout=5)
+            display_text = f"{display.stdout}\n{display.stderr}"
+            # QEMU 11.x 在 Cocoa 构建中把本机 SPICE 图形后端列为
+            # `spice-app`；它仍然提供 `-spice unix=...` 服务端，因此不能只匹配
+            # 旧版本曾使用的单独 `spice` 行。
+            result["spice_display"] = bool(re.search(r"(?mi)^\s*spice(?:-app)?\s*$", display_text))
+            if display.returncode != 0 and not result["spice_display"]:
+                result["errors"].append(f"-display help 退出码 {display.returncode}")
+        except (OSError, subprocess.SubprocessError) as exc:
+            result["errors"].append(f"无法执行 -display help：{exc}")
+
+        try:
+            devices = subprocess.run([qemu, "-device", "help"], check=False,
+                                     capture_output=True, text=True, timeout=5)
+            device_text = f"{devices.stdout}\n{devices.stderr}"
+            result["virtserialport"] = "virtserialport" in device_text
+        except (OSError, subprocess.SubprocessError) as exc:
+            result["errors"].append(f"无法执行 -device help：{exc}")
+
+        with tempfile.TemporaryDirectory(prefix="ctflab-spice-probe-") as directory:
+            socket_path = Path(directory) / "probe.sock"
+            probe_command = [
+                qemu, "-machine", "virt", "-nodefaults", "-display", "none", "-S",
+                # QEMU 11.x 把 UNIX transport 拆成 `unix=on` + `addr=PATH`；
+                # `unix=PATH` 会被解释为布尔值并在真正启动时失败。
+                "-spice", f"unix=on,addr={socket_path},disable-ticketing=on",
+                "-device", "virtio-serial-pci",
+                "-chardev", "spicevmc,id=ctflab_probe,name=vdagent",
+                "-device", "virtserialport,chardev=ctflab_probe,name=com.redhat.spice.0",
+            ]
+            try:
+                spice = subprocess.run(probe_command, check=False, capture_output=True,
+                                       text=True, timeout=1.5)
+                spice_text = f"{spice.stdout}\n{spice.stderr}"
+                result["spicevmc"] = (
+                    "not a valid char driver" not in spice_text
+                    and "invalid option" not in spice_text
+                    and "unknown option" not in spice_text
+                )
+                if not result["spicevmc"]:
+                    result["errors"].append("-chardev spicevmc 不可用")
+            except subprocess.TimeoutExpired:
+                # `-S` 使合法命令保持运行；超时本身就是“参数被接受”的证据。
+                result["spicevmc"] = True
+            except (OSError, subprocess.SubprocessError) as exc:
+                result["errors"].append(f"无法验证 spicevmc：{exc}")
+        result["supported"] = all(result[key] for key in
+                                   ("spice_display", "spicevmc", "virtserialport", "client"))
+        return result
+
+    @staticmethod
+    def spice_capability_error(capabilities: dict[str, Any]) -> CTFLabError:
+        missing = [label for key, label in (
+            ("spice_display", "QEMU spice 显示后端"),
+            ("spicevmc", "spicevmc chardev"),
+            ("virtserialport", "virtserialport 设备"),
+            ("client", "本地 SPICE 客户端（remote-viewer 或 spicy）"),
+        ) if not capabilities.get(key)]
+        detail = "；".join(capabilities.get("errors", []))
+        suffix = f"（{detail}）" if detail else ""
+        return CTFLabError(
+            "SPICE 动态分辨率未就绪：缺少 " + "、".join(missing) + suffix
+            + "。请安装/内置经过验证的 SPICE QEMU 与客户端；不会自动回退 Cocoa。"
+        )
+
+    def _spice_socket(self, profile_id: str) -> Path:
+        """返回 0700 runtime 目录内的本次 SPICE UNIX socket 路径。"""
+        directory = self.runtime_dir / profile_id / "spice"
+        directory.mkdir(parents=True, exist_ok=True)
+        os.chmod(directory, 0o700)
+        socket_path = directory / "display.sock"
+        if socket_path.exists() or socket_path.is_symlink():
+            if socket_path.is_dir():
+                raise CTFLabError(f"SPICE socket 路径被目录占用：{socket_path}")
+            socket_path.unlink()
+        return socket_path
+
+    def qemu_command(self, profile_id: str, profile: dict[str, Any], overlay: Path, lab_port: int,
+                     headless: bool, allow_internet: bool = False, clipboard: bool = False,
+                     display: str = "cocoa") -> tuple[list[str], dict[str, int]]:
+        if display not in {"cocoa", "spice"}:
+            raise CTFLabError(f"不支持的显示后端：{display}（可选 cocoa 或 spice）。")
+        if display == "spice" and (profile_id != "kali-arm64" or headless):
+            raise CTFLabError("SPICE 动态分辨率仅支持 Kali 图形模式。")
         if clipboard and (profile_id != "kali-arm64" or headless):
             raise CTFLabError("剪贴板仅支持 Kali 图形模式。")
         guest = profile.get("guest", {})
@@ -1669,6 +1793,13 @@ class LabManager:
             command += ["-vga", "std"]
             primary_adapter = str(network.get("adapter", "e1000"))
 
+        spice_socket: Path | None = None
+        if display == "spice":
+            capabilities = self.probe_spice(qemu)
+            if not capabilities.get("supported"):
+                raise self.spice_capability_error(capabilities)
+            spice_socket = self._spice_socket(profile_id)
+
         command += ["-net", "none"]
         host_forwards: dict[str, int] = {}
         forwards = network.get("host_forwards", []) or []
@@ -1694,11 +1825,23 @@ class LabManager:
             "-device", f"e1000,netdev=mgmt,mac={self.management_mac(profile_id)}",
             "-no-reboot",
         ]
-        if headless:
+        if display == "spice":
+            # UNIX socket + 0700 runtime 目录是本机鉴权边界；不开放 TCP，也不把 ticket
+            # 写入命令行或状态文件。SPICE agent transport 始终存在，剪贴板只由显式开关控制。
+            copy_paste = "off" if clipboard else "on"
+            command += [
+                "-display", "none",
+                # 与最小能力探测保持同一套 QEMU 11.x 参数格式。
+                "-spice", f"unix=on,addr={spice_socket},disable-ticketing=on,disable-copy-paste={copy_paste},disable-agent-file-xfer=on",
+                "-device", "virtio-serial-pci",
+                "-chardev", "spicevmc,id=ctflab_spice_agent,name=vdagent",
+                "-device", "virtserialport,chardev=ctflab_spice_agent,name=com.redhat.spice.0",
+            ]
+        elif headless:
             command += ["-display", "none", "-serial", "mon:stdio"]
         else:
             command += ["-display", "cocoa,zoom-to-fit=on"]
-        if clipboard:
+        if clipboard and display != "spice":
             command += [
                 "-device", "virtio-serial-pci",
                 "-chardev", "qemu-vdagent,id=ctflab_clipboard,clipboard=on,mouse=off",
@@ -1710,23 +1853,48 @@ class LabManager:
         command += ["-qmp", f"unix:{qmp_path},server=on,wait=off"]
         return command, host_forwards
 
-    def run(self, profile_ids: list[str], headless: bool = False, pcap: bool = False, allow_internet: bool = False, clipboard: bool = False, profile_overrides: dict[str, dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+    def run(self, profile_ids: list[str], headless: bool = False, pcap: bool = False,
+            allow_internet: bool = False, clipboard: bool = False,
+            display: str = "cocoa",
+            profile_overrides: dict[str, dict[str, Any]] | None = None) -> list[dict[str, Any]]:
         with self.operation_lock("启动 " + ",".join(profile_ids)):
-            return self._run_unlocked(profile_ids, headless=headless, pcap=pcap, allow_internet=allow_internet, clipboard=clipboard, profile_overrides=profile_overrides)
+            return self._run_unlocked(profile_ids, headless=headless, pcap=pcap,
+                                      allow_internet=allow_internet, clipboard=clipboard,
+                                      display=display, profile_overrides=profile_overrides)
 
-    def _run_unlocked(self, profile_ids: list[str], headless: bool = False, pcap: bool = False, allow_internet: bool = False, clipboard: bool = False, profile_overrides: dict[str, dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+    def _run_unlocked(self, profile_ids: list[str], headless: bool = False, pcap: bool = False,
+                      allow_internet: bool = False, clipboard: bool = False,
+                      display: str = "cocoa",
+                      profile_overrides: dict[str, dict[str, Any]] | None = None) -> list[dict[str, Any]]:
         profile_overrides = profile_overrides or {}
         profile_ids = list(dict.fromkeys(PROFILE_ALIASES.get(profile_id, profile_id) for profile_id in profile_ids))
+        if display not in {"cocoa", "spice"}:
+            raise CTFLabError(f"不支持的显示后端：{display}（可选 cocoa 或 spice）。")
+        if display == "spice" and profile_ids != ["kali-arm64"]:
+            raise CTFLabError("--display spice 只能单独启动 kali-arm64。")
+        if display == "spice" and headless:
+            raise CTFLabError("--display spice 不能与 --headless 同时使用。")
         if clipboard and (headless or "kali-arm64" not in profile_ids):
             raise CTFLabError("--clipboard 需要启动 Kali 图形窗口。")
         if allow_internet and profile_ids != ["kali-arm64"]:
             raise CTFLabError("--internet 只能单独启动 kali-arm64。")
         for profile_id in profile_ids:
             load_profile(profile_id)
+        if display == "spice":
+            # 预检必须发生在创建实验网交换机和 overlay 之前；显式 SPICE 缺件不能留下
+            # “虚拟机没启动但网络还在”的半完成状态。
+            qemu = which_any(QEMU_ARM_NAMES)
+            if not qemu:
+                raise CTFLabError("未找到 qemu-system-aarch64，无法启动 SPICE 动态分辨率。")
+            capabilities = self.probe_spice(qemu)
+            if not capabilities.get("supported"):
+                raise self.spice_capability_error(capabilities)
         running = self.running_states()
         for state in running:
             if state["profile_id"] == "kali-arm64" and "kali-arm64" in profile_ids and bool(state.get("clipboard_enabled")) != clipboard:
                 raise CTFLabError("切换剪贴板模式需要先 stop，再 run。")
+            if state["profile_id"] in profile_ids and state.get("display_backend", "cocoa") != display:
+                raise CTFLabError("切换显示后端需要先 stop，再 run。")
         if allow_internet and any(state["profile_id"] != "kali-arm64" for state in running):
             raise CTFLabError("Kali 联网维护前请先停止其他靶机。")
         if any(state.get("internet_enabled") for state in running) and profile_ids != ["kali-arm64"]:
@@ -1753,7 +1921,12 @@ class LabManager:
                 continue
             profile = profile_overrides.get(profile_id) or load_profile(profile_id)
             overlay = self.ensure_overlay(profile_id)
-            command, host_forwards = self.qemu_command(profile_id, profile, overlay, lab_port, headless, allow_internet=allow_internet, clipboard=clipboard and profile_id == "kali-arm64")
+            command, host_forwards = self.qemu_command(
+                profile_id, profile, overlay, lab_port, headless,
+                allow_internet=allow_internet,
+                clipboard=clipboard and profile_id == "kali-arm64",
+                display=display,
+            )
             log_path = self.logs_dir / f"{profile_id}.log"
             log_path.parent.mkdir(parents=True, exist_ok=True)
             log_handle = log_path.open("a", encoding="utf-8")
@@ -1795,8 +1968,43 @@ class LabManager:
                 "headless": headless,
                 "internet_enabled": allow_internet,
                 "clipboard_enabled": clipboard and profile_id == "kali-arm64",
+                "display_backend": display,
+                "spice_endpoint": str(self.runtime_dir / profile_id / "spice" / "display.sock") if display == "spice" else None,
             }
             write_json(self.runtime_state_path(profile_id), state)
+            if display == "spice":
+                # QEMU 先创建服务端 socket，再启动受控客户端；客户端只接收固定的
+                # spice+unix URI，不接受用户拼接的 QEMU/网络参数。
+                endpoint = Path(str(state["spice_endpoint"]))
+                deadline = time.monotonic() + 5.0
+                while not endpoint.exists() and bool_pid_alive(process.pid) and time.monotonic() < deadline:
+                    time.sleep(0.05)
+                client = spice_client_path()
+                if not endpoint.exists() or not client:
+                    self._stop_unlocked([profile_id])
+                    reason = "SPICE socket 未建立" if not endpoint.exists() else "本地 SPICE 客户端不可用"
+                    raise CTFLabError(f"{reason}；已清理本次 QEMU 启动，不会自动回退 Cocoa。")
+                client_uri = f"spice+unix://{endpoint}"
+                client_command = ([client, "--uri", client_uri]
+                                  if Path(client).name == "spicy"
+                                  else [client, client_uri])
+                client_log = self.logs_dir / f"{profile_id}-spice-client.log"
+                with client_log.open("a", encoding="utf-8") as client_handle:
+                    try:
+                        client_process = subprocess.Popen(
+                            client_command,
+                            stdin=subprocess.DEVNULL,
+                            stdout=client_handle,
+                            stderr=subprocess.STDOUT,
+                            start_new_session=True,
+                            text=True,
+                        )
+                    except OSError as exc:
+                        self._stop_unlocked([profile_id])
+                        raise CTFLabError(f"无法启动 SPICE 客户端：{exc}") from exc
+                state["spice_client_pid"] = client_process.pid
+                state["spice_client_log_path"] = str(client_log)
+                write_json(self.runtime_state_path(profile_id), state)
             started.append(state)
         return started
 
@@ -1851,8 +2059,25 @@ class LabManager:
                         os.kill(pid, signal.SIGKILL)
                     except ProcessLookupError:
                         pass
+            client_pid = int(state.get("spice_client_pid", 0) or 0)
+            if client_pid and bool_pid_alive(client_pid):
+                try:
+                    os.kill(client_pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                client_deadline = time.monotonic() + 1.0
+                while bool_pid_alive(client_pid) and time.monotonic() < client_deadline:
+                    time.sleep(0.05)
+                if bool_pid_alive(client_pid):
+                    try:
+                        os.kill(client_pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
             if qmp_path.exists():
                 qmp_path.unlink()
+            spice_endpoint = Path(str(state.get("spice_endpoint", "")))
+            if spice_endpoint.is_file() or spice_endpoint.is_symlink():
+                spice_endpoint.unlink()
             state_path = self.runtime_state_path(profile_id)
             if state_path.exists():
                 state_path.unlink()
@@ -2444,7 +2669,16 @@ def cmd_dist_verify(_manager: LabManager, args: argparse.Namespace) -> int:
     try:
         report = ctflab_dist.verify_distribution(args.dir)
     except ctflab_dist.DistError as exc:
+        if getattr(args, "json", False):
+            print(json.dumps({"ok": False, "entries": [], "problems": [str(exc)],
+                              "summary": {"total": 0, "ok": 0, "failed": 1},
+                              "dir": str(Path(args.dir).expanduser())},
+                             ensure_ascii=False, indent=2))
+            return 1
         raise CTFLabError(str(exc)) from exc
+    if getattr(args, "json", False):
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return 0 if report["ok"] else 1
     if report["ok"]:
         print(f"分发目录校验通过：{Path(args.dir).expanduser()}"
               f"（{len(report['entries'])} 个文件与清单一致）")
@@ -2561,6 +2795,7 @@ def cmd_app_build(_manager: LabManager, args: argparse.Namespace) -> int:
             args.out,
             version=args.version,
             qemu_root=args.qemu_root,
+            spice_client=args.spice_client,
             python_runtime=args.python_runtime,
             python_runtime_sha256=args.python_runtime_sha256,
             pyyaml_source=args.pyyaml,
@@ -2671,19 +2906,65 @@ def cmd_finalize_install(manager: LabManager, args: argparse.Namespace) -> int:
 
 
 def cmd_run(manager: LabManager, args: argparse.Namespace) -> int:
-    states = manager.run(args.profiles, headless=args.headless, pcap=args.pcap, allow_internet=args.internet, clipboard=args.clipboard)
+    states = manager.run(args.profiles, headless=args.headless, pcap=args.pcap,
+                         allow_internet=args.internet, clipboard=args.clipboard,
+                         display=args.display)
     for state in states:
         forwards = ", ".join(f"{name}=127.0.0.1:{port}" for name, port in state.get("host_forwards", {}).items()) or "无主机端口映射"
         print(f"已启动 {state['profile_id']}（PID {state['pid']}，实验网 TCP {state['lab_port']}；{forwards}）")
         if state.get("internet_enabled"):
             print("  Kali 联网维护模式已开启；先 stop，再默认 run 才会恢复隔离。")
+        if state.get("display_backend") == "spice":
+            print(f"  SPICE 动态分辨率端点：{state['spice_endpoint']}")
     pcap_paths = {str(state.get("pcap_path")) for state in states if state.get("pcap_path")}
     for pcap_path in sorted(pcap_paths):
         print(f"PCAP：{pcap_path}")
     return 0
 
 
-def cmd_status(manager: LabManager, _args: argparse.Namespace) -> int:
+def _status_report(manager: LabManager) -> dict[str, Any]:
+    """状态快照（GUI 与文本模式共用同一数据源，避免两套判断）。"""
+    running = {state["profile_id"]: state for state in manager.running_states()}
+    stale = {profile_id: pid for profile_id, pid in manager.stale_runtime_states()}
+    profiles: list[dict[str, Any]] = []
+    for profile_id in available_profiles():
+        profile = load_profile(profile_id)
+        image = manager.image_state(profile_id) or {}
+        state = running.get(profile_id) or {}
+        lab_port = int(state.get("lab_port", 0) or 0)
+        network = (manager.network_state(lab_port) or {}) if lab_port else {}
+        profiles.append({
+            "id": profile_id,
+            "name": str(profile.get("name", profile_id)),
+            "architecture": str((profile.get("guest") or {}).get("architecture", "")),
+            "firmware": str((profile.get("guest") or {}).get("firmware", "")),
+            "imported": bool(image),
+            "source_format": image.get("source_format"),
+            "base_path": image.get("base_path"),
+            "base_sha256": image.get("base_sha256"),
+            "uefi_vars_path": image.get("uefi_vars_path"),
+            "running": bool(state),
+            "pid": int(state.get("pid", 0) or 0),
+            "log_path": state.get("log_path"),
+            "lab_port": lab_port or None,
+            "host_forwards": state.get("host_forwards") or {},
+            "internet_enabled": bool(state.get("internet_enabled")),
+            "display_backend": state.get("display_backend", "cocoa"),
+            "stale_pid": stale.get(profile_id),
+            "network": {
+                "client_count": network.get("client_count"),
+                "learned_macs": len(network.get("learned_macs", []) or []),
+                "pcap_path": network.get("pcap_path"),
+            } if network else None,
+        })
+    return {"schema": 1, "state_dir": str(manager.state_dir), "profiles": profiles,
+            "running_count": len(running)}
+
+
+def cmd_status(manager: LabManager, args: argparse.Namespace) -> int:
+    if getattr(args, "json", False):
+        print(json.dumps(_status_report(manager), ensure_ascii=False, indent=2))
+        return 0
     running = {state["profile_id"]: state for state in manager.running_states()}
     shown_networks: set[int] = set()
     printed = False
@@ -2744,10 +3025,19 @@ def cmd_reset(manager: LabManager, args: argparse.Namespace) -> int:
 def cmd_health(manager: LabManager, args: argparse.Namespace) -> int:
     results = manager.health(args.profile)
     failed = False
+    pending = False
     for result in results:
         status = "OK" if result["ok"] is True else "WAIT" if result["ok"] is None else "FAIL"
-        print(f"{status:4} {result['name']}: {result['detail']}")
+        if not getattr(args, "json", False):
+            print(f"{status:4} {result['name']}: {result['detail']}")
         failed |= result["ok"] is False
+        pending |= result["ok"] is None
+    if getattr(args, "json", False):
+        print(json.dumps({"schema": 1, "profile": PROFILE_ALIASES.get(args.profile, args.profile),
+                          # ok 只表示没有明确失败；pending 单独表达“仍在启动/检查中”，
+                          # 防止 GUI 把 WAIT 错显示为健康通过。
+                          "ok": not failed, "pending": pending, "checks": results},
+                         ensure_ascii=False, indent=2))
     return 1 if failed else 0
 
 
@@ -2852,6 +3142,8 @@ def build_parser() -> argparse.ArgumentParser:
     dist_verify = dist_sub.add_parser(
         "verify", help="复核分发目录：逐文件大小与 SHA-256 与清单一致")
     dist_verify.add_argument("--dir", type=Path, required=True)
+    dist_verify.add_argument("--json", action="store_true",
+                             help="输出机器可读报告（GUI 使用；失败时返回 1 且仍打印 JSON）")
 
     install_parser = subparsers.add_parser("install", help="从 ARM64 安装 ISO 创建 Kali 基础镜像")
     install_parser.add_argument("profile", choices=profile_choices)
@@ -2880,8 +3172,12 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--clipboard", action="store_true", help="显式允许 Mac 与 Kali 图形桌面双向共享文本剪贴板")
     run_parser.add_argument("--pcap", action="store_true", help="记录隔离实验网的 Ethernet PCAP")
     run_parser.add_argument("--internet", action="store_true", help="仅为单独启动的 Kali 临时联网维护")
+    run_parser.add_argument("--display", choices=("cocoa", "spice"), default="cocoa",
+                            help="显示后端；默认 cocoa，Kali 可显式选择 spice 动态分辨率")
 
-    subparsers.add_parser("status", help="查看运行状态")
+    status_parser = subparsers.add_parser("status", help="查看运行状态")
+    status_parser.add_argument("--json", action="store_true",
+                               help="输出机器可读状态（GUI 使用；含导入与运行信息）")
 
     stop_parser = subparsers.add_parser("stop", help="停止实例，默认超时会强制退出；桌面建议 --graceful")
     stop_parser.add_argument("--graceful", action="store_true", help="只请求正常关机，30 秒超时后保留实例，不强制断电")
@@ -2896,6 +3192,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     health_parser = subparsers.add_parser("health", help="检查进程和已配置的端口")
     health_parser.add_argument("profile", choices=profile_choices)
+    health_parser.add_argument("--json", action="store_true",
+                               help="输出机器可读健康检查结果（GUI 使用）")
 
     probe_parser = subparsers.add_parser("probe", help="启动候选并收集 QMP 截图、DHCP 和服务证据")
     probe_parser.add_argument("profile", choices=profile_choices)
@@ -2951,6 +3249,8 @@ def build_parser() -> argparse.ArgumentParser:
     app_build.add_argument("--version", help=f"覆盖版本号，默认 {CTFLAB_VERSION}")
     app_build.add_argument("--qemu-root", type=Path,
                            help="QEMU 安装根目录（含 bin/ 与 share/qemu/）；默认从 PATH 探测")
+    app_build.add_argument("--spice-client", type=Path,
+                           help="可选 SPICE 客户端（当前支持 spicy）；提供后随 app 打包并做动态库闭包")
     app_build.add_argument("--python-runtime", type=Path, required=True,
                            help="python-build-standalone install_only_stripped 的 .tar.gz 或解包目录"
                                 "（必填：app 必须内置解释器，不回退系统 Python）")

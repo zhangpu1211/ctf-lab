@@ -139,6 +139,29 @@ CTFLab.app/
   （entitlement 丢失缺陷的定位与修复）与 `docs/verification-task6-3b-2026-09-15.md`
   （许可证闭环与内置 Python 运行时）。
 
+## 12. 图形入口（Task 6.4）
+
+主入口改为原生 SwiftUI/AppKit 可执行文件（`Contents/MacOS/CTFLabGUI`，`CFBundleExecutable` 指向它）；
+CLI 启动器保留在 `Contents/Resources/bin/`（`ctflab-cli` 与兼容名 `CTFLab`），由 GUI 以固定路径调用。
+
+- **不做第二套逻辑**：GUI 只调用既有 CLI（`dist verify --json`、`import <profile> <基盘> --manifest`、
+  `run`、`status --json`、`health <profile> --json`、`stop --all`、`reset <profile>`），
+  另以固定动作调用 Kali-only 的 `run kali-arm64 --internet` 与 `run kali-arm64 --display spice`，
+  不解析任意 QEMU 参数、不绕过清单哈希；
+- **状态机门禁**：校验未通过时导入/启动禁用；未全部导入时启动/重置禁用；运行中禁止再次启动；
+  执行中所有动作禁用；重新打开 App 时通过 `status --json` 恢复“已导入/运行中”显示；
+- **重置必须确认**：确认框明确说明 overlay 中的实验改动会丢失，只有确认后才逐节点 `reset`；
+- **命令拼接**：参数以数组传递（不做 shell 拼接），路径含空格保持为单一参数；基盘路径由
+  `DISTRIBUTION.json` 的 `profile + role=base` 条目解析，找不到即报错而不是猜文件名；
+- **失败可见**：CLI 的 stderr/stdout 原样进入日志面板，失败时给出“命令 + 退出码 + 原文”的
+  可复制错误块；主可执行文件由代码签名覆盖、其余文件由 `MANIFEST.json` 覆盖；
+- **放置约定**：CLI 启动器放在 `Contents/Resources/bin` 而非 `Contents/MacOS`——codesign 会把
+  `MacOS/` 里的额外可执行文件当作嵌套代码要求单独签名，而脚本签名依赖扩展属性、不适合随包分发；
+  放在 `Resources/` 里由 bundle 签名按哈希封存（`app verify` 会检查两个启动器都在位）。
+
+源码在仓库 `gui/`（`GuiCore.swift` 状态机与命令构造、`GuiApp.swift` SwiftUI 界面、
+`GuiCoreTests.swift` 无需 XCTest 的核心测试），随包镜像到 `Contents/Resources/ctflab/gui/` 供审计。
+
 ## 10. 仍需决策
 
 1. ~~项目许可证~~ 已决定：MIT（2026-09-15）；

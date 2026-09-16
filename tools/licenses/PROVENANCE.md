@@ -19,3 +19,12 @@
   （除非显式使用 `--allow-incomplete-license-texts`），不做猜测。
 
 新增上游组件文本时：从对应上游发布物原样复制、在此登记来源与哈希，不要改写文本内容。
+
+## sqlite 3.53.4
+
+- Homebrew formula：`sqlite` 3.53.4，许可证标识为 `blessing`；运行时闭包由 `spicy`
+  的 GTK/GStreamer 依赖引入。
+- 上游来源：https://www.sqlite.org/2026/sqlite-autoconf-3530400.tar.gz
+- 收录文件：`tools/licenses/sqlite/BLESSING`，为 SQLite 上游发布物中的 blessing 文本。
+- 该文本仅覆盖 SQLite 的 blessing 许可声明；Homebrew SPDX 仍将源归档声明为
+  `NOASSERTION`、结论为 `blessing`，SBOM 以此事实记录，不扩大为其他组件的许可证结论。

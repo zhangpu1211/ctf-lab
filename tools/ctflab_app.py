@@ -34,7 +34,15 @@ TOOLS_DIR = Path(__file__).resolve().parent
 DEFAULT_SOURCE_ROOT = TOOLS_DIR.parent
 
 APP_BUNDLE_NAME = "CTFLab.app"
-APP_EXECUTABLE = "CTFLab"
+# 双击打开运行的是原生图形入口；`ctflab-cli` 与兼容名 `CTFLab` 都指向同一 CLI 启动器。
+APP_EXECUTABLE = "CTFLab"          # 兼容保留的 CLI 启动器名（既有脚本/验收引用）
+GUI_EXECUTABLE = "CTFLabGUI"       # CFBundleExecutable：原生 SwiftUI 入口
+CLI_EXECUTABLE = "ctflab-cli"      # GUI 调用的 CLI 启动器
+GUI_SOURCE_DIR = "gui"
+# 编译进 app 的源码（测试文件只随包镜像、不参与编译，避免重复符号）。
+GUI_SOURCES = ("GuiCore.swift", "GuiApp.swift")
+GUI_MIRROR_EXTRA = ("GuiCoreTests.swift",)
+GUI_TARGET = "arm64-apple-macos13.0"
 CTFLAB_VERSION_FALLBACK = "0.1.0"
 BUNDLE_IDENTIFIER = "local.ctflab.app"
 RUNTIME_REL = "Contents/Resources/runtime"
@@ -45,7 +53,11 @@ SBOM_REL = "Contents/Resources/SBOM.json"
 THIRD_PARTY_REL = "Contents/Resources/THIRD_PARTY_LICENSES.md"
 LICENSE_REL = "Contents/Resources/LICENSE"
 SOURCE_OFFER_REL = "Contents/Resources/SOURCE_OFFER.md"
-LAUNCHER_REL = f"Contents/MacOS/{APP_EXECUTABLE}"
+# CLI 启动器放在 Resources/bin（MacOS/ 只放原生主入口）：codesign 会把 MacOS/ 内的
+# 额外可执行文件当作嵌套代码要求单独签名，而脚本签名依赖扩展属性、不适合分发；
+# 放在 Resources/ 里由 bundle 签名按哈希封存，随包复制不会失效。
+LAUNCHER_REL = "Contents/Resources/bin/ctflab-cli"
+LAUNCHER_COMPAT_REL = f"Contents/Resources/bin/{APP_EXECUTABLE}"
 INFO_PLIST_REL = "Contents/Info.plist"
 SIGNATURE_DIR_REL = "Contents/_CodeSignature"
 
@@ -93,6 +105,8 @@ PYTHON_VERSION_RE = re.compile(r"^Python\s+([0-9][0-9A-Za-z.]*)$")
 PBS_ASSET_RE = re.compile(r"^(cpython-\d+\.\d+\.\d+)\+(\d{8})-aarch64-apple-darwin-")
 
 QEMU_BINARIES = ("qemu-system-aarch64", "qemu-system-x86_64", "qemu-img")
+# 外置 SPICE 客户端是可选运行时；未提供时保留默认 Cocoa App，显式请求 SPICE 会被 CLI 拒绝。
+SPICE_CLIENT_NAME = "spicy"
 # 只随包实际需要的固件/ROM/keymaps（aarch64 virt UEFI + x86_64 pc BIOS/UEFI 与三种网卡）。
 QEMU_SHARE_FILES = (
     "edk2-aarch64-code.fd",   # aarch64 virt 的 UEFI 固件代码
@@ -159,6 +173,8 @@ KNOWN_LICENSES = {
     "snappy": "BSD-3-Clause",
     "vde": "GPL-2.0-or-later AND LGPL-2.1-or-later（libvdeplug）",
     "zstd": "BSD-3-Clause OR GPL-2.0",
+    "spice-gtk": "LGPL-2.1-or-later",
+    "sqlite": "blessing",
 }
 LICENSE_GLOBS = ("COPYING*", "LICENSE*", "NOTICE*", "LGPL-*", "GPL-*", "MIT*", "BSD*")
 
@@ -166,7 +182,13 @@ LAUNCHER_TEMPLATE = """#!/bin/sh
 # CTFLab 启动器（.app 内）：使用 app 自带运行时（QEMU + Python），不依赖任何开发机路径。
 set -eu
 
-contents_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+# 启动器位于 Contents/Resources/bin：向上找到包含 Resources/ctflab 的 Contents 目录，
+# 不假设固定的相对深度（MacOS/ 或 Resources/bin/ 都能工作）。
+contents_dir="$script_dir"
+while [ "$contents_dir" != "/" ] && [ ! -d "$contents_dir/Resources/ctflab" ]; do
+  contents_dir=$(dirname "$contents_dir")
+done
 resources="$contents_dir/Resources"
 runtime="$resources/runtime"
 if [ -d "$runtime/bin" ]; then
@@ -219,8 +241,9 @@ def ctflab_version() -> str:
 
 # --------------------------------------------------------------------------- otool 封装
 
-def _run_tool(command: list[str], *, check: bool = True) -> subprocess.CompletedProcess:
-    result = subprocess.run(command, capture_output=True, text=True)
+def _run_tool(command: list[str], *, check: bool = True,
+              env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
+    result = subprocess.run(command, capture_output=True, text=True, env=env)
     if check and result.returncode != 0:
         raise AppBuildError(f"命令失败：{' '.join(command)}：{(result.stderr or result.stdout).strip()}")
     return result
@@ -796,7 +819,7 @@ def _write_launcher(path: Path) -> None:
 def _info_plist(version: str) -> dict[str, Any]:
     return {
         "CFBundleDevelopmentRegion": "zh_CN",
-        "CFBundleExecutable": APP_EXECUTABLE,
+        "CFBundleExecutable": GUI_EXECUTABLE,
         "CFBundleIdentifier": BUNDLE_IDENTIFIER,
         "CFBundleInfoDictionaryVersion": "6.0",
         "CFBundleName": "CTFLab",
@@ -822,8 +845,10 @@ def _copy_ctflab_sources(source_root: Path, destination: Path) -> list[str]:
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source, target)
         copied.append(rel)
-    for rel_root in ("tools/ctflab_profiles", "tools/guest_fixes"):
+    for rel_root in ("tools/ctflab_profiles", "tools/guest_fixes", GUI_SOURCE_DIR):
         source_dir = source_root / rel_root
+        if not source_dir.is_dir():
+            continue
         for path in sorted(source_dir.rglob("*")):
             if path.is_dir():
                 continue
@@ -839,6 +864,45 @@ def _copy_ctflab_sources(source_root: Path, destination: Path) -> list[str]:
         shutil.copy2(readme, destination / "README.md")
         copied.append("README.md")
     return copied
+
+
+def build_gui_executable(source_root: Path, target: Path, *,
+                         swiftc: str | None = None,
+                         prebuilt: Path | None = None) -> dict[str, Any]:
+    """把 `gui/` 下的 SwiftUI 源码编译成 app 的原生入口（或复制预编译产物）。
+
+    没有 swiftc 时直接失败（不回退到脚本入口）：图形入口是交付形态的一部分。
+    """
+    if prebuilt is not None:
+        _expect(prebuilt.is_file(), f"预编译 GUI 可执行文件不存在：{prebuilt}")
+        shutil.copy2(prebuilt, target)
+        target.chmod(0o755)
+        return {"path": str(target), "source": "prebuilt-injected", "swift_version": None}
+
+    compiler = swiftc or shutil.which("swiftc")
+    _expect(compiler, "缺少 swiftc（Xcode 命令行工具）：构建图形入口需要它；不生成半成品，构建停止。")
+    sources = [source_root / GUI_SOURCE_DIR / name for name in GUI_SOURCES]
+    for source in sources:
+        _expect(source.is_file(), f"缺少 GUI 源文件：{source}")
+    command = [compiler, "-O", "-target", GUI_TARGET, "-parse-as-library",
+               "-o", str(target), *[str(source) for source in sources]]
+    # CommandLineTools/Swift 在不同小版本间会拒绝复用默认 clang module cache；构建使用
+    # 本次临时、可写的缓存目录，避免把用户的 ~/.cache 权限或旧 SDK 缓存当成项目失败。
+    cache_dir = Path(tempfile.mkdtemp(prefix="ctflab-swift-cache-"))
+    build_env = os.environ.copy()
+    build_env["CLANG_MODULE_CACHE_PATH"] = str(cache_dir)
+    try:
+        result = _run_tool(command, check=False, env=build_env)
+        _expect(result.returncode == 0,
+                "GUI 编译失败：" + (result.stderr or result.stdout).strip()[:800])
+        target.chmod(0o755)
+        version_line = _run_tool([compiler, "--version"], check=False,
+                                 env=build_env).stdout.strip().splitlines()
+    finally:
+        shutil.rmtree(cache_dir, ignore_errors=True)
+    return {"path": str(target), "source": "swiftc",
+            "swift_version": version_line[0] if version_line else None,
+            "sources": [f"{GUI_SOURCE_DIR}/{name}" for name in GUI_SOURCES]}
 
 
 def _sign_macho_files(runtime_bin: Path, runtime_lib: Path, identity: str,
@@ -889,12 +953,18 @@ def _rewrite_install_names(binaries: Iterable[Path], libs: dict[str, Path]) -> N
 
 
 def _iter_manifest_files(app_root: Path) -> list[Path]:
+    """清单覆盖除代码签名自身产物之外的所有文件。
+
+    例外：主可执行文件（Contents/MacOS/CTFLabGUI）不在清单内——bundle 签名会重写它的
+    签名节，哈希必然变化；它的完整性由代码签名（codesign --verify --deep --strict）保证。
+    """
     files: list[Path] = []
+    main_executable = f"Contents/MacOS/{GUI_EXECUTABLE}"
     for path in sorted(app_root.rglob("*")):
         if path.is_dir():
             continue
         rel = path.relative_to(app_root).as_posix()
-        if rel.startswith(SIGNATURE_DIR_REL + "/"):
+        if rel.startswith(SIGNATURE_DIR_REL + "/") or rel == main_executable:
             continue
         files.append(path)
     return files
@@ -917,7 +987,8 @@ def build_sbom(*, version: str, generated_at: str, qemu_root: Path, libs: dict[s
                license_texts_complete: bool, vendored_index: dict[str, list[str]] | None = None,
                source_offer: dict[str, Any] | None = None,
                python_meta: dict[str, Any] | None = None,
-               pyyaml_meta: dict[str, Any] | None = None) -> dict[str, Any]:
+               pyyaml_meta: dict[str, Any] | None = None,
+               spice_client: Path | None = None) -> dict[str, Any]:
     import ctflab_package  # noqa: PLC0415  函数内导入，避免循环依赖
 
     vendored_index = vendored_index or {}
@@ -987,6 +1058,25 @@ def build_sbom(*, version: str, generated_at: str, qemu_root: Path, libs: dict[s
         ],
     }]
     components.extend(dylib_components)
+    if spice_client is not None:
+        client_formula = _formula_of(spice_client) or "spice-gtk"
+        components.append({
+            "name": "spicy",
+            "type": "application",
+            "role": "display-client",
+            "version": _formula_version(client_formula),
+            "license": KNOWN_LICENSES["spice-gtk"],
+            "bundled": True,
+            "source": f"Homebrew formula {client_formula}",
+            "binaries": [{
+                "file": f"{RUNTIME_REL}/bin/{SPICE_CLIENT_NAME}",
+                "version": _formula_version(client_formula),
+                "arch": _binary_arch(spice_client),
+                "sha256": sha256_file(spice_client),
+                "license": KNOWN_LICENSES["spice-gtk"],
+                "bundled": True,
+            }],
+        })
     _expect(python_meta, "构建 SBOM 需要内置 Python 运行时元数据。")
     _expect(pyyaml_meta, "构建 SBOM 需要 PyYAML 元数据。")
     components.append({
@@ -1076,6 +1166,7 @@ def build_app(
     version: str | None = None,
     source_root: Path | None = None,
     qemu_root: Path | None = None,
+    spice_client: Path | None = None,
     python_runtime: Path | None = None,
     python_runtime_sha256: str | None = None,
     pyyaml_source: Path | None = None,
@@ -1085,6 +1176,8 @@ def build_app(
     allow_incomplete_license_texts: bool = False,
     unsigned: bool = False,
     share_files: Iterable[str] | None = None,
+    gui_binary: Path | None = None,
+    swiftc: str | None = None,
 ) -> dict[str, Any]:
     """构建 `CTFLab.app`；排他发布，目标已存在时拒绝覆盖。
 
@@ -1099,6 +1192,10 @@ def build_app(
             f"app 版本必须与 CTFLAB_VERSION 一致：当前 {runtime_version}，请求 {version}")
     generated_at = generated_at or now_iso()
     qemu_root = Path(qemu_root) if qemu_root else detect_qemu_root()
+    if spice_client is not None:
+        spice_client = Path(spice_client).expanduser().resolve()
+        _expect(spice_client.is_file() and os.access(spice_client, os.X_OK),
+                f"SPICE 客户端不存在或不可执行：{spice_client}")
     _expect(python_runtime,
             "缺少 --python-runtime：app 必须内置 Python 运行时（python-build-standalone "
             "install_only_stripped 的 .tar.gz 或解包目录），不回退系统 Python。")
@@ -1134,17 +1231,29 @@ def build_app(
         runtime_lib.mkdir(parents=True)
         runtime_share.mkdir(parents=True)
 
-        # 1) Info.plist 与启动器
+        # 1) Info.plist：CLI 启动器（GUI 调用 + 兼容名）与原生图形入口
         (contents / "Info.plist").write_bytes(plistlib.dumps(_info_plist(version)))
-        _write_launcher(contents / "MacOS" / APP_EXECUTABLE)
+        (resources / "bin").mkdir(parents=True, exist_ok=True)
+        _write_launcher(contents / "Resources" / "bin" / CLI_EXECUTABLE)
+        _write_launcher(contents / "Resources" / "bin" / APP_EXECUTABLE)
+        gui_meta = build_gui_executable(source_root, contents / "MacOS" / GUI_EXECUTABLE,
+                                        swiftc=swiftc, prebuilt=gui_binary)
+        if unsigned:
+            # 工具链会给 Mach-O 自动加 ad-hoc 签名；诊断用的 unsigned 构建必须真的没有签名。
+            _run_tool(["codesign", "--remove-signature", str(contents / "MacOS" / GUI_EXECUTABLE)],
+                      check=False)
 
         # 2) CTFLab 源码镜像
         _copy_ctflab_sources(source_root, resources / "ctflab")
 
-        # 3) QEMU 程序与资源（同时采集源二进制 entitlements：HVF 等能力不能丢）
+        # 3) QEMU 程序与可选 SPICE 客户端（同时采集源二进制 entitlements：HVF 等能力不能丢）
         source_entitlements: dict[str, dict[str, Any]] = {}
-        for name in QEMU_BINARIES:
-            source = qemu_root / "bin" / name
+        runtime_binary_sources: dict[str, Path] = {
+            name: qemu_root / "bin" / name for name in QEMU_BINARIES
+        }
+        if spice_client is not None:
+            runtime_binary_sources[SPICE_CLIENT_NAME] = spice_client
+        for name, source in runtime_binary_sources.items():
             _expect(source.is_file(), f"缺少 QEMU 程序：{source}")
             shutil.copy2(source, runtime_bin / name)
             (runtime_bin / name).chmod(0o755)
@@ -1154,7 +1263,7 @@ def build_app(
         copied_share = copy_qemu_share(qemu_root, runtime_share, share_files)
 
         # 4) 动态库闭包与 install_name 改写
-        libs_sources = collect_dylib_closure([runtime_bin / name for name in QEMU_BINARIES])
+        libs_sources = collect_dylib_closure([runtime_bin / name for name in runtime_binary_sources])
         for name, source in sorted(libs_sources.items()):
             shutil.copy2(source, runtime_lib / name)
             (runtime_lib / name).chmod(0o755)
@@ -1162,7 +1271,7 @@ def build_app(
             if found:
                 source_entitlements[name] = found
         libs_targets = {name: runtime_lib / name for name in libs_sources}
-        _rewrite_install_names([runtime_bin / name for name in QEMU_BINARIES], libs_targets)
+        _rewrite_install_names([runtime_bin / name for name in runtime_binary_sources], libs_targets)
 
         # 4.5) 内置 Python 运行时与 PyYAML（学生机零 Python 依赖的硬前提）
         licenses_dir = resources / "licenses"
@@ -1181,6 +1290,7 @@ def build_app(
 
         # 5) 签名 Mach-O（install_name_tool 之后必须重新签名；没有身份时 ad-hoc）
         if not unsigned:
+            codesign_path(contents / "MacOS" / GUI_EXECUTABLE, sign_identity or "-")
             _sign_macho_files(runtime_bin, runtime_lib, sign_identity or "-", source_entitlements,
                               extra_roots=[runtime_python])
             # 断言：源二进制的能力（例如 com.apple.security.hypervisor）必须在副本上保留，
@@ -1194,7 +1304,7 @@ def build_app(
 
         bundled_entitlements: dict[str, dict[str, Any]] = {}
         for name in source_entitlements:
-            directory = runtime_bin if name in QEMU_BINARIES else runtime_lib
+            directory = runtime_bin if name in runtime_binary_sources else runtime_lib
             actual = read_entitlements(directory / name)
             if actual:
                 bundled_entitlements[name] = actual
@@ -1205,7 +1315,9 @@ def build_app(
         license_index: dict[str, list[str]] = {}
         vendored_index: dict[str, list[str]] = {}
         formulas = sorted({_formula_of(source) or "unknown" for source in libs_sources.values()}
-                          | {"qemu", "edk2"})
+                          | {"qemu", "edk2"}
+                          | ({_formula_of(spice_client) or "spice-gtk"}
+                             if spice_client is not None else set()))
         missing: list[str] = []
         for formula in formulas:
             if formula == "edk2":
@@ -1262,7 +1374,8 @@ def build_app(
                           libs=libs_sources, qemu_share=copied_share,
                           license_index=license_index, license_texts_complete=not missing,
                           vendored_index=vendored_index, source_offer=offer_meta,
-                          python_meta=python_meta, pyyaml_meta=pyyaml_meta)
+                          python_meta=python_meta, pyyaml_meta=pyyaml_meta,
+                          spice_client=spice_client)
         (resources / "SBOM.json").write_text(json.dumps(sbom, ensure_ascii=False, indent=2) + "\n",
                                              encoding="utf-8")
         (resources / "THIRD_PARTY_LICENSES.md").write_text(third_party_markdown(sbom), encoding="utf-8")
@@ -1280,10 +1393,22 @@ def build_app(
             "version": version,
             "generated_at": generated_at,
             "bundle_identifier": BUNDLE_IDENTIFIER,
+            "entrypoint": f"Contents/MacOS/{GUI_EXECUTABLE}",
+            "gui": {
+                "executable": f"Contents/MacOS/{GUI_EXECUTABLE}",
+                "cli": LAUNCHER_REL,
+                "cli_compat": LAUNCHER_COMPAT_REL,
+                "sources": gui_meta.get("sources", []),
+                "swift_version": gui_meta.get("swift_version"),
+                "source": gui_meta.get("source"),
+                "note": "原生 SwiftUI 入口（AppKit 仅用于目录选择）；不依赖 Electron/Node/浏览器。",
+            },
             "runtime": {
                 "root": RUNTIME_REL,
-                "binaries": list(QEMU_BINARIES),
                 "dylibs": sorted(libs_sources),
+                "binaries": list(runtime_binary_sources),
+                "spice_client": (f"{RUNTIME_REL}/bin/{SPICE_CLIENT_NAME}"
+                                  if spice_client is not None else None),
                 "share_files": copied_share,
                 "qemu_version": _qemu_version(qemu_root / "bin" / "qemu-system-aarch64"),
                 "source": f"Homebrew qemu {_formula_version('qemu') or '?'}",
@@ -1307,6 +1432,7 @@ def build_app(
                 },
             },
             "signature": dict(signature_plan),
+            "signature_covers": [f"Contents/MacOS/{GUI_EXECUTABLE}"],
             "license": {
                 "status": ctflab_package.PROJECT_LICENSE,
                 "project_license_file": LICENSE_REL,
@@ -1434,6 +1560,7 @@ def verify_app(app_path: Path, *, check_signature: bool = True) -> dict[str, Any
             f"不是普通 .app 目录：{app_path}")
     for rel in (INFO_PLIST_REL, LAUNCHER_REL, MANIFEST_REL, SBOM_REL, THIRD_PARTY_REL,
                 LICENSE_REL, SOURCE_OFFER_REL,
+                f"Contents/MacOS/{GUI_EXECUTABLE}", LAUNCHER_COMPAT_REL,
                 f"{CTFLAB_REL}/tools/ctflab.py", f"{RUNTIME_REL}/bin/qemu-img"):
         _expect((app_path / rel).exists(), f"app 缺少必需内容：{rel}")
 
@@ -1448,7 +1575,8 @@ def verify_app(app_path: Path, *, check_signature: bool = True) -> dict[str, Any
     _expect(isinstance(manifest.get("runtime"), dict), "MANIFEST.json 缺少有效 runtime。")
     _expect(isinstance(manifest.get("files"), list), "MANIFEST.json 缺少有效 files。")
     _expect(isinstance(manifest.get("license"), dict), "MANIFEST.json 缺少有效 license。")
-    _expect(info.get("CFBundleExecutable") == APP_EXECUTABLE, "Info.plist 的 CFBundleExecutable 不正确。")
+    _expect(info.get("CFBundleExecutable") == GUI_EXECUTABLE,
+            f"Info.plist 的 CFBundleExecutable 必须指向原生图形入口 {GUI_EXECUTABLE}。")
     _expect(info.get("CFBundleIdentifier") == BUNDLE_IDENTIFIER, "Info.plist 的 CFBundleIdentifier 不正确。")
     _expect(str(info.get("CFBundleShortVersionString")) == str(manifest["version"]),
             "Info.plist 版本与 MANIFEST 不一致。")
@@ -1463,6 +1591,24 @@ def verify_app(app_path: Path, *, check_signature: bool = True) -> dict[str, Any
             f"启动器必须使用内置解释器（{PYTHON_RUNTIME_REL}/bin/python3）。")
     _expect("-B -s -E" in launcher,
             "启动器必须以 -B -s -E 调用内置解释器（禁止写字节码缓存、忽略用户 site 与环境变量）。")
+
+    gui_binary = app_path / "Contents/MacOS" / GUI_EXECUTABLE
+    _expect(gui_binary.is_file(), f"缺少图形入口：Contents/MacOS/{GUI_EXECUTABLE}")
+    _expect(os.access(gui_binary, os.X_OK), "图形入口不可执行。")
+    for dep in otool_deps(gui_binary):
+        if is_system_library(dep):
+            continue
+        _expect(dep.startswith("@loader_path/") or dep.startswith("@rpath/"),
+                f"图形入口含绝对路径依赖：{dep}")
+    for hit in forbidden_binary_reference(gui_binary):
+        raise AppBuildError(f"图形入口残留禁止引用：{hit}")
+    gui_record = manifest.get("gui") or {}
+    _expect(gui_record.get("executable") == f"Contents/MacOS/{GUI_EXECUTABLE}",
+            "MANIFEST.gui.executable 与 Info.plist 主入口不一致。")
+    _expect(gui_record.get("cli") == LAUNCHER_REL,
+            f"MANIFEST.gui.cli 必须指向 CLI 启动器 {LAUNCHER_REL}。")
+    _expect(gui_record.get("cli_compat") == LAUNCHER_COMPAT_REL,
+            f"MANIFEST.gui.cli_compat 必须保留兼容名 {LAUNCHER_COMPAT_REL}。")
 
     for name in QEMU_BINARIES:
         binary = app_path / RUNTIME_REL / "bin" / name
@@ -1496,10 +1642,23 @@ def verify_app(app_path: Path, *, check_signature: bool = True) -> dict[str, Any
     _expect(not problems, "运行时引用检查失败：\n" + "\n".join(problems))
 
     runtime_section = manifest.get("runtime", {})
+    runtime_binaries = runtime_section.get("binaries", list(QEMU_BINARIES))
+    _expect(isinstance(runtime_binaries, list)
+            and all(isinstance(name, str) for name in runtime_binaries),
+            "MANIFEST.runtime.binaries 必须是字符串数组。")
+    spice_client_rel = runtime_section.get("spice_client")
+    if spice_client_rel is not None:
+        _expect(spice_client_rel == f"{RUNTIME_REL}/bin/{SPICE_CLIENT_NAME}",
+                "MANIFEST.runtime.spice_client 必须指向内置 spicy。")
+        spice_client_path = app_path / spice_client_rel
+        _expect(spice_client_path.is_file() and os.access(spice_client_path, os.X_OK),
+                "MANIFEST.runtime.spice_client 缺失或不可执行。")
+        _expect(SPICE_CLIENT_NAME in runtime_binaries,
+                "MANIFEST.runtime.binaries 必须登记内置 spicy。")
     runtime_entitlements = runtime_section.get("entitlements", {})
     _expect(isinstance(runtime_entitlements, dict),
             "MANIFEST.runtime.entitlements 必须是字典。")
-    allowed_entitlement_files = set(QEMU_BINARIES) | set(runtime_section.get("dylibs", []))
+    allowed_entitlement_files = set(runtime_binaries) | set(runtime_section.get("dylibs", []))
     for name, recorded in runtime_entitlements.items():
         _expect(isinstance(name, str) and name in allowed_entitlement_files,
                 f"MANIFEST.runtime.entitlements 含未知文件：{name!r}")
@@ -1511,7 +1670,7 @@ def verify_app(app_path: Path, *, check_signature: bool = True) -> dict[str, Any
         _expect(isinstance(recorded.get("sha256"), str)
                 and re.fullmatch(r"[0-9a-f]{64}", recorded["sha256"]),
                 f"{name} 的 entitlement 摘要哈希无效。")
-        directory = (app_path / RUNTIME_REL / "bin") if name in QEMU_BINARIES \
+        directory = (app_path / RUNTIME_REL / "bin") if name in runtime_binaries \
             else (app_path / RUNTIME_REL / "lib")
         actual = read_entitlements(directory / name) or {}
         _expect(entitlement_record(actual) == recorded,
@@ -1534,10 +1693,13 @@ def verify_app(app_path: Path, *, check_signature: bool = True) -> dict[str, Any
         _expect(path.is_file() and not path.is_symlink(), f"清单登记但 app 内缺失或不是普通文件：{rel}")
         _expect(sha256_file(path) == digest, f"文件哈希不符：{rel}")
     listed = seen_entries
+    covered_by_signature = set(manifest.get("signature_covers", []))
     for path in _iter_manifest_files(app_path):
         rel = path.relative_to(app_path).as_posix()
         if rel == MANIFEST_REL:
             continue  # 清单自身不在清单内（其哈希记录在同级 .sha256 旁车文件里）
+        if rel in covered_by_signature:
+            continue  # 主可执行文件由代码签名覆盖（见 _iter_manifest_files 说明）
         _expect(rel in listed, f"app 内存在未登记文件：{rel}")
 
     for path in app_path.rglob("*"):

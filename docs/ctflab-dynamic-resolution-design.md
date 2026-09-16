@@ -1,5 +1,10 @@
 # CTFLab 动态分辨率设计：UTM 导出路径与带 SPICE 的 QEMU 路径对比
 
+> 当前实现状态：路径 B 的 CLI/GUI 能力门禁、QEMU 11.x SPICE 参数、可选运行时打包和 Kali XFCE
+> 显示适配已接入。2026-09-16 已用带 SPICE 的 QEMU 与内置 `spicy` 完成 server/client/agent
+> 连接、冷启动恢复，以及 1000×700 / 800×600 窗口对应来宾 2000×1400 / 1600×1200 的实际跟随验证。
+> 旧分发基盘需补装 `configure.sh --display-only`；详细证据见 `verification-display-network-2026-09-16.md`。
+
 > 状态：**路径 A 的 `utm-export` 已实现并通过单元测试；UTM 4.7.5 必需段与必需键已按上游源码
 > 补齐。2026-09-14：首次导入（R1）因缺必需段失败；补齐后导出 `CTFLab-Kali-E2E-20260914-R2`，
 > 在 UTM 4.7.5 中通过“导入/解析”验收（虚拟机未启动），并完成一次冷启动与 Kali 图形登录
@@ -10,9 +15,9 @@
 > Smoke 与 Basic Pentesting 2 两个 x86_64 BIOS 包（`utm-export` 的 x86_64 变体）的导出与 E2E
 > 交付（导入/解析、冷启动、控制台登录、基本交互、ACPI 正常关机、盘完整性与隔离核对；独立验证记录
 > `verification-utm-smoke-2026-09-14.md`、`verification-utm-basic-pentesting-2-2026-09-14.md`）。
-> **重启后复测失败，显示链路不稳定；当前包仅保证固定显示可用。** 路径 A 保持“部分验证”，
+> **重启后复测失败，显示链路不稳定；当前 UTM 包仅保证固定显示可用。** 路径 A 保持“部分验证”，
 > 不得宣称完整 Path A、动态分辨率或联网靶场验收；Smoke/Basic 的静态控制台 E2E 已在限定范围内通过；
-> 路径 B 未实现**。首次失败记录与证据保留在
+> 路径 B 的运行时连接与窗口跟随已验证，但尚未达到完整动态分辨率可交付（剪贴板隔离和客户端鉴权负向仍待补齐）**。首次失败记录与证据保留在
 > `~/Downloads/ctflab-utm-e2e-20260914/E2E-FAILURE-2026-09-14.md`；导入通过截图
 > `import-accepted-R2.png`。默认显示路径（Homebrew QEMU + Cocoa + `zoom-to-fit`）
 > 仍不支持动态分辨率；固定 `xres/yres` 与窗口缩放也都不是动态分辨率。**结构状态与运行状态分离**：
@@ -20,7 +25,8 @@
 > 记录在导出清单的 `runtime_status`（`e2e_scope`/`e2e_status`/`dynamic_resolution`，取值见 2.3）与
 > 独立验证记录中。旧 schema 迁移标签仅用于 schema 2 兼容迁移，不作为当前 fixture 或当前结构状态
 > 输出，避免 E2E 完成后产生歧义。
-> 本文仍是路径对比与边界基线，不含 SPICE 后端，也不改变默认 QEMU 命令与现有 CLI 行为。
+> 本文仍是路径对比与边界基线；SPICE 后端已接入源代码能力门禁，验收构建已能通过 `--qemu-root` 与
+> `--spice-client` 纳入 QEMU/客户端，但默认 Cocoa 构建不自动携带该可选组合，也不改变现有 CLI 行为。
 > 两条路径的默认关闭边界：A 的导出包默认不带网卡、默认关闭 UTM Clipboard Sharing；
 > B 的动态分辨率保留唯一的 virtio-serial + spicevmc agent transport；剪贴板按 `--clipboard`
 > 条件开关：未授权时 `disable-copy-paste=on`/`disable-agent-file-xfer=on` 且客户端关闭
@@ -285,10 +291,10 @@ state:
 - **分发边界**：QEMU 构建与 SPICE 客户端的许可、体积、签名、SBOM 属于 Task 6 打包范畴；
   在此之前只做本机能力探测与手工 PoC，不分发二进制、不写入任何发布渠道。
 
-### 3.3 CLI/API 草案（未实现）
+### 3.3 CLI/API（已实现能力门禁；运行时仍需 SPICE 构建）
 
 ```yaml
-# 接口草案：可选显示后端（默认 cocoa，行为不变）
+# 接口：可选显示后端（默认 cocoa，行为不变）
 flag: display
 usage: run <profile...> [--display <cocoa|spice>]
 allowed_profiles:
@@ -299,7 +305,7 @@ behavior:
          agent transport 始终保留；剪贴板按下方 clipboard 条件开关
 state:
   display_backend: cocoa|spice
-  spice_endpoint_unix: unix:<runtime_dir>/spice.sock   # 优先；目录 0700；不要求 addr=
+  spice_endpoint_unix: unix=on,addr=<runtime_dir>/spice.sock   # QEMU 11.x 语法；目录 0700；不监听 TCP
   spice_endpoint_tcp: addr=127.0.0.1,port=<受控端口>    # 回退；必须带每次运行鉴权
   spice_auth: unix-socket-0700|per-run-ticket          # ticket 不落进程参数与状态明文
   spice_flags_without_clipboard: "disable-copy-paste=on,disable-agent-file-xfer=on"
@@ -309,7 +315,7 @@ state:
     spicevmc: true|false
     client: true|false
 probe:
-  - qemu -display help 输出包含 spice
+  - qemu -display help 输出包含 spice 或 spice-app
   - -chardev spicevmc 可用（virtserialport 可用）
   - 本地客户端（例如 remote-viewer）存在于 PATH；未传 `--clipboard` 时受控启动方式强制
     关闭 clipboard sharing，传入时仅允许文本方向
@@ -331,23 +337,20 @@ failure:
 
 ### 3.5 最小实现切片
 
-0. 前置 PoC：自管 QEMU + SPICE 的图形设备与客户端组合验证（UTM 的 `virtio-gpu-pci` 结果
-   不能直接套用）；未通过前不进入以下实现；
-1. 能力探测函数 + 单元测试（伪造 QEMU 输出：支持 / 不支持 / 命令异常三态）；
-2. 显示后端选择与命令拼装（本机端点 + 每次运行本地鉴权、始终保留唯一 virtio-serial +
-   spicevmc agent transport、剪贴板标志随 `--clipboard` 切换：未授权 `disable-copy-paste=on`、
-   授权 `disable-copy-paste=off`，`disable-agent-file-xfer=on` 保留、仅 `kali-arm64`）；
-3. 显式请求失败语义（启动前报错、不自动回退）与状态记录（缺失项与原因在 `status` 可见）；
-4. 隔离验证：agent transport 存在时的三层剪贴板负向验证（英文、中文、多行双向）、
-   未授权本地客户端无法连接；任一层不能证明隔离，路径 B 整体不实现；
-5. 默认路径回归（不传选项时命令快照与现状一致）；
-6. 手工 E2E 清单（见第 5 节），通过前不得对外宣称支持动态分辨率。
+0. [已实现门禁] 显式请求时探测 QEMU 的 spice 显示后端、`spicevmc`、`virtserialport` 与本地客户端；
+   任一缺失在启动前失败，不创建实验网或虚拟机；
+1. [已实现] 显示后端选择与命令拼装：本机 UNIX socket、0700 runtime 目录、唯一 virtio-serial +
+   spicevmc agent transport、`--clipboard` 分层开关、仅 `kali-arm64`；
+2. [已实现] 显式请求失败语义与状态记录；默认 Cocoa 命令保持不变；
+3. [部分验证] 自管 QEMU + SPICE 客户端组合已纳入独立验收 App，并完成 UNIX socket 连接、Kali
+   `spice-vdagent`、重启后恢复与两种窗口尺寸的实际 `xrandr` 跟随；未授权客户端/剪贴板负向 E2E 尚未完成；
+4. [后续任务] 补齐剪贴板与未授权客户端边界，并更新课堂分发基盘中的 XFCE 显示适配。
 
 ## 4. 路径对比
 
 | 维度 | A：独立 UTM 导出 | B：带 SPICE 的 QEMU + 本地客户端 |
 |---|---|---|
-| 动态分辨率证据 | UTM 显示机制 PoC 已验证（2026-09-14）；Smoke/Basic（x86_64 固定显示）的静态控制台 E2E 已在限定范围内通过；Kali 包动态分辨率重启后复测失败，仅保证固定显示可用 | 本机未实测，需先做 PoC |
+| 动态分辨率证据 | UTM 显示机制 PoC 已验证（2026-09-14）；Smoke/Basic（x86_64 固定显示）的静态控制台 E2E 已在限定范围内通过；Kali 包动态分辨率重启后复测失败，仅保证固定显示可用 | 带 SPICE QEMU + 受控客户端 + XFCE 适配已验证两档窗口的实际 `xrandr` 跟随；旧基盘需补装适配 |
 | 网络默认与隔离 | 默认无网卡；未来 Host Only 需固定键集 + “Isolate Guest from Host” | 保持 CTFLab 实验网与现有隔离语义 |
 | 剪贴板默认 | 关闭 UTM Clipboard Sharing；宿主/来宾双向负向 E2E | agent transport 始终保留；按 `--clipboard` 条件开关（未授权禁用复制粘贴/文件传输 + 客户端关闭共享；授权允许文本） |
 | 端点与鉴权 | 不适用（UTM 管理） | 两种互斥模式：UNIX socket（0700 目录，优先）或 TCP `127.0.0.1` + 每次运行鉴权 |
@@ -361,7 +364,7 @@ failure:
 
 ## 5. 测试矩阵
 
-单元测试（实现时补入 `tools/tests/`，本轮不实现）：
+单元测试（已补入 `tools/tests/`）：
 
 | 用例 | 断言 |
 |---|---|
@@ -379,21 +382,21 @@ failure:
 | B：agent transport 保留 | 两种剪贴板状态下都含唯一 virtio-serial + spicevmc transport |
 | B：未授权剪贴板命令 | 未传 `--clipboard` 时命令含 `disable-copy-paste=on` 与 `disable-agent-file-xfer=on`，不启用任何剪贴板方向 |
 | B：已授权剪贴板命令 | 传入 `--clipboard` 时命令为 `disable-copy-paste=off`（或省略），保留 `disable-agent-file-xfer=on`，文本方向可用 |
-| B：UNIX socket 模式 | 命令含 `unix=<0700 目录下 socket>`，且不含 `addr=`/`port=`（不把 TCP 要求混入该模式） |
+| B：UNIX socket 模式 | QEMU 11.x 命令含 `unix=on,addr=<0700 目录下 socket>`，且不含 `port=`（不监听 TCP） |
 | B：TCP 模式（回退） | 命令含 `addr=127.0.0.1,port=<受控端口>`，不含 `0.0.0.0` 或裸 `-spice`；每次运行 ticket 不出现在命令参数与状态明文 |
 | B：剪贴板通道唯一 | `--clipboard` + spice 复用同一 spicevmc 通道，不创建第二个 vdagent 通道 |
 
-手工 E2E（写入验证记录、通过后才允许宣称；本轮不执行）：
+手工 E2E（写入验证记录；正向窗口跟随已完成，边界项仍单独保留）：
 
 | 路径 | 步骤 |
 |---|---|
 | A | UTM 打开新包 → 启动 → 来宾图形会话中 `spice-vdagent` 进程运行、agent 已连接 → 两种窗口尺寸下实际 `xrandr --current` 模式跟随（动态分辨率唯一证据）→ 宿主/来宾剪贴板双向负向：英文、中文、多行哨兵均不泄漏（Clipboard Sharing 已关闭）→ 网络三层隔离：无 WAN 出口、无物理 LAN 可达、无法访问 CTFLab 实验网（`192.168.242.0/24` 不可达、Mac 无端口映射可达）→ 删除包无残留 → 用户已有 UTM 虚拟机前后哈希一致 |
-| B（正向：UNIX socket 模式） | 客户端经 `unix:<runtime_dir>/spice.sock` 连接（目录 0700、无 TCP 监听）→ 窗口缩放/全屏时 xrandr 跟随 → `--clipboard` 时英文/中文/多行文本双向逐字节一致 → `stop --graceful` 回归 → 默认 Cocoa 与 `--headless` 回归 |
-| B（正向：TCP 模式回退） | 客户端经 `127.0.0.1:<受控端口>` + 每次运行鉴权连接 → 窗口缩放/全屏时 xrandr 跟随 → `lsof -iTCP` 无非回环监听、无未授权连接 → `--clipboard` 时英文/中文/多行文本双向逐字节一致 → `stop --graceful` 回归 |
+| B（正向：UNIX socket 模式） | 客户端经 `unix:<runtime_dir>/spice.sock` 连接（目录 0700、无 TCP 监听）→ 两种实际窗口尺寸下 xrandr 跟随及冷启动恢复已验证 → `stop --all`、默认 Cocoa 与 `--headless` 回归已验证；`--clipboard` 正向专项仍待补齐 |
+| B（正向：TCP 模式回退） | 客户端经 `127.0.0.1:<受控端口>` + 每次运行鉴权连接 → 窗口缩放/全屏时 xrandr 跟随 → `lsof -iTCP` 无非回环监听、无未授权连接 → 当前未实现/未验收 TCP 回退路径 |
 | B（负向：未授权剪贴板 + 未授权客户端） | agent transport 存在、未传 `--clipboard`：宿主侧放入英文、中文、多行哨兵文本，来宾侧确认剪贴板无内容；来宾侧写入哨兵文本，宿主剪贴板哈希不变；受控客户端 clipboard sharing 已关闭；另一未授权本地客户端无法连接端点 → 任一层失败即判定隔离不成立，不得实现路径 B |
 
 回归要求：两条路径的改动都不得改变默认 `run` 命令、`stop/reset` 语义、PCAP 与健康检查行为；
-本次完整回归（2026-09-15 复核，331 项）必须全部通过。
+本次完整回归（2026-09-16 复核，359 项，5 项按历史 UTM 目录缺失规则跳过）全部通过。
 
 ## 6. 推荐路径
 
@@ -401,9 +404,9 @@ failure:
   定位为“显示体验导出”能力：复用已通过 PoC 的 UTM 显示机制（Smoke/Basic 的静态控制台 E2E 已在
   限定范围内通过；Kali 包的动态分辨率重启后复测失败，仅保证固定显示可用；该项待修复后按 2.4 重新验收），
   不动运行器、不动默认 QEMU 命令；导出包默认无网卡，不接入实验网。
-- **中期（依赖 Task 6）**：路径 B 以独立 PoC 为前置门槛（自管 QEMU + SPICE 的图形设备与
-  客户端组合，UTM 的 `virtio-gpu-pci` 结果不套用），再做能力探测、本地鉴权与三层剪贴板
-  负向 E2E；在全部通过前，显示后端不进入默认路径，文档与 CLI 都不得宣称 CTFLab 支持动态分辨率。
+- **中期（依赖 Task 6）**：路径 B 的自管 QEMU + SPICE 客户端组合已通过 UNIX socket 连接、窗口跟随
+  和冷启动恢复验证；仍需完成本地鉴权与三层剪贴板负向 E2E，并更新课堂分发基盘。全部通过前，显示
+  后端不进入默认路径，文档与 CLI 只能把它标为显式可选能力。
 - **两条路径的共同底线**：默认 Cocoa 与 `zoom-to-fit` 现状不变；
   在对应路径的 E2E 验收记录给出之前，不得声明动态分辨率已支持。
 
@@ -420,13 +423,13 @@ failure:
 - 剪贴板不做隐式开关：agent transport 始终保留；未授权时禁用复制粘贴与文件传输（含客户端），
   授权时才允许文本方向；任一层无法证明未授权隔离就不实现路径 B；
 - 不允许路径 B 用于 `kali-arm64` 之外的 profile；不把 UTM 的 `virtio-gpu-pci` 结果直接
-  套用到自管 QEMU + SPICE（独立 PoC 未通过前不实现）；
-- 不在 Task 6 打包完成前分发或内置 QEMU 与 SPICE 客户端二进制；
+  套用到自管 QEMU + SPICE（自管路径的窗口跟随已单独验收，剪贴板和鉴权边界仍待验收）；
 - 不允许 SPICE 以非本机方式暴露：TCP 仅 `127.0.0.1` + 每次运行鉴权，UNIX socket 仅
   0700 runtime 目录；不以 VNC 作为默认显示路径；
-- 本次新增的仅有路径 A 的 `utm-export` 导出命令；未新增 `run --display`、SPICE 显示参数或
-  任何默认显示路径/默认 QEMU 命令变更（既有 `probe --matrix` 等参数不属于显示功能）；
-- 本轮不实现 UTM 后端与 SPICE 后端（本文只是设计）。
+- 本次路径 B 新增的是显式 `run --display cocoa|spice` 能力门禁与 SPICE 命令构造；默认不传参数时
+  仍是 Cocoa，绝不静默回退；SPICE 二进制与客户端只在经过许可/SBOM/签名核验的可选 runtime 中进入验收包；
+- 本轮不改变 UTM 后端；SPICE 后端与可选 runtime 配合 XFCE 适配已完成两档窗口跟随，
+  旧分发基盘未更新，当前不宣称所有既有分发包的动态分辨率已交付。
 
 ## 8. 仍需决策的问题
 

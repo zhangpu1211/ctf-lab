@@ -187,6 +187,10 @@ def make_source_root(path: pathlib.Path, *, with_decoys: bool = False,
     (path / "tools" / "guest_fixes" / "smoke" / "interfaces").write_text("auto lo\n", encoding="utf-8")
     (path / "README.md").write_text("# stub\n", encoding="utf-8")
     (path / "LICENSE").write_text("MIT License\n\nstub for tests\n", encoding="utf-8")
+    gui_dir = path / ctflab_app.GUI_SOURCE_DIR
+    gui_dir.mkdir(parents=True, exist_ok=True)
+    for name in ctflab_app.GUI_SOURCES:
+        (gui_dir / name).write_text(f"// stub {name}\n", encoding="utf-8")
     if with_vendored:
         # 假 runtime 的 dylib 不在 /opt/homebrew 下，formula 归为 unknown；
         # 在 vendored 目录里放文本即可命中回退路径。
@@ -212,6 +216,15 @@ class AppTestCase(unittest.TestCase):
         cls.source_root = make_source_root(base / "src")
         cls.fake_python = FakePythonRuntime(base / "fakepython").build()
         cls.fake_pyyaml = make_fake_pyyaml(base / "pyyaml-6.0.3-cp312-cp312-macosx_11_0_arm64.whl")
+        # 预编译的 GUI 入口替身：避免每个用例都调用 swiftc（真实编译路径由专门的用例覆盖）。
+        cls.fake_gui = base / "CTFLabGUI-stub"
+        with tempfile.TemporaryDirectory() as temp:
+            stub_c = pathlib.Path(temp) / "gui.c"
+            stub_c.write_text("int main(void) { return 0; }\n", encoding="utf-8")
+            result = subprocess.run([CLANG, "-o", str(cls.fake_gui), str(stub_c)],
+                                    capture_output=True, text=True)
+            if result.returncode != 0:
+                raise RuntimeError(result.stderr)
 
     @classmethod
     def tearDownClass(cls) -> None:
@@ -235,6 +248,7 @@ class AppTestCase(unittest.TestCase):
             "allow_incomplete_license_texts": True,
             "unsigned": True,
             "share_files": FAKE_SHARE_FILES,
+            "gui_binary": self.fake_gui,
         }
         params.update(kwargs)
         return ctflab_app.build_app(self.out, **params)
@@ -244,7 +258,9 @@ class StructureTests(AppTestCase):
     def test_required_structure_and_info_plist(self) -> None:
         result = self.build()
         app = pathlib.Path(result["app"])
-        for rel in ("Contents/Info.plist", "Contents/MacOS/CTFLab",
+        for rel in ("Contents/Info.plist",
+                    f"Contents/MacOS/{ctflab_app.GUI_EXECUTABLE}",
+                    ctflab_app.LAUNCHER_REL, ctflab_app.LAUNCHER_COMPAT_REL,
                     "Contents/Resources/ctflab/tools/ctflab.py",
                     "Contents/Resources/MANIFEST.json", "Contents/Resources/SBOM.json",
                     "Contents/Resources/THIRD_PARTY_LICENSES.md",
@@ -253,7 +269,7 @@ class StructureTests(AppTestCase):
                     "Contents/Resources/runtime/share/qemu"):
             self.assertTrue((app / rel).exists(), f"缺少 {rel}")
         info = plistlib.loads((app / "Contents/Info.plist").read_bytes())
-        self.assertEqual(info["CFBundleExecutable"], "CTFLab")
+        self.assertEqual(info["CFBundleExecutable"], ctflab_app.GUI_EXECUTABLE)
         self.assertEqual(info["CFBundleIdentifier"], ctflab_app.BUNDLE_IDENTIFIER)
         self.assertEqual(info["CFBundleShortVersionString"], "0.1.0")
 

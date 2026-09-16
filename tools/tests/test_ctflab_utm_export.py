@@ -1167,10 +1167,10 @@ class CliSurfaceTests(unittest.TestCase):
         for forbidden in ("--force", "--overwrite", "--template", "--clipboard", "--network"):
             self.assertNotIn(forbidden, options)
 
-    def test_run_still_has_no_display_backend(self) -> None:
+    def test_run_exposes_explicit_display_backend(self) -> None:
         sub = self.subcommands()["run"]
         options = {option for action in sub._actions for option in action.option_strings}
-        self.assertNotIn("--display", options)
+        self.assertIn("--display", options)
 
     def test_cmd_utm_export_reports_bundle_and_pending_e2e(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

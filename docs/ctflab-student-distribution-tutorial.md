@@ -14,8 +14,8 @@
 当前开发机已生成的实际位置是：
 
 ```text
-/Users/pufei/Downloads/ctflab-app-build-20260916/CTFLab.app
-/Users/pufei/Downloads/ctflab-dist-20260916/
+/Users/pufei/Downloads/ctflab-app-build-spice-release-20260916/CTFLab.app
+/Users/pufei/Downloads/ctflab-dist-spice-release-20260916/
 ```
 
 当前分发目录中的文件为：
@@ -32,27 +32,56 @@ basic-pentesting-2-base.qcow2
 
 这两个绝对路径是本机产物位置，不是学生机器上的固定路径。复制或下载后，后续命令只需要把
 `APP_DIR` 和 `DIST_DIR` 改成实际位置。分发目录约 9.2GB，`.app` 约 264MB；不要把这些
-虚拟磁盘提交到 Git 仓库。
+虚拟磁盘提交到 Git 仓库。当前新版 App 约 302MB；旧的无 SPICE 产物和旧分发目录仍保留，但不含本轮
+Kali 显示适配，课堂使用应以这里列出的新版路径为准。
 
-## 2. 设置路径
+## 2. 图形界面流程（推荐：双击打开）
+
+导入和启动现在不需要终端。双击 `CTFLab.app`（首次打开按 §3 手动放行一次）后：
+
+1. **选择分发目录**：点“选择…”，选中包含 `DISTRIBUTION.json`、`SHA256SUMS` 与三个基盘的目录；
+   App 会自动识别清单里登记的文件；对话框里可以直接用 `⌘⇧G` 粘贴路径。
+2. **校验分发目录**：点“校验分发目录”。表格会逐文件显示大小、状态与失败原因；
+   **任何一个文件哈希不一致时，“导入实验环境”和“启动全部”保持禁用**——先重新下载，不要绕过。
+3. **导入实验环境**：点一次，App 会依次对 `kali-arm64`、`smoke`、`basic-pentesting-2` 执行
+   与命令行完全相同的 `--manifest` 导入（Kali 的 UEFI NVRAM 会按清单自动配对）。
+   进度、成功/失败与 CLI 原文都显示在窗口里；导入失败会停在该节点并给出可复制的错误信息。
+4. **启动全部**：三个节点一起启动（Kali 图形窗口 + 两台靶机）。
+5. **检查状态**：显示每个节点是否已导入、是否运行、健康检查结果与日志路径。
+
+6. **Kali 联网维护**（仅在老师明确授权时）：确认所有节点都已停止后，点击“Kali 联网维护…”，
+   再确认弹窗。它只启动 Kali 的临时 user-net 出口，不启动 Smoke/Basic；维护结束必须点击“停止全部”，
+   然后用默认“启动全部”恢复隔离实验网。
+7. **Kali 动态分辨率**：点击“Kali 动态分辨率…”可请求 SPICE 图形会话。只有 `app verify` 报告包含
+   SPICE-capable QEMU 与本地客户端的构建才会启动；缺件会在创建虚拟机前明确报错，不会把窗口缩放冒充动态分辨率。
+
+其他按钮：**停止全部**（同时停止三个节点并清理实验网）、**重置…**（逐节点删除运行 overlay；
+会先弹出确认框，明确提示 overlay 中的实验改动会丢失，基础镜像不受影响）。
+
+重新打开 App 时会自动读取状态目录，已导入/运行中的节点会恢复显示；重复导入同一份分发目录
+是幂等的，不会覆盖已验证的基盘。窗口底部始终显示当前执行的 CLI 命令与输出，排障时可直接复制。
+
+## 3. 命令行流程（开发者 / 排障）
+
+需要脚本化或排查问题时，使用 App 内置的 CLI（与图形界面是同一套逻辑）：
 
 将 `.app` 和分发目录放在本机可读写的位置后，在终端执行：
 
 ```zsh
 APP_DIR="/path/to/CTFLab.app"
 DIST_DIR="/path/to/ctflab-dist-20260916"
-CLI="$APP_DIR/Contents/MacOS/CTFLab"
+CLI="$APP_DIR/Contents/Resources/bin/CTFLab"
 ```
 
 例如，直接使用当前开发机产物：
 
 ```zsh
-APP_DIR="/Users/pufei/Downloads/ctflab-app-build-20260916/CTFLab.app"
-DIST_DIR="/Users/pufei/Downloads/ctflab-dist-20260916"
-CLI="$APP_DIR/Contents/MacOS/CTFLab"
+APP_DIR="/Users/pufei/Downloads/ctflab-app-build-spice-release-20260916/CTFLab.app"
+DIST_DIR="/Users/pufei/Downloads/ctflab-dist-spice-release-20260916"
+CLI="$APP_DIR/Contents/Resources/bin/CTFLab"
 ```
 
-## 3. 首次打开 App
+## 4. 首次打开 App
 
 首次双击 `CTFLab.app` 时，macOS 可能提示无法验证开发者。当前构建为本地 ad-hoc 签名，尚未
 进行 Developer ID 签名和公证：
@@ -64,7 +93,7 @@ CLI="$APP_DIR/Contents/MacOS/CTFLab"
 也可以直接使用上面设置的 `CLI` 路径运行命令。不要从网上下载其他 QEMU 或替换 App 内的
 运行时文件。
 
-## 4. 校验 App 和分发目录
+## 5. 校验 App 和分发目录
 
 先校验 App 本身：
 
@@ -85,7 +114,7 @@ CLI="$APP_DIR/Contents/MacOS/CTFLab"
 两次校验都必须通过。若出现 SHA-256 不一致，删除不完整的下载并重新获取；不要使用参数绕过校验，
 也不要继续导入损坏或被替换的文件。
 
-## 5. 导入三个实验节点
+## 6. 导入三个实验节点
 
 清单会按 profile 核对每个基盘的 SHA-256。导入 Kali 时，还会从同一清单自动找到并登记配套的
 UEFI NVRAM 模板；不要把 Kali 基盘和其他 profile 的文件混用。
@@ -110,7 +139,7 @@ UEFI NVRAM 模板；不要把 Kali 基盘和其他 profile 的文件混用。
 源分发目录保持不变，运行时写入独立 overlay。导入记录中的 `image.json.source_verification` 会
 保存清单校验的证据。重复导入同一文件是幂等操作，不会覆盖已验证的基盘。
 
-## 6. 启动并检查实验网
+## 7. 启动并检查实验网
 
 首次使用建议同时启动 Kali 和两台靶机：
 
@@ -138,7 +167,7 @@ Kali 会打开 QEMU 图形窗口；两台 x86 靶机也可能打开窗口，但�
 "$CLI" run kali-arm64 smoke basic-pentesting-2 --headless
 ```
 
-## 7. 课堂中的常用操作
+## 8. 课堂中的常用操作
 
 需要在 Kali 图形桌面中复制文本时，停止后用 `--clipboard` 重新启动：
 
@@ -174,7 +203,7 @@ Kali 会打开 QEMU 图形窗口；两台 x86 靶机也可能打开窗口，但�
 `reset` 只删除运行 overlay，不删除已导入基盘，也不修改原始分发目录；但本次 overlay 中的
 实验改动会丢失。
 
-## 8. 常见问题
+## 9. 常见问题
 
 ### 导入时报 SHA-256 不一致
 
@@ -217,7 +246,27 @@ echo "$CLI"
 课堂默认不允许这样做。`--internet` 仅用于单独启动 Kali 的软件维护，不能与 Smoke 或 Basic
 Pentesting 2 同时启动；未经授权不要扩大网络边界。
 
-## 9. 给老师/助教的交付核对
+图形界面的“Kali 联网维护…”与命令行下面的 `--internet` 是同一能力。联网完成后必须先停止 Kali，
+再按默认隔离模式启动实验节点；不要把 `--internet` 用在 Smoke、Basic Pentesting 2 或多节点命令上。
+
+### 想让 Kali 窗口跟随来宾分辨率
+
+使用带 SPICE 的新版 App，点击“Kali 动态分辨率…”，登录 Kali 桌面后拖动窗口即可。
+Retina 屏的窗口逻辑尺寸与来宾像素尺寸可能为 1:2，例如 1000×700 对应 2000×1400。
+当前机器上的 Kali 已安装显示适配；旧分发目录内的基盘尚未更新，重新导入或重置旧基盘后需由老师补装。
+老师在 Kali 内运行新版 `tools/guest_fixes/kali-arm64/configure.sh --display-only`（需 sudo）后重新登录；
+此选项仅安装显示适配，不重配网络。新版无人值守安装会自动包含该适配。
+
+命令行显式请求 SPICE：
+
+```zsh
+"$CLI" run kali-arm64 --display spice
+```
+
+该模式要求 SPICE-capable QEMU、`spicevmc`/`virtserialport` 和本地 SPICE 客户端；缺任一项会在启动前
+拒绝。默认 `"$CLI" run kali-arm64` 仍使用 Cocoa 缩放，不是动态分辨率。
+
+## 10. 给老师/助教的交付核对
 
 发布给学生前，至少确认：
 

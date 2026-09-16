@@ -13,7 +13,7 @@
 | `smoke-base.qcow2` | `base-b3112d219743-netfix1.qcow2` | 约 0.1GB | Smoke 靶机基盘 |
 | `basic-pentesting-2-base.qcow2` | `base-c68a185c1bb3-netfix1.qcow2` | 约 0.8GB | Basic Pentesting 2 基盘 |
 | `DISTRIBUTION.json` / `SHA256SUMS` / `README.md` | `ctflab dist prepare` 生成 | 数 KB | 清单与校验 |
-| `CTFLab.app` | `app build` 产物（自带 `.sha256` 旁车） | 264MB | 运行器（含 QEMU + Python，无需另装） |
+| `CTFLab.app` | `app build` 产物（自带 `.sha256` 旁车） | 约 302MB | 运行器（含 QEMU + Python + 可选 SPICE，无需另装） |
 
 压缩产物是**标准 qcow2**（zstd 压缩簇），`qemu-img` 与 CTFLab 都能直接读，学生不需要解包。
 
@@ -50,11 +50,11 @@ python3 tools/ctflab.py dist verify --dir ~/Downloads/ctflab-dist
 shasum -a 256 -c SHA256SUMS
 
 # 2) 导入：清单会强制核对基盘哈希，并自动套用配套的 NVRAM 模板
-CTFLab.app/Contents/MacOS/CTFLab import kali-arm64 ~/Downloads/kali-arm64-base.qcow2 \
+CTFLab.app/Contents/Resources/bin/CTFLab import kali-arm64 ~/Downloads/kali-arm64-base.qcow2 \
   --manifest ~/Downloads/DISTRIBUTION.json
 
 # 3) 启动
-CTFLab.app/Contents/MacOS/CTFLab run kali-arm64
+CTFLab.app/Contents/Resources/bin/CTFLab run kali-arm64
 ```
 
 - 哈希不一致时导入**直接失败**并打印期望值与实际值：重新下载，不要绕过；

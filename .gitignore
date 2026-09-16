@@ -6,6 +6,7 @@
 !/LICENSE
 !/docs/
 !/tools/
+!/gui/
 
 /docs/*
 !/docs/ctflab-mac-mvp-implementation-plan.md
@@ -23,6 +24,8 @@
 !/docs/ctflab-task6-app-runtime-design.md
 !/docs/verification-task6-2-2026-09-15.md
 !/docs/verification-task6-3a-2026-09-15.md
+!/docs/verification-gui-2026-09-16.md
+!/docs/verification-display-network-2026-09-16.md
 !/docs/verification-task6-3b-2026-09-15.md
 !/docs/verification-distribution-2026-09-16.md
 
@@ -40,13 +43,21 @@
 !/tools/ctflab_app_kali_e2e.py
 !/tools/ctflab_utm_fixture.json
 !/tools/ctflab_profiles/
+/gui/*
+!/gui/*.swift
 !/tools/guest_fixes/
 !/tools/licenses/
+!/tools/spice_client/
+/tools/spice_client/*
+!/tools/spice_client/ctflab_spicy.c
 !/tools/tests/
 
 # vendored 许可证文本：只允许明确登记的组件目录与文件（默认拒绝）。
 /tools/licenses/*
 !/tools/licenses/PROVENANCE.md
+!/tools/licenses/sqlite/
+/tools/licenses/sqlite/*
+!/tools/licenses/sqlite/BLESSING
 !/tools/licenses/dtc/
 /tools/licenses/dtc/*
 !/tools/licenses/dtc/GPL

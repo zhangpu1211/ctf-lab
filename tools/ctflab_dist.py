@@ -291,17 +291,46 @@ def verify_distribution(out_dir: Path) -> dict[str, Any]:
         _expect(name and Path(name).name == name, f"清单条目文件名不合法：{name!r}")
         _expect(_SHA256_RE.match(str(entry.get("sha256", ""))),
                 f"清单条目哈希不合法：{name}")
+        row: dict[str, Any] = {
+            "file": name,
+            "profile": entry.get("profile"),
+            "role": entry.get("role"),
+            "expected_size": entry.get("size"),
+            "expected_sha256": entry["sha256"],
+        }
         path = out_dir / name
         if not path.is_file():
             problems.append(f"清单登记但文件缺失：{name}")
+            row.update({"status": "missing", "problem": "文件缺失"})
+            checked.append(row)
             continue
         size = path.stat().st_size
-        if int(entry.get("size", -1)) != size:
-            problems.append(f"{name}: 大小不一致（清单 {entry.get('size')}，实际 {size}）")
+        row["size"] = size
         digest = sha256_file(path)
-        if digest != entry["sha256"]:
-            problems.append(f"{name}: SHA-256 不一致（清单 {entry['sha256'][:12]}…，"
-                            f"实际 {digest[:12]}…）")
-        checked.append({"file": name, "profile": entry.get("profile"), "role": entry.get("role")})
-    return {"ok": not problems, "entries": checked, "problems": problems,
-            "manifest": str(manifest_path(out_dir))}
+        row["sha256"] = digest
+        size_ok = int(entry.get("size", -1)) == size
+        hash_ok = digest == entry["sha256"]
+        size_problem = f"大小不一致（清单 {entry.get('size')}，实际 {size}）"
+        hash_problem = (f"SHA-256 不一致（清单 {entry['sha256'][:12]}…，"
+                        f"实际 {digest[:12]}…）")
+        # 两项都检查、都上报（沿用既有文本语义）；行状态取更严重的一类。
+        if not size_ok:
+            problems.append(f"{name}: {size_problem}")
+        if not hash_ok:
+            problems.append(f"{name}: {hash_problem}")
+        if size_ok and hash_ok:
+            row.update({"status": "ok", "problem": None})
+        elif not hash_ok:
+            row.update({"status": "sha256-mismatch", "problem": hash_problem})
+        else:
+            row.update({"status": "size-mismatch", "problem": size_problem})
+        checked.append(row)
+    ok_count = sum(1 for row in checked if row.get("status") == "ok")
+    return {
+        "ok": not problems,
+        "entries": checked,
+        "problems": problems,
+        "manifest": str(manifest_path(out_dir)),
+        "dir": str(out_dir),
+        "summary": {"total": len(checked), "ok": ok_count, "failed": len(problems)},
+    }

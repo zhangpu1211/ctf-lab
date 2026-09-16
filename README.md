@@ -19,6 +19,8 @@ CTFLab 是面向 Apple Silicon Mac 的本地虚拟靶场运行器。它使用 QE
 - `CTFLab.app` 自带受控 QEMU 与 Python 运行时（含 PyYAML），目标机器无需安装任何环境；
 - 基盘分发链（路线 A）：`dist prepare/verify` 生成 zstd 压缩基盘、`DISTRIBUTION.json`、`SHA256SUMS`
   与分发说明；`import --manifest/--expect-sha256` 强制核对下载文件哈希并把校验证据写入导入记录。
+- Kali 图形模式支持显式选择 SPICE 动态分辨率（`run kali-arm64 --display spice`）；启动前会探测
+  SPICE QEMU、`spicevmc`、`virtserialport` 与本地客户端，缺件直接失败，不回退为缩放。
 
 ## 快速开始
 
@@ -59,6 +61,26 @@ ctflab run kali-arm64                           # 3) 启动
 
 自动探测输出的是候选，不是启动保证。磁盘文件通常无法可靠提供客体 CPU 架构、来宾网卡名、登录状态和服务清单；低置信度字段必须核对来源，probe 截图也必须排除 UEFI Shell 或错误画面。
 
+## 图形入口
+
+`CTFLab.app` 的主入口是原生 SwiftUI 界面（Apple Silicon、macOS 13+，不依赖 Electron/Node/浏览器）：
+
+- 流程：选择课程分发目录 → 校验（逐文件大小与 SHA-256，失败即禁用导入与启动）→ 导入三个节点 →
+  启动全部 → 检查状态（health）→ 停止全部 → 重置（先弹确认框，明确提示 overlay 改动会丢失）；
+- 图形界面只调用内置 CLI：`dist verify --json`、`import <profile> <基盘> --manifest`、`run`、
+  `status --json`、`health --json`、`stop --all`、`reset <profile>`；Kali 的“联网维护”和“动态分辨率”
+  是单独确认的 Kali-only 动作，不解析任意 QEMU 参数、不绕过清单哈希；命令行对应的维护命令是
+  `run kali-arm64 --internet`，动态分辨率请求是 `run kali-arm64 --display spice`；路径含空格按单一参数传递；
+- 重新打开 App 会通过 `status` 恢复已导入/运行中显示；重复导入是幂等的，不覆盖已验证基盘；
+- CLI 保留在 `CTFLab.app/Contents/Resources/bin/ctflab-cli`（兼容名 `CTFLab`），
+  供开发、脚本化与故障排查使用，与图形界面共享同一状态目录与同一导入逻辑。
+
+Smoke/Basic 的静态控制台 E2E 已在限定范围内通过；默认 Cocoa/旧课堂分发包仍仅保证固定显示可用，
+旧 UTM 路径动态分辨率仍不稳定；本轮 SPICE 构建配合 Kali 显示适配，已测得窗口尺寸跟随。
+提供带 SPICE QEMU 与本地 `spicy` 客户端的构建才启用 `--display spice`；未提供该运行时或能力探测失败时，
+命令会在创建虚拟机前拒绝，不自动回退 Cocoa。当前验收包与限制见
+[`联网与动态分辨率验证记录`](docs/verification-display-network-2026-09-16.md)。
+
 ## 测试
 
 ```bash
@@ -71,7 +93,7 @@ python3 -m py_compile tools/ctflab.py tools/ctflab_inspect.py tools/ctflab_netwo
 - [第一阶段快速使用](docs/ctflab-phase1-quickstart.md)
 - [学生分发版使用教程：校验、导入、启动与重置](docs/ctflab-student-distribution-tutorial.md)
 - [完整实施计划与路线图](docs/ctflab-mac-mvp-implementation-plan.md)
-- [动态分辨率设计：UTM 导出与 SPICE 路径对比（Smoke/Basic 的 x86_64 固定显示、静态控制台 E2E 已在限定范围内通过；动态分辨率仍不稳定；路径 B 未实现）](docs/ctflab-dynamic-resolution-design.md)
+- [动态分辨率设计：UTM 导出与 SPICE 路径对比（SPICE 窗口跟随已验证，旧镜像需显示适配）](docs/ctflab-dynamic-resolution-design.md)
 - [2026-09-06 Mac M 回归验证](docs/verification-2026-09-06.md)
 - [2026-09-07 Kali 安装、图形与互通验证](docs/verification-2026-09-07.md)
 - [2026-09-13 Kali 图形体验验证（剪贴板、分辨率、关闭策略、Ghidra 帮助）](docs/verification-2026-09-13.md)
@@ -83,9 +105,11 @@ python3 -m py_compile tools/ctflab.py tools/ctflab_inspect.py tools/ctflab_netwo
 - [Task 6.2 设计：受控 QEMU 运行时的 CTFLab.app](docs/ctflab-task6-app-runtime-design.md)
 - [Task 6.2 验证记录（2026-09-15）](docs/verification-task6-2-2026-09-15.md)
 - [Task 6.3A 验证记录：Kali ARM64 + UEFI 真实验收（2026-09-15）](docs/verification-task6-3a-2026-09-15.md)
+- [图形入口验证记录（2026-09-16）](docs/verification-gui-2026-09-16.md)
 - [Task 6.3B 验证记录：许可证闭环与内置 Python 运行时（2026-09-15）](docs/verification-task6-3b-2026-09-15.md)
 - [基盘分发指南（路线 A：网盘 / 课程资料区）](docs/ctflab-distribution-guide.md)
 - [分发链验证记录：压缩基盘与可校验导入（2026-09-16）](docs/verification-distribution-2026-09-16.md)
+- [联网与动态分辨率功能验证记录（2026-09-16）](docs/verification-display-network-2026-09-16.md)
 
 ## 许可证
 

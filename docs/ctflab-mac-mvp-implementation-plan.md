@@ -1,6 +1,6 @@
 # CTFLab Mac M 跨架构靶场实施方案
 
-> 状态（2026-09-16）：Phase 1 **核心课堂版已收口**。核心运行器、ARM64 Kali + UEFI、隔离实验网、生命周期保护、受控 QEMU/Python 运行时、许可证闭环和路线 A 基盘分发链均已落地并有独立验证记录；最近完整回归为 331 项通过，`.app` smoke E2E 为 15/15，最终分发目录中的三个压缩基盘 + NVRAM 已完成 Kali 29/29 E2E。正式发布边界仍单独保留：Developer ID 签名/公证、真实新 macOS 用户验收、真实网盘上传/下载、第三方靶盘再分发条款，以及不属于当前课堂主路径的 Go 交换机、主机直连、动态分辨率和靶机应用级回连。本文是后续开发、测试、打包和验收的范围基线。验收状态只使用四类标签：**已验证 / 部分验证 / 未验证 / 后续任务**（定义见第 7 节）。
+> 状态（2026-09-16）：Phase 1 **核心课堂版已收口**。核心运行器、ARM64 Kali + UEFI、隔离实验网、生命周期保护、受控 QEMU/Python 运行时、许可证闭环和路线 A 基盘分发链均已落地并有独立验证记录；最近完整回归为 359 项（5 项按历史 UTM 交付目录缺失规则跳过），`.app` smoke E2E 为 15/15，最终分发目录中的三个压缩基盘 + NVRAM 已完成 Kali 29/29 E2E。正式发布边界仍单独保留：Developer ID 签名/公证、真实新 macOS 用户验收、真实网盘上传/下载、第三方靶盘再分发条款，以及不属于当前课堂主路径的 Go 交换机、主机直连、SPICE 动态分辨率完整边界验收和靶机应用级回连。本文是后续开发、测试、打包和验收的范围基线。验收状态只使用四类标签：**已验证 / 部分验证 / 未验证 / 后续任务**（定义见第 7 节）。
 
 ## 1. 目标与边界
 
@@ -96,7 +96,7 @@ Phase 0 的成功标准不是“成功转成 qcow2”，而是“在当前 Mac M
 
 - **Kali ARM64：** 使用 `qemu-system-aarch64`、`-accel hvf`、VirtIO 磁盘/网卡/显示设备；这是日常图形桌面和工具的主力。
 - **x86 靶机：** 使用 `qemu-system-x86_64`、`-accel tcg,thread=multi`；性能重点是服务可用和漏洞复现，不把它作为图形工作站。
-- **显示：** 首版输出独立的本地图形窗口，使用 `virtio-gpu`，优先启用经过验证的 GL 路径，失败自动回落到 2D 模式。当前实现中 `qemu-vdagent` 通道**仅是经授权的文本剪贴板路径**（`--clipboard`），SPICE 显示与动态分辨率**均未实现**；不以 VNC 作为默认显示路径。现状：文本剪贴板已交付；动态分辨率未交付——默认路径（Homebrew QEMU + Cocoa）只有 `zoom-to-fit` 缩放，不是动态分辨率；两条真实路径（UTM 导出、将来分发带 SPICE 的 QEMU + 本地客户端）的对比与推荐见 `docs/ctflab-dynamic-resolution-design.md`（设计文档，未实现）。
+- **显示：** 首版输出独立的本地图形窗口，使用 `virtio-gpu`，优先启用经过验证的 GL 路径，失败自动回落到 2D 模式。默认路径（Homebrew QEMU + Cocoa）只有 `zoom-to-fit` 缩放，不是动态分辨率；显式 `--display spice` 已接入能力探测、Kali-only 门禁、本机 UNIX socket、`spicevmc` agent transport 和可选运行时打包。SPICE 配合 XFCE 显示适配已验证两档窗口 `xrandr` 跟随；旧分发基盘需补装适配，默认显示路径仍不改变；详见 `docs/ctflab-dynamic-resolution-design.md`。
 - **存储：** 所有实验运行从不可变基础镜像创建 qcow2 overlay，重置时删除 overlay 后重新创建，基础镜像不被修改。
 
 ### 3.2 网络策略
@@ -294,7 +294,7 @@ network:
 
 - 默认启动 Kali 本地图形窗口；
 - 支持全屏、窗口缩放、1920×1080、键盘与鼠标；
-- 自动安装并验证 guest agent 的文本剪贴板（已交付）；动态分辨率尚未交付（默认 Cocoa 路径不支持，见第 7 节与 `docs/ctflab-dynamic-resolution-design.md`）；
+- 自动安装并验证 guest agent 的文本剪贴板（已交付）；`qemu-vdagent` 仅是经授权的文本剪贴板路径；SPICE 显示与动态分辨率仍尚未完成包含剪贴板隔离和客户端鉴权的完整验收（默认 Cocoa 路径不支持，SPICE 窗口跟随与冷启动恢复已完成，见第 7 节与 `docs/ctflab-dynamic-resolution-design.md`）；
 - 允许 `ctflab run kali --headless`，但默认不启用；
 - 关闭显示窗口时明确选择“关机”或“后台继续运行”；
 - 对 VirGL/GL 渲染失败自动退回稳定的 2D 显示设备。
@@ -365,7 +365,7 @@ qemu-img create -f qcow2 -F qcow2 \
 - [x] 验证 XFCE 登录、键盘、鼠标、1920×1080 手动显示及 Firefox/Burp/Wireshark 主界面。
 - [x] 验证 XFCE 登录、窗口缩放、键盘、鼠标和至少 1920×1080 显示。
 - [x] 安装/验证 guest agent 的文本剪贴板：Mac↔Kali 双向（英文/中文/多行）、关闭通道不共享、重启后可用。
-- [ ] 动态分辨率：默认路径（QEMU 11.1 + cocoa + virtio-gpu）没有让来宾分辨率跟随窗口的通道（2026-09-13 证据）。两条真实路径与推荐见 `docs/ctflab-dynamic-resolution-design.md`：A. 独立 UTM 导出/适配——`utm-export` 已实现（aarch64+UEFI 与 x86_64+BIOS 两个变体），UTM 4.7.5 必需段/必需键已按上游源码补齐；2026-09-14 R1 导入被拒后，R2 已通过 UTM 导入/解析、冷启动与 Kali 图形登录、剪贴板负向、网络隔离与来宾内正常关机，会话内动态分辨率三档跟随但**重启后复测失败（显示链路不稳定，当前包仅保证固定显示可用）**；Smoke 与 Basic Pentesting 2 两包已交付并通过 UTM E2E（导入/冷启动/控制台登录/交互/ACPI 正常关机/盘完整性），导出包默认无网卡，详见 `docs/verification-2026-09-14.md` 第 6 节与两份 `verification-utm-*.md`；B. 将来分发带 SPICE 的 QEMU + 本地 SPICE 客户端——显式请求时能力探测失败必须启动前报错，仅监听 127.0.0.1，未传显示参数时保持 Cocoa 默认，剪贴板未授权不得共享（路径 B 未实现）。
+- [ ] 动态分辨率：默认路径（QEMU 11.1 + cocoa + virtio-gpu）没有让来宾分辨率跟随窗口的通道（2026-09-13 证据）。UTM 路线 A 的动态链路重启后复测失败，旧包仅保证固定显示可用；路径 B 已接入 `run --display spice`、受控客户端与 XFCE 适配，已验证两档窗口跟随及冷启动后适配自动启动。待更新旧分发基盘，并补齐剪贴板负向和客户端鉴权 E2E。按 `docs/ctflab-dynamic-resolution-design.md` 第 5 节继续验收。
 - [x] 明确显示窗口关闭策略：确认框 + ACPI 电源键，来宾确认后正常关机；不提供隐藏后台（需要后台请用 `--headless`）。
 
 2026-09-07：`--headless` 已实现，窗口关闭策略、动态缩放和剪贴板仍未验收。新增 `install/install-status/stop-install/finalize-install`，以及只允许 Kali 独占运行的 `--internet` 维护模式；`--from-runtime` 可保留旧盘并固化维护成果。独立重装实例已验证无需手工修复即可 DHCP/SSH 登录。Ghidra 已安装并出现项目窗口，但首次帮助页报错，不能列为完整工具验收通过。
@@ -457,6 +457,15 @@ reset 后无残留、App 树哈希不变、`qemu-img check` 通过。过程中�
 entitlement 丢失缺陷（HVF `HV_NO_DEVICE`），并在复核中收紧为 entitlement 键和值完全一致。
 **仍未做** Developer ID 签名与公证。详见
 `docs/verification-task6-3a-2026-09-15.md`。
+
+2026-09-16（图形入口）证据：`CTFLab.app` 主入口改为原生 SwiftUI/AppKit（`Contents/MacOS/CTFLabGUI`），
+CLI 保留在 `Contents/Resources/bin/{ctflab-cli,CTFLab}` 供开发与排障；学生双击 App 即可完成
+“选择分发目录 → 校验 → 导入三个节点 → 启动全部 → 检查状态（健康）→ 停止全部 → 重置（带确认框）”，
+不再需要手输 import 命令。GUI 只调用既有 CLI（`dist verify --json`、`import <profile> <基盘> --manifest`、
+`run`、`status --json`、`health --json`、`stop --all`、`reset <profile>`），并以固定动作提供 Kali 联网维护
+与 SPICE 动态分辨率请求，不解析任意 QEMU 参数、不绕过清单哈希。验证：GUI 单元测试（Swift 核心 + CLI JSON 契约 +
+构建集成）与实机点击验证（校验通过/错误目录拒绝/导入完成/三节点启动并健康通过/停止无残留/重置确认）
+见 `docs/verification-gui-2026-09-16.md`；**未做** Developer ID 签名与公证。
 
 2026-09-15（Task 6.3B）证据：许可证闭环（项目 MIT + `LICENSE` 随包、`dtc`/libfdt 文本
 vendored、QEMU 源码书面要约 `SOURCE_OFFER.md`，`distribution_blockers` 清零）与 `.app`
@@ -567,9 +576,10 @@ Mac 端口映射、受控 QEMU/Python 运行时、许可证闭环和路线 A 分
    可作为候选交付；若要允许联网维护或接入物理网络，应先用 `CTFLAB_INSTALL_PASSWORD` 重装/固化新基盘，
    并在分发说明中明确该边界。
 
-**当前不建议插入的工作：** 主机直连、Go 交换机迁移和动态分辨率都会扩大权限、兼容性或显示链路风险，
-而当前无权限端口映射已经满足 Kali→靶机和 Mac→靶机的已验证教学路径。只有课程确实需要 Mac 直接扫描实验网、
-交换机性能/跨平台复用成为瓶颈，或动态分辨率成为明确的使用阻塞时，才分别启动 Task 5、Task 4 或 Task 3 的专项工作。
+**当前不建议插入的工作：** 主机直连、Go 交换机迁移仍会扩大权限与网络风险；当前无权限端口映射已经满足
+Kali→靶机和 Mac→靶机的已验证教学路径。动态分辨率专项已完成 SPICE 窗口跟随与冷启动恢复验证，但在剪贴板
+隔离、客户端鉴权负向 E2E 和旧分发基盘更新完成前不进入默认课堂路径；Task 5、靶机应用级回连仍按明确课程用例和
+可逆夹具单独启动。
 靶机应用级回连则应在有明确课程用例、两端均为自有靶机且有可逆验证夹具后单独验收，不能用现有 PCAP 帧级证据替代。
 
 **收口门槛：** 当前课堂版已满足：`.app` 运行时零手工依赖证据、最终分发目录哈希可复核、三个压缩基盘完成真实

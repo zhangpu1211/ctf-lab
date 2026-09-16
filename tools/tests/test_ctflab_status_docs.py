@@ -24,6 +24,7 @@ import os
 import pathlib
 import re
 import sys
+import subprocess
 import tempfile
 import unittest
 from unittest import mock
@@ -205,7 +206,7 @@ class PlanDocumentTests(unittest.TestCase):
         line = find_line(plan, "qemu-vdagent")
         self.assertIn("仅是经授权的文本剪贴板路径", line)
         self.assertIn("SPICE 显示与动态分辨率", line)
-        self.assertIn("均未实现", line)
+        self.assertIn("尚未完成", line)
 
 
 class VerificationRecordTests(unittest.TestCase):
@@ -217,15 +218,21 @@ class VerificationRecordTests(unittest.TestCase):
             self.assertIn(label, self.text)
 
     def test_regression_count_is_dated(self) -> None:
-        # 不钉死细分数字（测试集会增长），但必须带复核日期与当前总数，陈旧计数不得残留
+        # 不钉死细分数字（测试集会增长），但必须带复核日期、当前总数与各模块计数；陈旧计数不得残留
         self.assertIn("本次完整回归", self.text)
-        self.assertIn("2026-09-15 复核", self.text)
-        self.assertIn("331 项通过", self.text)
-        self.assertIn("56 项验收状态与设计边界守卫测试", self.text)
+        self.assertIn("2026-09-16 复核", self.text)
+        self.assertIn("352 项通过", self.text)
+        self.assertIn("61 项验收状态与设计边界守卫测试", self.text)
         self.assertIn("82 项路径 A `utm-export` 单元测试", self.text)
         self.assertIn("37 项 Task 6.1 打包测试", self.text)
-        self.assertIn("58 项 Task 6.2/6.3A/6.3B app 受控运行时、许可证与验收守卫测试", self.text)
-        for stale in ("66 项通过", "当前完整回归", "174 项通过", "161 项通过", "202 项", "205 项", "235 项", "245 项", "280 项", "283 项", "286 项", "279 项", "278 项", "269 项", "267 项", "242 项", "243 项", "244 项", "48 项", "95 项", "293 项", "309 项", "312 项", "313 项", "43 项 Task 6.2"):
+        self.assertIn("58 项 Task 6.2 app 受控运行时测试", self.text)
+        self.assertIn("18 项分发目录测试", self.text)
+        self.assertIn("21 项图形入口测试", self.text)
+        for stale in ("66 项通过", "当前完整回归", "174 项通过", "161 项通过", "202 项", "205 项",
+                      "235 项", "245 项", "280 项", "283 项", "286 项", "331 项", "349 项",
+                      "279 项", "278 项", "269 项", "267 项", "242 项", "243 项", "244 项",
+                      "48 项", "95 项", "293 项", "309 项", "312 项", "313 项",
+                      "43 项 Task 6.2", "6.3B app 受控运行时、许可证与验收守卫测试"):
             self.assertNotIn(stale, self.text)
 
     def test_matrix_wording_avoids_adapted_claim(self) -> None:
@@ -340,7 +347,7 @@ class DesignBoundaryTests(unittest.TestCase):
         self.assertIn("首次导入（R1）因缺必需段失败", header)
         self.assertIn("通过“导入/解析”验收", header)
         self.assertIn("部分验证", header)
-        self.assertIn("路径 B 未实现", header)
+        self.assertIn("尚未达到完整动态分辨率可交付", header)
         self.assertIn("不得宣称", header)
         self.assertIn("不支持动态分辨率", header)
         self.assertIn("默认不带网卡", header)
@@ -384,16 +391,17 @@ class DesignBoundaryTests(unittest.TestCase):
     def test_endpoint_modes_are_separate(self) -> None:
         """UNIX socket 与 TCP 是两套互斥要求，不得混写为同时成立。"""
         flat = normalized(self.text)
-        self.assertIn("`unix=<socket 路径>`", flat)
-        self.assertIn("不要求也不应出现 `addr=127.0.0.1`/`port=`", flat)
+        self.assertIn("unix=on,addr=<runtime_dir>/spice.sock", flat)
+        self.assertIn("不监听 TCP", flat)
         self.assertIn("`addr=127.0.0.1,port=<受控端口>`", flat)
         self.assertNotIn("生成的命令必须包含 `addr=127.0.0.1`", flat)
 
     def test_cli_scope_wording_is_precise(self) -> None:
         flat = normalized(self.text)
-        self.assertIn("本次新增的仅有路径 A 的 `utm-export`", flat)
-        self.assertIn("`probe --matrix`", flat)
-        self.assertNotIn("未新增任何 CLI", flat)
+        self.assertIn("本次路径 B 新增的是显式 `run --display cocoa|spice` 能力门禁与 SPICE 命令构造", flat)
+        self.assertIn("spice_probe:", flat)
+        self.assertIn("默认不传参数时 仍是 Cocoa", flat)
+        self.assertNotIn("本次新增的仅有路径 A 的 `utm-export`", flat)
         self.assertNotIn("本次未新增动态分辨率相关 CLI", flat)
 
     def test_path_a_implementation_status_is_honest(self) -> None:
@@ -442,8 +450,8 @@ class DesignBoundaryTests(unittest.TestCase):
             self.assertNotIn(stale, self.text)
 
 
-class CurrentStageCliTests(unittest.TestCase):
-    """路径 B 未实现前的当前阶段断言；实现路径 B 时需同步更新本测试与设计文档。"""
+class SpiceDisplayCliTests(unittest.TestCase):
+    """路径 B 的 CLI 契约：显式 SPICE，能力不足时启动前失败；默认仍为 Cocoa。"""
 
     def run_options(self) -> set[str]:
         parser = ctflab.build_parser()
@@ -453,9 +461,8 @@ class CurrentStageCliTests(unittest.TestCase):
         return {option for action in subcommands["run"]._actions
                 for option in action.option_strings}
 
-    def test_run_has_no_display_option_yet(self) -> None:
-        self.assertNotIn("--display", self.run_options(),
-                         "显示后端选项属于路径 B，未授权实现前不应出现在 run 上")
+    def test_run_has_display_option(self) -> None:
+        self.assertIn("--display", self.run_options())
 
     def test_default_command_stays_cocoa_without_spice(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -471,6 +478,43 @@ class CurrentStageCliTests(unittest.TestCase):
         self.assertIn("cocoa", joined)
         self.assertNotIn("spice", joined.lower())
         self.assertNotIn("qemu-vdagent", joined, "默认不传 --clipboard 时不得创建剪贴板通道")
+
+    def test_probe_accepts_qemu_spice_app_backend(self) -> None:
+        """QEMU 11.x 的 `spice-app` 列表项必须被识别为 SPICE 能力。"""
+        completed = subprocess.CompletedProcess([], 0, "Available display backend types:\nspice-app\n", "")
+        devices = subprocess.CompletedProcess([], 0, "name 'virtserialport', bus virtio-serial-bus\n", "")
+        with mock.patch("ctflab.spice_client_path", return_value="/tmp/spicy"), \
+                mock.patch("ctflab.subprocess.run",
+                           side_effect=[completed, devices,
+                                        subprocess.TimeoutExpired([], 1.5)]):
+            capabilities = ctflab.LabManager.probe_spice("qemu")
+        self.assertTrue(capabilities["spice_display"])
+        self.assertTrue(capabilities["spicevmc"])
+        self.assertTrue(capabilities["virtserialport"])
+        self.assertTrue(capabilities["client"])
+        self.assertTrue(capabilities["supported"])
+
+    def test_spice_requires_capability_and_keeps_default_isolated(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            manager = ctflab.LabManager(root)
+            profile = {"guest": {"architecture": "aarch64"}, "network": {}}
+            missing = {"spice_display": False, "spicevmc": False,
+                       "virtserialport": True, "client": False,
+                       "supported": False, "errors": ["测试缺件"]}
+            with mock.patch.object(manager, "ensure_uefi_vars",
+                                   return_value=(root / "code", root / "vars")), \
+                    mock.patch("ctflab.which_any", return_value="qemu"), \
+                    mock.patch.object(manager, "probe_spice", return_value=missing):
+                with self.assertRaisesRegex(ctflab.CTFLabError, "不会自动回退 Cocoa"):
+                    manager.qemu_command("kali-arm64", profile, root / "disk", 23400, False,
+                                         display="spice")
+
+    def test_spice_is_restricted_to_graphical_kali(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = ctflab.LabManager(pathlib.Path(directory))
+            with self.assertRaisesRegex(ctflab.CTFLabError, "只能单独启动 kali-arm64"):
+                manager.run(["smoke"], display="spice")
 
 
 class DeliveryClaimGuardTests(unittest.TestCase):
@@ -506,7 +550,7 @@ class DeliveryClaimGuardTests(unittest.TestCase):
         flat = normalized(ROOT_README.read_text(encoding="utf-8"))
         self.assertIn("静态控制台 E2E 已在限定范围内通过", flat)
         self.assertIn("动态分辨率仍不稳定", flat)
-        self.assertIn("路径 B 未实现", flat)
+        self.assertIn("未提供该运行时或能力探测失败时", flat)
         for stale in ("已实现并完成 UTM E2E", "完成 UTM E2E"):
             self.assertNotIn(stale, flat)
 
