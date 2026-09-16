@@ -12,15 +12,16 @@ CTFLab 是面向 Apple Silicon Mac 的本地虚拟靶场运行器。它使用 QE
 - `probe` 收集 QMP、截图 OCR/画面分类、DHCP 与 HTTP/SSH 协议证据；
 - x86_64 在 Mac M 上使用 QEMU TCG，ARM64 使用 HVF；
 - 从 Kali ARM64 安装 ISO 无人值守安装 XFCE，支持安装状态查询、UEFI NVRAM 与运行盘固化；
-- Kali 默认隔离运行；独占联网维护模式可补装软件，并禁止同时启动脆弱靶机；
+- Kali 默认通过 user-mode NAT 联网，方便直接安装/更新工具；Smoke、Basic Pentesting 2 的管理网仍为
+  `restrict=on`，三者的实验网继续只经回环交换机互通；
 - 不覆盖原始镜像，运行时写入独立 QCOW2 overlay；
 - 跨进程文件锁保护导入、启动、停止、重置和候选配置生成，避免多终端竞争；
 - 回环 TCP 二层交换机提供固定 DHCP、MAC 学习、逐连接限速和可选 PCAP，默认不把脆弱靶机接入物理局域网；
 - `CTFLab.app` 自带受控 QEMU 与 Python 运行时（含 PyYAML），目标机器无需安装任何环境；
 - 基盘分发链（路线 A）：`dist prepare/verify` 生成 zstd 压缩基盘、`DISTRIBUTION.json`、`SHA256SUMS`
   与分发说明；`import --manifest/--expect-sha256` 强制核对下载文件哈希并把校验证据写入导入记录。
-- Kali 图形模式支持显式选择 SPICE 动态分辨率（`run kali-arm64 --display spice`）；启动前会探测
-  SPICE QEMU、`spicevmc`、`virtserialport` 与本地客户端，缺件直接失败，不回退为缩放。
+- Kali 图形启动默认使用 SPICE 自动分辨率；启动前会探测 SPICE QEMU、`spicevmc`、`virtserialport`
+  与本地客户端，缺件直接失败，不回退为缩放。x86 靶机默认使用 Cocoa；无头模式不启动图形客户端。
 
 ## 快速开始
 
@@ -34,7 +35,7 @@ CTFLab 是面向 Apple Silicon Mac 的本地虚拟靶场运行器。它使用 QE
 shasum -a 256 -c SHA256SUMS                     # 1) 校验下载完整性
 ctflab import kali-arm64 kali-arm64-base.qcow2 --manifest DISTRIBUTION.json
                                                 # 2) 清单自动核对哈希并套用配套 NVRAM 模板
-ctflab run kali-arm64                           # 3) 启动
+ctflab run kali-arm64                           # 3) 启动 Kali（默认联网、自动分辨率）
 ```
 
 哈希不一致时导入会直接失败并打印期望值与实际值：重新下载，不要绕过校验。
@@ -63,22 +64,23 @@ ctflab run kali-arm64                           # 3) 启动
 
 ## 图形入口
 
-`CTFLab.app` 的主入口是原生 SwiftUI 界面（Apple Silicon、macOS 13+，不依赖 Electron/Node/浏览器）：
+`CTFLab.app` 的主入口是原生 SwiftUI 界面（Apple Silicon；随包 QEMU/SPICE 运行时要求 macOS 15.0+，
+不依赖 Electron/Node/浏览器）：
 
 - 流程：选择课程分发目录 → 校验（逐文件大小与 SHA-256，失败即禁用导入与启动）→ 导入三个节点 →
-  启动全部 → 检查状态（health）→ 停止全部 → 重置（先弹确认框，明确提示 overlay 改动会丢失）；
+  勾选要启动的节点（通常是 Kali + 一个或多个靶机）→ 启动所选节点 → 检查状态（health）→
+  停止全部 → 重置（先弹确认框，明确提示 overlay 改动会丢失）；
 - 图形界面只调用内置 CLI：`dist verify --json`、`import <profile> <基盘> --manifest`、`run`、
-  `status --json`、`health --json`、`stop --all`、`reset <profile>`；Kali 的“联网维护”和“动态分辨率”
-  是单独确认的 Kali-only 动作，不解析任意 QEMU 参数、不绕过清单哈希；命令行对应的维护命令是
-  `run kali-arm64 --internet`，动态分辨率请求是 `run kali-arm64 --display spice`；路径含空格按单一参数传递；
+  `status --json`、`health --json`、`stop --all`、`reset <profile>`；启动所选节点时由 CLI 自动为 Kali
+  配置联网与 SPICE 自动分辨率，为其他节点保持隔离，不解析任意 QEMU 参数、不绕过清单哈希；命令行可直接
+  使用 `run kali-arm64 smoke` 或 `run kali-arm64 smoke basic-pentesting-2`；路径含空格按单一参数传递；
 - 重新打开 App 会通过 `status` 恢复已导入/运行中显示；重复导入是幂等的，不覆盖已验证基盘；
 - CLI 保留在 `CTFLab.app/Contents/Resources/bin/ctflab-cli`（兼容名 `CTFLab`），
   供开发、脚本化与故障排查使用，与图形界面共享同一状态目录与同一导入逻辑。
 
-Smoke/Basic 的静态控制台 E2E 已在限定范围内通过；默认 Cocoa/旧课堂分发包仍仅保证固定显示可用，
-旧 UTM 路径动态分辨率仍不稳定；本轮 SPICE 构建配合 Kali 显示适配，已测得窗口尺寸跟随。
-提供带 SPICE QEMU 与本地 `spicy` 客户端的构建才启用 `--display spice`；未提供该运行时或能力探测失败时，
-命令会在创建虚拟机前拒绝，不自动回退 Cocoa。当前验收包与限制见
+Smoke/Basic 的 x86 靶机静态控制台 E2E 已在限定范围内通过；旧 UTM 路径的历史记录仍保留为边界说明，
+其中固定显示与动态分辨率结论不适用于当前 App 的 SPICE 主路径。
+当前 App 使用带 SPICE QEMU 与本地 `spicy` 客户端的构建，Kali 图形启动自动启用动态分辨率；未提供该运行时或能力探测失败时，命令会在创建虚拟机前拒绝，不自动回退 Cocoa。当前验收包与限制见
 [`联网与动态分辨率验证记录`](docs/verification-display-network-2026-09-16.md)。
 
 ## 测试

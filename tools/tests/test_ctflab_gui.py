@@ -189,12 +189,16 @@ class ResetSemanticsTests(unittest.TestCase):
         self.assertIn(ctflab_app.LAUNCHER_REL, source,
                       f"GUI 必须引用 {ctflab_app.LAUNCHER_REL}（ctflab_app.LAUNCHER_REL）")
 
-    def test_gui_exposes_explicit_kali_internet_maintenance_action(self) -> None:
-        """GUI 只通过单独的、可确认的 Kali 维护动作使用 --internet。"""
+    def test_gui_exposes_selected_node_start_and_default_policy(self) -> None:
+        """GUI 把启动节点选择交给用户，Kali 的联网与自动分辨率由 CLI 默认策略负责。"""
         source = (GUI_DIR / "GuiCore.swift").read_text(encoding="utf-8")
-        self.assertIn('case runKaliInternet', source)
-        self.assertIn('["run", LabNode.kali.rawValue, "--internet"]', source)
-        self.assertIn("canKaliInternet", source)
+        app = (GUI_DIR / "GuiApp.swift").read_text(encoding="utf-8")
+        self.assertIn("case run(nodes: [LabNode])", source)
+        self.assertIn("canStartSelected", source)
+        self.assertIn("启动所选节点", app)
+        self.assertIn("selectedNodes", app)
+        self.assertNotIn("Kali 联网维护", app)
+        self.assertNotIn("动态分辨率…", app)
 
 
 @unittest.skipUnless(SWIFTC, "需要 swiftc（Xcode 命令行工具）编译 GUI 核心")
@@ -354,7 +358,7 @@ class GuiDocsGuardTests(unittest.TestCase):
         gui_section = text.index("## 2. 图形界面流程")
         cli_section = text.index("## 3. 命令行流程")
         self.assertLess(gui_section, cli_section, "图形流程必须排在命令行之前")
-        for needle in ("双击", "校验分发目录", "导入实验环境", "启动全部", "检查状态", "重置"):
+        for needle in ("双击", "校验分发目录", "导入实验环境", "启动所选节点", "检查状态", "重置"):
             self.assertIn(needle, text)
         self.assertIn("Contents/Resources/bin/CTFLab", text)
 
@@ -362,7 +366,7 @@ class GuiDocsGuardTests(unittest.TestCase):
         text = self.README.read_text(encoding="utf-8")
         self.assertIn("## 图形入口", text)
         self.assertIn("CTFLab.app/Contents/Resources/bin/ctflab-cli", text)
-        self.assertIn("--internet", text)
+        self.assertIn("默认联网", text)
 
 
 if __name__ == "__main__":

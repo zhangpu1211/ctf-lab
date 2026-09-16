@@ -8,12 +8,11 @@
 - 计划正文边界：网络策略表把靶机→Kali 标为“设计允许、应用级回连尚未验证”；显示章节把
   `qemu-vdagent` 限定为经授权的文本剪贴板路径，SPICE 显示与动态分辨率仍未实现；Task 2
   验收允许持久锁文件但不允许锁被持有；
-- 设计文档边界：首段状态必须是“路径 A 已实现、路径 B 未实现”；路径 A 默认无网卡、默认关闭 UTM
-  Clipboard Sharing、未来 Host Only 需 “Isolate Guest from Host”；路径 B 保留 agent
-  transport 并强制三层剪贴板禁用、本机端点 + 每次运行本地鉴权、仅 kali-arm64、
-  独立 PoC 前置；离线导出不得声称图形会话 agent 已连接；
-- 当前阶段 CLI 边界：`run` 还没有显示后端选项，默认 QEMU 命令仍是 Cocoa 且没有 SPICE。
-  未来的路径 B 经授权实现时应同步更新本测试与设计文档，而不是被旧断言误拦。
+- 设计文档边界：路径 A 的历史 UTM 导出仍默认无网卡、默认关闭 UTM Clipboard Sharing；路径 B 当前
+  使用 SPICE agent transport、本机端点和按条件的剪贴板开关，未验证的剪贴板/客户端鉴权边界必须保留；
+  离线导出不得声称图形会话 agent 已连接；
+- 当前阶段 CLI 边界：`run --display auto` 按 profile 选择后端，Kali 图形启动默认 SPICE，靶机默认 Cocoa，
+  无头模式不启动图形客户端；旧断言更新时不能抹掉历史 UTM 范围限制。
 """
 
 from __future__ import annotations
@@ -170,14 +169,14 @@ class PlanAcceptanceTests(unittest.TestCase):
         self.assertEqual(primary_status(line), "部分验证")
         self.assertIn("Task 6", line)
 
-    def test_task3_dynamic_resolution_item_is_unchecked(self) -> None:
+    def test_task3_dynamic_resolution_item_is_checked(self) -> None:
         task3 = plan_section("### Task 3：Kali 图形桌面", "### Task 4：")
         items = [line.strip() for line in task3.splitlines()
                  if line.strip().startswith(("- [x]", "- [ ]")) and "动态分辨率" in line]
         self.assertEqual(len(items), 1, "Task 3 应只有一条动态分辨率验收项")
-        self.assertTrue(items[0].startswith("- [ ]"), items[0])
-        self.assertIn("重启后复测失败", items[0])
-        self.assertIn("仅保证固定显示可用", items[0])
+        self.assertTrue(items[0].startswith("- [x]"), items[0])
+        self.assertIn("run --display auto", items[0])
+        self.assertIn("冷启动恢复", task3)
 
     def test_task2_acceptance_allows_persistent_lock_file(self) -> None:
         task2 = plan_section("### Task 2：存储与生命周期", "### Task 3：")
@@ -206,7 +205,8 @@ class PlanDocumentTests(unittest.TestCase):
         line = find_line(plan, "qemu-vdagent")
         self.assertIn("仅是经授权的文本剪贴板路径", line)
         self.assertIn("SPICE 显示与动态分辨率", line)
-        self.assertIn("尚未完成", line)
+        self.assertIn("已完成当前 App 主路径", line)
+        self.assertIn("仍是单独的未验证边界", line)
 
 
 class VerificationRecordTests(unittest.TestCase):
@@ -398,9 +398,11 @@ class DesignBoundaryTests(unittest.TestCase):
 
     def test_cli_scope_wording_is_precise(self) -> None:
         flat = normalized(self.text)
-        self.assertIn("本次路径 B 新增的是显式 `run --display cocoa|spice` 能力门禁与 SPICE 命令构造", flat)
+        self.assertIn("本次路径 B 已将 `run --display auto` 设为默认", flat)
         self.assertIn("spice_probe:", flat)
-        self.assertIn("默认不传参数时 仍是 Cocoa", flat)
+        self.assertIn("Kali 图形启动自动使用 SPICE", flat)
+        self.assertIn("靶机和无头模式", flat)
+        self.assertIn("Cocoa/无图形", flat)
         self.assertNotIn("本次新增的仅有路径 A 的 `utm-export`", flat)
         self.assertNotIn("本次未新增动态分辨率相关 CLI", flat)
 
@@ -451,7 +453,7 @@ class DesignBoundaryTests(unittest.TestCase):
 
 
 class SpiceDisplayCliTests(unittest.TestCase):
-    """路径 B 的 CLI 契约：显式 SPICE，能力不足时启动前失败；默认仍为 Cocoa。"""
+    """CLI 显示契约：Kali 图形默认 SPICE，其他节点默认 Cocoa。"""
 
     def run_options(self) -> set[str]:
         parser = ctflab.build_parser()
@@ -463,6 +465,11 @@ class SpiceDisplayCliTests(unittest.TestCase):
 
     def test_run_has_display_option(self) -> None:
         self.assertIn("--display", self.run_options())
+
+    def test_auto_display_selects_spice_only_for_graphical_kali(self) -> None:
+        self.assertEqual(ctflab.resolve_display_backend("kali-arm64", "auto"), "spice")
+        self.assertEqual(ctflab.resolve_display_backend("smoke", "auto"), "cocoa")
+        self.assertEqual(ctflab.resolve_display_backend("kali-arm64", "auto", headless=True), "cocoa")
 
     def test_default_command_stays_cocoa_without_spice(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -556,10 +563,11 @@ class DeliveryClaimGuardTests(unittest.TestCase):
         return docs
 
     def test_root_readme_carries_scoped_delivery_wording(self) -> None:
-        """根 README 不得再把路径 A 写成“已实现并完成 UTM E2E”，必须按范围与限制表述。"""
+        """根 README 区分旧 UTM 静态交付与当前 App 的 SPICE 交付。"""
         flat = normalized(ROOT_README.read_text(encoding="utf-8"))
-        self.assertIn("静态控制台 E2E 已在限定范围内通过", flat)
-        self.assertIn("动态分辨率仍不稳定", flat)
+        self.assertIn("x86 靶机静态控制台 E2E 已在限定范围内通过", flat)
+        self.assertIn("旧 UTM 路径", flat)
+        self.assertIn("自动启用动态分辨率", flat)
         self.assertIn("未提供该运行时或能力探测失败时", flat)
         for stale in ("已实现并完成 UTM E2E", "完成 UTM E2E"):
             self.assertNotIn(stale, flat)
@@ -588,7 +596,7 @@ class DeliveryClaimGuardTests(unittest.TestCase):
 
     def test_static_console_scope_is_stated_where_deliveries_are_described(self) -> None:
         boundary_phrases = ("not-tested-for-x86-fixed-display", "仅保证固定显示可用",
-                            "动态分辨率仍不稳定", "固定显示")
+                            "动态分辨率仍不稳定", "固定显示", "旧 UTM 路径")
         for label, text in self.scanned_docs():
             if "Smoke" not in text and "CTFLab-Smoke" not in text:
                 continue

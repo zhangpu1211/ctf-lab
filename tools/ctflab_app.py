@@ -105,6 +105,10 @@ PYTHON_VERSION_RE = re.compile(r"^Python\s+([0-9][0-9A-Za-z.]*)$")
 PBS_ASSET_RE = re.compile(r"^(cpython-\d+\.\d+\.\d+)\+(\d{8})-aarch64-apple-darwin-")
 
 QEMU_BINARIES = ("qemu-system-aarch64", "qemu-system-x86_64", "qemu-img")
+# 课堂分发包最低支持 macOS 15.0；QEMU 11.1.0 若用当前系统 SDK 构建会错误地引用
+# macOS 26 才提供的 strchrnul，导致旧系统在导入阶段直接 dyld 失败。
+MIN_BUNDLED_MACOS = "15.0"
+MIN_BUNDLED_MACOS_VERSION = (15, 0)
 # 外置 SPICE 客户端是可选运行时；未提供时保留默认 Cocoa App，显式请求 SPICE 会被 CLI 拒绝。
 SPICE_CLIENT_NAME = "spicy"
 # 只随包实际需要的固件/ROM/keymaps（aarch64 virt UEFI + x86_64 pc BIOS/UEFI 与三种网卡）。
@@ -447,6 +451,19 @@ def _is_mach_o(path: Path) -> bool:
             return handle.read(4) in MACHO_MAGICS
     except OSError:
         return False
+
+
+def macho_minimum_os(path: Path) -> tuple[int, int] | None:
+    """读取 Mach-O 的 LC_BUILD_VERSION.minos；无法读取时返回 None。"""
+    result = _run_tool(["otool", "-l", str(path)], check=False)
+    versions = re.findall(r"\n\s+minos\s+(\d+)\.(\d+)", result.stdout)
+    if not versions:
+        return None
+    return max((int(major), int(minor)) for major, minor in versions)
+
+
+def macho_version_text(version: tuple[int, int]) -> str:
+    return f"{version[0]}.{version[1]}"
 
 
 def iter_macho_files(root: Path) -> list[Path]:
@@ -826,7 +843,9 @@ def _info_plist(version: str) -> dict[str, Any]:
         "CFBundlePackageType": "APPL",
         "CFBundleShortVersionString": version,
         "CFBundleVersion": version,
-        "LSMinimumSystemVersion": "13.0",
+        # GUI 本身可在 macOS 13 编译，但随包 QEMU/SPICE 运行时以 macOS 15.0 为最低版本；
+        # 让 Finder 在启动前给出正确兼容性判断，避免进入 dyld 才失败。
+        "LSMinimumSystemVersion": MIN_BUNDLED_MACOS,
         "NSHighResolutionCapable": True,
         "LSApplicationCategoryType": "public.app-category.developer-tools",
     }
@@ -1405,6 +1424,7 @@ def build_app(
             },
             "runtime": {
                 "root": RUNTIME_REL,
+                "minimum_macos": MIN_BUNDLED_MACOS,
                 "dylibs": sorted(libs_sources),
                 "binaries": list(runtime_binary_sources),
                 "spice_client": (f"{RUNTIME_REL}/bin/{SPICE_CLIENT_NAME}"
@@ -1514,7 +1534,11 @@ def _exclusive_publish_file(source: Path, destination: Path) -> None:
 
 
 def verify_runtime_references(app: Path) -> list[str]:
-    """检查 app 内所有 Mach-O 文件：无禁止引用，且非系统依赖都在 app 运行时内。"""
+    """检查 app 内 Mach-O 引用与 QEMU/客户端最低系统版本。
+
+    内置动态库仍按依赖闭包检查；可执行入口另做 ``minos`` 守卫，因为 QEMU 直接
+    使用新 SDK 的系统符号时，旧 macOS 会在 ``qemu-img info`` 阶段由 dyld 拒绝启动。
+    """
     runtime = app / RUNTIME_REL
     problems: list[str] = []
     macho_files = [p for p in (runtime / "bin").iterdir() if p.is_file()]
@@ -1523,6 +1547,17 @@ def verify_runtime_references(app: Path) -> list[str]:
     macho_files += iter_macho_files(runtime / "python")
     allowed_roots = [(runtime / "lib").resolve(), (runtime / "python").resolve()]
     for path in macho_files:
+        if path.parent == runtime / "bin":
+            minimum = macho_minimum_os(path)
+            if minimum is None:
+                problems.append(f"{path.name}: 无法读取 Mach-O 最低 macOS 版本")
+            elif minimum > MIN_BUNDLED_MACOS_VERSION:
+                problems.append(
+                    f"{path.name}: 最低 macOS {macho_version_text(minimum)} 高于支持目标 {MIN_BUNDLED_MACOS}")
+            if path.name in QEMU_BINARIES:
+                symbols = _run_tool(["nm", "-u", str(path)], check=False).stdout
+                if "strchrnul" in symbols:
+                    problems.append(f"{path.name}: 仍引用旧系统不存在的 strchrnul")
         for dep in otool_deps(path):
             if dep.startswith("@loader_path/"):
                 target = (path.parent / dep[len("@loader_path/"):]).resolve()
@@ -1642,6 +1677,8 @@ def verify_app(app_path: Path, *, check_signature: bool = True) -> dict[str, Any
     _expect(not problems, "运行时引用检查失败：\n" + "\n".join(problems))
 
     runtime_section = manifest.get("runtime", {})
+    _expect(runtime_section.get("minimum_macos") == MIN_BUNDLED_MACOS,
+            f"MANIFEST.runtime.minimum_macos 必须为 {MIN_BUNDLED_MACOS}。")
     runtime_binaries = runtime_section.get("binaries", list(QEMU_BINARIES))
     _expect(isinstance(runtime_binaries, list)
             and all(isinstance(name, str) for name in runtime_binaries),

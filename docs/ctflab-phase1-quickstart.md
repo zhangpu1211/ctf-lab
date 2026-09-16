@@ -82,19 +82,25 @@ unset CTFLAB_INSTALL_PASSWORD
 
 ```bash
 ./tools/ctflab stop --all
-./tools/ctflab run kali-arm64 --internet
-# 在 Kali 中维护软件；需要 apt 源时参考 tools/guest_fixes/kali-arm64/kali.sources
+./tools/ctflab run kali-arm64
+# Kali 默认通过 user-mode NAT 联网；需要 apt 源时参考 tools/guest_fixes/kali-arm64/kali.sources
 # 维护完成后先在 Kali 内正常关机，再执行：
 ./tools/ctflab stop kali-arm64
 ./tools/ctflab finalize-install kali-arm64 --from-runtime --confirm
 ./tools/ctflab run kali-arm64 smoke basic-pentesting-2
 ```
 
-联网维护仅允许单独 Kali，不能同时启动靶机。默认运行不允许公网访问；实验 DHCP 不下发不存在的网关，Kali 禁用 IP 转发。联网模式仅用于可信软件维护，不能连接未知靶机。
+Kali 默认联网，但仍只通过 QEMU user-mode NAT 访问外网；Smoke、Basic Pentesting 2 的管理网继续使用
+`restrict=on`，不会因为和 Kali 一起启动而获得公网访问。三者的实验网仍只通过回环交换机互通；联网仅用于
+可信软件维护和教学检索，不要把未知主机接入实验网。
 
 `--from-runtime` 展平当前 overlay 为新只读基盘，归档原运行目录并保留旧基盘；这样后续 `reset` 不会丢失已固化的软件。务必先正常关机，不能把强制停止等同于文件系统已干净卸载。归档会额外占用磁盘空间。
 
-图形界面由 QEMU 独立窗口提供，`--headless` 不打开窗口。已验证 1920×1080 手动分辨率、键鼠和 XFCE、文本剪贴板双向复制、窗口关闭/停止策略，以及 Ghidra 项目/导入/反编译工作流；默认 Cocoa 路径的动态分辨率仍受 QEMU 后端限制（窗口只做缩放），尚未交付。新版内置 SPICE 的 App 配合 Kali 显示适配，已验证窗口尺寸跟随；旧课堂分发基盘仍需更新，3D 加速未验收，不能承诺与商业虚拟机相同体验。详见[2026-09-13 图形体验验证](verification-2026-09-13.md)、[联网与动态分辨率验证](verification-display-network-2026-09-16.md)与[动态分辨率设计](ctflab-dynamic-resolution-design.md)。
+图形界面由 QEMU 独立窗口提供，`--headless` 不打开窗口。Kali 图形启动默认使用内置 SPICE 客户端和
+`spice-vdagent` 自动适配分辨率；Smoke、Basic Pentesting 2 仍使用 Cocoa 固定显示。新版 App 已验证
+Kali 窗口尺寸跟随、冷启动恢复与联网；3D 加速未验收，不能承诺与商业虚拟机相同体验。详见[2026-09-13
+图形体验验证](verification-2026-09-13.md)、[联网与动态分辨率验证](verification-display-network-2026-09-16.md)
+与[动态分辨率设计](ctflab-dynamic-resolution-design.md)。
 
 ### 2.1 接收新的未知镜像
 
@@ -179,9 +185,13 @@ Kali 图形会话处于活动状态时，ACPI 电源键会打开来宾自己的�
 
 不要用 Cocoa 窗口红色关闭按钮代替来宾关机：关闭窗口会先弹 “Are you sure you want to quit QEMU?” 确认框，确认后 QEMU 发送 ACPI 电源键，但仍需要来宾确认并在来宾退出后才会结束；窗口关闭后无法重新显示同一实例。后台使用应从一开始选择 `--headless`。
 
-### 图形体验增量（2026-09-13）
+### 图形体验增量（2026-09-16）
 
-`run` 的 Cocoa 窗口默认启用 `zoom-to-fit`，把画面缩放到窗口大小；这是缩放，不是来宾改变分辨率。当前 QEMU 11.1 + cocoa + virtio-gpu 没有让来宾分辨率跟随窗口的通道（QMP `display-update` 已不接受 EDID，vdagent 只支持剪贴板和鼠标）。默认路径仍需在来宾内用 XFCE 显示设置或 `xrandr` 选择分辨率，窗口会按比例缩放。新版 App 可显式使用 `run kali-arm64 --display spice`：内置 SPICE 客户端配合 Kali XFCE 自启动适配，已验证两档窗口尺寸的实际 `xrandr` 跟随及冷启动恢复；旧分发基盘需先补装显示适配，剪贴板负向与未授权客户端拒绝仍待专项验收。见[联网与动态分辨率验证](verification-display-network-2026-09-16.md)与[动态分辨率设计](ctflab-dynamic-resolution-design.md)。
+`run` 的 `--display auto` 是默认策略：Kali 图形模式使用 SPICE 和 XFCE 自启动适配，窗口尺寸会驱动来宾
+真实分辨率变化；Smoke、Basic Pentesting 2 使用 Cocoa `zoom-to-fit`。无头模式不启动 SPICE 客户端。
+如需调试兼容性，可显式传 `--display cocoa`；显式 `--display spice` 仍只允许单独的 Kali 图形会话，缺少
+SPICE 能力时会在创建虚拟机前失败，不自动回退。见[联网与动态分辨率验证](verification-display-network-2026-09-16.md)
+与[动态分辨率设计](ctflab-dynamic-resolution-design.md)。
 
 文本剪贴板用 `run kali-arm64 --clipboard` 显式开启：默认关闭，仅对 Kali 图形模式生效，不为靶机创建通道；需要来宾已登录图形会话（`spice-vdagent` 是会话级进程），不能与 `--headless` 同用，切换需先停止再启动。已验收英文、中文和多行文本的双向复制粘贴（内容逐字节一致）、关闭通道后不共享、重启后仍可用。开启期间 Kali 能读到复制的文本，请勿复制个人密码或其他敏感内容。
 

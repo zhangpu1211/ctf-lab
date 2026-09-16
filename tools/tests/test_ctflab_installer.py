@@ -179,19 +179,23 @@ class InstallerCommandTests(unittest.TestCase):
             with self.assertRaisesRegex(CTFLabError, "confirm-reinstall"):
                 manager.start_install("kali-arm64", "unused.iso", unattended=True, resume=True)
 
-    def test_online_maintenance_rejects_targets_and_mode_changes(self) -> None:
+    def test_kali_defaults_to_internet_but_targets_remain_isolated(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             manager = LabManager(Path(directory))
-            with self.assertRaisesRegex(CTFLabError, "只能单独"):
+            with self.assertRaisesRegex(CTFLabError, "只有 Kali"):
                 manager.run(["smoke"], allow_internet=True)
-            with mock.patch.object(manager, "running_states", return_value=[{"profile_id": "smoke"}]), self.assertRaisesRegex(CTFLabError, "停止其他靶机"):
-                manager.run(["kali-arm64"], allow_internet=True)
-            online = [{"profile_id": "kali-arm64", "internet_enabled": True}]
-            with mock.patch.object(manager, "running_states", return_value=online):
-                with self.assertRaisesRegex(CTFLabError, "联网维护"):
-                    manager.run(["smoke"])
-                with self.assertRaisesRegex(CTFLabError, "切换联网模式"):
-                    manager.run(["kali-arm64"])
+            calls = []
+            qemu_process = mock.Mock(pid=1234)
+            qemu_process.poll.return_value = None
+            with mock.patch.object(manager, "ensure_network", return_value={"pcap_path": None}), \
+                    mock.patch.object(manager, "ensure_overlay", side_effect=lambda profile_id: Path(directory) / f"{profile_id}.qcow2"), \
+                    mock.patch.object(manager, "qemu_command", side_effect=lambda *args, **kwargs: (calls.append(kwargs) or (["qemu"], {}))), \
+                    mock.patch("ctflab.subprocess.Popen", return_value=qemu_process):
+                states = manager.run(["kali-arm64", "smoke"], headless=True)
+            self.assertEqual(len(states), 2)
+            self.assertEqual([call["allow_internet"] for call in calls], [True, False])
+            self.assertEqual([call["display"] for call in calls], ["cocoa", "cocoa"],
+                             "无头模式不启动图形客户端")
 
     def test_running_or_incomplete_install_cannot_be_finalized(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

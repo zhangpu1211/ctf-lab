@@ -12,7 +12,7 @@
 | 构建/校验集成 | `tools/ctflab_app.py`（`swiftc` 编译、启动器位置、`MANIFEST.gui`、`signature_covers`、`app verify` 检查） | 已验证 |
 | CLI 机器可读输出 | `dist verify --json`、`status --json`、`health --json`（GUI 的唯一数据来源） | 已验证 |
 | 单元测试 | `tools/tests/test_ctflab_gui.py`（21 项：Swift 核心断言 + CLI JSON 契约 + 构建集成 + 文档守卫） | 已验证 |
-| 测试构建产物 | `/Users/pufei/Downloads/ctflab-app-build-gui-20260916/CTFLab.app`（树 SHA-256 `b282b31dec1fa1fd…`，MANIFEST SHA-256 `2fb5d19f801a4a8e…`，ad-hoc 签名，725 个登记文件） | 已验证 |
+| 最终测试构建产物 | `/Users/pufei/Downloads/ctflab-app-build-macos15-auto-final2-20260916/CTFLab.app`（macOS 15.0 兼容 QEMU/SPICE，ad-hoc 签名，797 个登记文件） | 已验证 |
 
 本次 GUI 验证未覆盖既有旧产物：`/Users/pufei/Downloads/ctflab-app-build-20260916/CTFLab.app` 与旧分发目录
 `/Users/pufei/Downloads/ctflab-dist-20260916/`；二者已由后续清理移除，验证截图与 JSON 证据保留。
@@ -29,7 +29,7 @@
 | 校验分发目录（真实 10GB 校验） | 表格逐文件显示大小（1.43GB/8.1GB/67.1MB/267.6MB）与“通过” | `05-verified.png` |
 | 错误目录被拒绝 | 选 `/tmp/ctflab-empty-dist`：横幅显示“未找到分发清单 …/DISTRIBUTION.json”、退出码 1、可复制；导入/启动保持禁用 | `06-wrong-dir-rejected.png` |
 | **导入实验环境可调用并真实完成** | 三次 `import <profile> <基盘> --manifest DISTRIBUTION.json` 全部完成（App 内 `qemu-img convert` 解压分发基盘到隔离状态目录，约 22GB）；节点表全部“已导入=是”，启动按钮启用 | `08-importing.png`、`10-imported.png` |
-| **启动全部** | 三台 VM 均由 App 内运行时启动（`qemu-system-aarch64` 用 HVF + App 内固件；`qemu-system-x86_64` 跑靶机），状态行变“实验环境运行中” | `12-health-checked.png` 与进程证据 |
+| **选择并启动所选节点** | 复选框默认全选；取消靶机后可仅启动 Kali 或 Kali+指定靶机。CLI 自动给 Kali user-mode NAT + SPICE，给靶机 restrict + Cocoa | GUI 源码/Swift 核心测试与最终 App CLI 实测 |
 | **检查状态（健康）** | 三个节点均显示 PID、“健康=通过”与日志路径 | `12-health-checked.png` |
 | 停止全部 | 无 QEMU、无交换机、无运行状态残留 | `13-stopped.png` |
 | 重置（确认框 + 取消 + 确认） | 确认框逐字提示“overlay 中的实验改动（安装的软件、产生的文件、被攻击后的状态）会全部丢失”；取消后 overlay 保留；确认后三节点 overlay 被删除、基盘保留 | `14-reset-confirm.png`、`15-reset-done.png` |
@@ -38,7 +38,7 @@
 ## 3. 仅单元测试覆盖（未逐项点击）
 
 - 状态机门禁组合（未校验/校验失败/执行中/未全部导入/运行中）与按钮启用状态：Swift 核心 58 条断言；
-- 命令拼接：`--manifest` 基盘位置参数、路径含空格、Kali-only `--internet`/`--display spice`、
+- 命令拼接：`--manifest` 基盘位置参数、路径含空格、节点选择、Kali 默认联网/自动显示与显式 `--display spice`、
   `stop --all`、逐节点 `reset`；
 - JSON 解析：分发报告（含缺失/大小不符/哈希不符三类失败）、状态报告、健康报告；字段名契约由
   Python 测试锁定（`dist verify --json`、`status --json`、`health --json`）；
@@ -56,11 +56,11 @@
 
 ## 5. 回归与边界
 
-- `python3 -m unittest discover -s tools/tests`：**352 项通过**（新增 21 项 GUI 测试；基线 331 项全部保持通过）；
+- `python3 -m unittest discover -s tools/tests`：当前全量 **361 项**（356 项实际执行通过，5 项历史 UTM 目录缺失跳过）；GUI 定向测试与 Swift 核心测试均通过；
 - `swiftc` 构建检查：`GuiCore.swift + GuiCoreTests.swift` 编译并运行 58 条检查全部通过；
   `GuiCore.swift + GuiApp.swift` 以 `-parse-as-library` 编译通过（app 构建即真实编译）；
 - `python3 -m py_compile tools/ctflab.py tools/ctflab_app.py tools/ctflab_dist.py` 通过；
-- 图形界面遵守既有边界：原始镜像只读 + overlay 运行、回环隔离实验网；联网只通过明确确认的
-  Kali-only 维护动作，动态分辨率只通过明确确认的 SPICE 动作；
+- 图形界面遵守既有边界：原始镜像只读 + overlay 运行、回环隔离实验网；Kali 默认通过 user-mode NAT
+  联网并自动使用 SPICE，Smoke/Basic 始终使用 restrict + Cocoa；动态分辨率不再需要单独按钮；
   不把口令写入命令行/日志/JSON、不把磁盘与日志加入 Git；
 - 本轮未提交、未推送；未修改既有最终 App 与分发目录。

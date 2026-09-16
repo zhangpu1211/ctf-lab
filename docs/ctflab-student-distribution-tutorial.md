@@ -14,7 +14,7 @@
 当前开发机已生成的实际位置是：
 
 ```text
-/Users/pufei/Downloads/ctflab-app-build-spice-clipboard-release2-20260916/CTFLab.app
+/Users/pufei/Downloads/ctflab-app-build-macos15-auto-final2-20260916/CTFLab.app
 /Users/pufei/Downloads/ctflab-dist-spice-release-20260916/
 ```
 
@@ -31,8 +31,8 @@ basic-pentesting-2-base.qcow2
 ```
 
 这两个绝对路径是本机产物位置，不是学生机器上的固定路径。复制或下载后，后续命令只需要把
-`APP_DIR` 和 `DIST_DIR` 改成实际位置。分发目录约 9.2GB，`.app` 约 264MB；不要把这些
-虚拟磁盘提交到 Git 仓库。当前新版 App 约 302MB；旧的无 SPICE 产物和旧分发目录已清理，课堂使用
+`APP_DIR` 和 `DIST_DIR` 改成实际位置。分发目录约 9.2GB，当前 `.app` 约 302MB；不要把这些
+虚拟磁盘提交到 Git 仓库。旧的无 SPICE 产物和旧分发目录已清理，课堂使用
 应以这里列出的新版路径为准。
 
 ## 2. 图形界面流程（推荐：双击打开）
@@ -42,18 +42,14 @@ basic-pentesting-2-base.qcow2
 1. **选择分发目录**：点“选择…”，选中包含 `DISTRIBUTION.json`、`SHA256SUMS` 与三个基盘的目录；
    App 会自动识别清单里登记的文件；对话框里可以直接用 `⌘⇧G` 粘贴路径。
 2. **校验分发目录**：点“校验分发目录”。表格会逐文件显示大小、状态与失败原因；
-   **任何一个文件哈希不一致时，“导入实验环境”和“启动全部”保持禁用**——先重新下载，不要绕过。
+   **任何一个文件哈希不一致时，“导入实验环境”和“启动所选节点”保持禁用**——先重新下载，不要绕过。
 3. **导入实验环境**：点一次，App 会依次对 `kali-arm64`、`smoke`、`basic-pentesting-2` 执行
    与命令行完全相同的 `--manifest` 导入（Kali 的 UEFI NVRAM 会按清单自动配对）。
    进度、成功/失败与 CLI 原文都显示在窗口里；导入失败会停在该节点并给出可复制的错误信息。
-4. **启动全部**：三个节点一起启动（Kali 图形窗口 + 两台靶机）。
+4. **选择节点并启动**：在节点列表勾选要运行的节点，通常选择 Kali 和一个或多个靶机；
+   然后点“启动所选节点”。Kali 图形窗口默认使用 SPICE 自动分辨率并通过 user-mode NAT 联网，
+   Smoke/Basic 的管理网仍保持隔离。只选择 Kali、只选择靶机或选择任意组合均可。
 5. **检查状态**：显示每个节点是否已导入、是否运行、健康检查结果与日志路径。
-
-6. **Kali 联网维护**（仅在老师明确授权时）：确认所有节点都已停止后，点击“Kali 联网维护…”，
-   再确认弹窗。它只启动 Kali 的临时 user-net 出口，不启动 Smoke/Basic；维护结束必须点击“停止全部”，
-   然后用默认“启动全部”恢复隔离实验网。
-7. **Kali 动态分辨率**：点击“Kali 动态分辨率…”可请求 SPICE 图形会话。只有 `app verify` 报告包含
-   SPICE-capable QEMU 与本地客户端的构建才会启动；缺件会在创建虚拟机前明确报错，不会把窗口缩放冒充动态分辨率。
 
 其他按钮：**停止全部**（同时停止三个节点并清理实验网）、**重置…**（逐节点删除运行 overlay；
 会先弹出确认框，明确提示 overlay 中的实验改动会丢失，基础镜像不受影响）。
@@ -76,7 +72,7 @@ CLI="$APP_DIR/Contents/Resources/bin/CTFLab"
 例如，直接使用当前开发机产物：
 
 ```zsh
-APP_DIR="/Users/pufei/Downloads/ctflab-app-build-spice-clipboard-release2-20260916/CTFLab.app"
+APP_DIR="/Users/pufei/Downloads/ctflab-app-build-macos15-auto-final2-20260916/CTFLab.app"
 DIST_DIR="/Users/pufei/Downloads/ctflab-dist-spice-release-20260916"
 CLI="$APP_DIR/Contents/Resources/bin/CTFLab"
 ```
@@ -151,7 +147,8 @@ UEFI NVRAM 模板；不要把 Kali 基盘和其他 profile 的文件混用。
 "$CLI" health basic-pentesting-2
 ```
 
-默认网络只绑定本机回环地址，不把脆弱靶机接入物理局域网，也不提供公网出口。实验网地址为：
+默认实验网只绑定本机回环地址，不把脆弱靶机接入物理局域网。Kali 的管理网默认通过 QEMU
+user-mode NAT 提供互联网出口；Smoke/Basic 管理网使用 `restrict=on`，不提供公网出口。实验网地址为：
 
 | 节点 | 实验网地址 | Mac 端口映射 |
 |---|---|---|
@@ -241,17 +238,14 @@ echo "$CLI"
 "$CLI" health basic-pentesting-2
 ```
 
-### 想让靶机访问公网
+### 网络与显示说明
 
-课堂默认不允许这样做。`--internet` 仅用于单独启动 Kali 的软件维护，不能与 Smoke 或 Basic
-Pentesting 2 同时启动；未经授权不要扩大网络边界。
+课堂版默认仅给 Kali 提供 user-mode NAT 互联网出口；Smoke、Basic Pentesting 2 始终保持管理网隔离，
+实验网仍只通过本机回环交换机互通。命令行保留 `--internet` 作为兼容旧脚本的显式参数，但日常启动
+Kali 不需要再附加它，也不要把它用于靶机。
 
-图形界面的“Kali 联网维护…”与命令行下面的 `--internet` 是同一能力。联网完成后必须先停止 Kali，
-再按默认隔离模式启动实验节点；不要把 `--internet` 用在 Smoke、Basic Pentesting 2 或多节点命令上。
-
-### 想让 Kali 窗口跟随来宾分辨率
-
-使用带 SPICE 的新版 App，点击“Kali 动态分辨率…”，登录 Kali 桌面后拖动窗口即可。
+使用新版 App 时，Kali 图形窗口默认通过 SPICE 自动跟随来宾分辨率，拖动窗口即可；不再需要单独的
+“动态分辨率”按钮。Retina 屏的窗口逻辑尺寸与来宾像素尺寸可能为 1:2，例如 1000×700 对应 2000×1400。
 Retina 屏的窗口逻辑尺寸与来宾像素尺寸可能为 1:2，例如 1000×700 对应 2000×1400。
 当前机器上的 Kali 已安装显示适配；旧分发目录内的基盘尚未更新，重新导入或重置旧基盘后需由老师补装。
 老师在 Kali 内运行新版 `tools/guest_fixes/kali-arm64/configure.sh --display-only`（需 sudo）后重新登录；
@@ -271,7 +265,7 @@ Retina 屏的窗口逻辑尺寸与来宾像素尺寸可能为 1:2，例如 1000�
 ```
 
 该模式要求 SPICE-capable QEMU、`spicevmc`/`virtserialport` 和本地 SPICE 客户端；缺任一项会在启动前
-拒绝。默认 `"$CLI" run kali-arm64` 仍使用 Cocoa 缩放，不是动态分辨率。
+拒绝，不会静默退回 Cocoa。无头模式不启动 SPICE 客户端；靶机图形窗口仍使用 Cocoa。
 
 ## 10. 给老师/助教的交付核对
 

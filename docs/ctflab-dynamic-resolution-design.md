@@ -1,12 +1,19 @@
 # CTFLab 动态分辨率设计：UTM 导出路径与带 SPICE 的 QEMU 路径对比
 
-> 当前实现状态：路径 B 的 CLI/GUI 能力门禁、QEMU 11.x SPICE 参数、可选运行时打包和 Kali XFCE
+> 当前交付策略（2026-09-16）：CTFLab CLI 的 `run --display auto` 是默认值。Kali 图形启动自动选择
+> SPICE、`spicevmc` agent transport 和 XFCE 显示适配，窗口尺寸跟随来宾分辨率；x86 靶机自动选择
+> Cocoa，`--headless` 不启动 SPICE 客户端。Kali 的管理网默认通过 user-mode NAT 联网，Smoke/Basic
+> Pentesting 2 的管理网继续 `restrict=on`；实验网仍只通过回环交换机互通。GUI 已改为可勾选启动
+> Kali、Smoke、Basic 的任意组合，并移除了单独的联网维护/动态分辨率按钮。下文带有“历史”标记的
+> UTM 失败记录和旧默认策略用于保留证据，不覆盖当前 App 行为。
+
+> 当前实现状态：路径 B 的 CLI/GUI 能力门禁、QEMU 11.x SPICE 参数、运行时打包和 Kali XFCE
 > 显示适配已接入。2026-09-16 已用带 SPICE 的 QEMU 与内置 `spicy` 完成 server/client/agent
 > 连接、冷启动恢复，以及 1000×700 / 800×600 窗口对应来宾 2000×1400 / 1600×1200 的实际跟随验证。
 > 旧分发基盘已清理；新版分发目录已包含 `configure.sh --display-only` 的适配结果。
 > 详细证据见 `verification-display-network-2026-09-16.md`。
 
-> 状态：**路径 A 的 `utm-export` 已实现并通过单元测试；UTM 4.7.5 必需段与必需键已按上游源码
+> 历史对比基线（截至 2026-09-14，**不覆盖上方当前交付策略**）：路径 A 的 `utm-export` 已实现并通过单元测试；UTM 4.7.5 必需段与必需键已按上游源码
 > 补齐。2026-09-14：首次导入（R1）因缺必需段失败；补齐后导出 `CTFLab-Kali-E2E-20260914-R2`，
 > 在 UTM 4.7.5 中通过“导入/解析”验收（虚拟机未启动），并完成一次冷启动与 Kali 图形登录
 > （lightdm 登录 → XFCE 桌面）。同日两轮会话中另完成：剪贴板负向（英/中/多行、双向不泄漏）与
@@ -26,8 +33,8 @@
 > 记录在导出清单的 `runtime_status`（`e2e_scope`/`e2e_status`/`dynamic_resolution`，取值见 2.3）与
 > 独立验证记录中。旧 schema 迁移标签仅用于 schema 2 兼容迁移，不作为当前 fixture 或当前结构状态
 > 输出，避免 E2E 完成后产生歧义。
-> 本文仍是路径对比与边界基线；SPICE 后端已接入源代码能力门禁，验收构建已能通过 `--qemu-root` 与
-> `--spice-client` 纳入 QEMU/客户端，但默认 Cocoa 构建不自动携带该可选组合，也不改变现有 CLI 行为。
+> 本文仍保留路径对比与历史边界基线；当前验收 App 已随包携带 SPICE QEMU 与本地客户端，`run --display auto`
+> 默认给 Kali 选择 SPICE，靶机选择 Cocoa，不改变实验网与 overlay 语义。
 > 两条路径的默认关闭边界：A 的导出包默认不带网卡、默认关闭 UTM Clipboard Sharing；
 > B 的动态分辨率保留唯一的 virtio-serial + spicevmc agent transport；剪贴板按 `--clipboard`
 > 条件开关：未授权时 `disable-copy-paste=on`/`disable-agent-file-xfer=on` 且客户端关闭
@@ -252,12 +259,12 @@ state:
 - 基础镜像发布同样使用排他重命名；登记完成后基盘设为只读（0444），导出与运行都以只读
   方式使用，overlay 不写回基盘。
 
-## 3. 路径 B：将来分发带 SPICE 的 QEMU 与本地 SPICE 客户端
+## 3. 路径 B：当前分发的带 SPICE QEMU 与本地 SPICE 客户端
 
 ### 3.1 形态
 
-- 随 CTFLab 分发（或在用户显式确认后引导安装）带 SPICE 的 QEMU 构建与本地 SPICE 客户端，
-  作为**可选显示后端**；Cocoa 仍是默认显示路径（未传显示参数时的唯一行为）；
+- 随 CTFLab 分发带 SPICE 的 QEMU 构建与本地 SPICE 客户端，作为当前 Kali 图形启动的默认显示后端；
+  `run --display auto` 对 x86 靶机选择 Cocoa，`--headless` 不启动图形客户端，显式 `--display cocoa` 保留作排障；
 - 动态分辨率由来宾 `spice-vdagent` 的 monitors config 能力驱动，因此**无论是否开启剪贴板，
   都必须保留唯一的 virtio-serial + spicevmc agent transport**（这是分辨率跟随的前提，
   不是剪贴板开关）；文本剪贴板仅在显式 `--clipboard` 时启用，并复用同一条 spicevmc 通道
@@ -267,8 +274,8 @@ state:
 ### 3.2 硬性要求
 
 - **能力探测与失败语义**：启动前探测 QEMU 是否支持 spice 显示后端与 spicevmc/virtserialport，
-  以及本地客户端可执行文件是否存在。用户**显式请求** spice 时，任一缺失必须在启动前明确报错
-  并停止（不启动虚拟机、不悄悄回退 Cocoa）；只有**未传显示参数**时，默认 Cocoa 路径才保持不变；
+  以及本地客户端可执行文件是否存在。auto 为 Kali 选择 SPICE 时，任一缺失必须在启动前明确报错
+  并停止（不启动虚拟机、不悄悄回退 Cocoa）；显式 `--display cocoa` 才跳过 SPICE 探测；
 - **本机端点 + 每次运行本地鉴权（两种模式互斥，不叠加要求）**：仅本机端点不足以阻止同机
   其他进程，必须叠加每次运行的本地鉴权；按实现选型二者之一：
   - **UNIX socket 模式（优先）**：命令使用 `unix=<socket 路径>`，socket 位于权限 0700 的
@@ -278,30 +285,34 @@ state:
     明文中（经 0600 受限文件或文件描述符传递，运行结束即失效）；端口来自与 QMP/实验端口
     同一受控范围并写入运行状态；
   E2E 必须包含“未授权本地客户端无法连接”，并按所选模式分别验证；
-- **保留 Cocoa 默认**：不传新选项时命令与现状一致；`zoom-to-fit` 保留但仍称缩放；
+- **保留 Cocoa 能力**：`--display cocoa` 与 `zoom-to-fit` 保留作靶机和兼容性排障；未传显示选项时由
+  `auto` 按 profile 选择后端；
 - **剪贴板按 `--clipboard` 条件开关（分层控制）**：动态分辨率所需的 agent transport 始终
   保留；未传 `--clipboard` 时：SPICE 侧 `disable-copy-paste=on`、`disable-agent-file-xfer=on`，
   受控 SPICE 客户端也关闭 clipboard sharing，不启用任何剪贴板方向；传入 `--clipboard` 时：
   `disable-copy-paste=off`（或省略），允许文本剪贴板，`disable-agent-file-xfer=on` 仍保留。
   负向 E2E 必须在 agent transport 存在的前提下验证未授权时英文、中文、多行文本双向均不泄漏；
   任一层不能证明隔离，则**不得实现路径 B**；
-- **范围限制**：仅允许 `kali-arm64`；靶机 profile（smoke、basic-pentesting-2 等）一律拒绝，
-  并有对应的拒绝测试；
+- **范围限制**：SPICE 仅允许 `kali-arm64`；auto 启动靶机 profile（smoke、basic-pentesting-2 等）时
+  一律选择 Cocoa，并有对应的选择测试；
 - **前置 PoC（独立门槛）**：自管 QEMU + SPICE 的图形设备与客户端组合必须先做独立 PoC；
   UTM 的 `virtio-gpu-pci` 动态分辨率结果不能直接套用，PoC 通过前不进入实现；
-- **分发边界**：QEMU 构建与 SPICE 客户端的许可、体积、签名、SBOM 属于 Task 6 打包范畴；
-  在此之前只做本机能力探测与手工 PoC，不分发二进制、不写入任何发布渠道。
+- **分发边界**：QEMU 构建与 SPICE 客户端的许可、体积、签名、SBOM 已纳入 Task 6 打包范畴；
+  当前 App 已随包分发这些运行时，正式 Developer ID 签名与公证仍未完成。
 
-### 3.3 CLI/API（已实现能力门禁；运行时仍需 SPICE 构建）
+### 3.3 CLI/API（当前实现）
 
 ```yaml
-# 接口：可选显示后端（默认 cocoa，行为不变）
+# 接口：可选显示后端（默认 auto）
 flag: display
-usage: run <profile...> [--display <cocoa|spice>]
+usage: run <profile...> [--display <auto|cocoa|spice>]
 allowed_profiles:
-  - kali-arm64        # 靶机 profile（smoke、basic-pentesting-2 等）一律拒绝
+  - kali-arm64        # auto 图形模式 → spice
+  - smoke              # auto → cocoa
+  - basic-pentesting-2 # auto → cocoa
 behavior:
-  cocoa: 现状；本地窗口；zoom-to-fit 缩放；不是动态分辨率
+  auto: 图形 Kali → spice；图形靶机 → cocoa；--headless 下所有节点 → cocoa/none
+  cocoa: 本地窗口；zoom-to-fit 缩放；用于靶机和兼容性排障
   spice: 需能力探测通过；本机端点 + 每次运行本地鉴权；由受控 SPICE 客户端显示；
          agent transport 始终保留；剪贴板按下方 clipboard 条件开关
 state:
@@ -322,7 +333,8 @@ probe:
     关闭 clipboard sharing，传入时仅允许文本方向
 failure:
   - 显式请求 spice 且探测失败：启动前报错退出，列出缺失项与安装提示；不自动回退 Cocoa
-  - 未显式传入显示参数：不执行探测，不改变任何现有参数（默认 cocoa）
+  - auto 选择 spice 时：能力探测失败即在创建虚拟机前报错，不静默退回 Cocoa
+  - auto 选择 cocoa 时：不执行 SPICE 探测
 ```
 
 ### 3.4 磁盘只读 / overlay / 隔离网络边界
@@ -397,7 +409,7 @@ failure:
 | B（负向：未授权剪贴板 + 未授权客户端） | agent transport 存在、未传 `--clipboard`：宿主侧放入英文、中文、多行哨兵文本，来宾侧确认剪贴板无内容；来宾侧写入哨兵文本，宿主剪贴板哈希不变；受控客户端 clipboard sharing 已关闭；另一未授权本地客户端无法连接端点 → 任一层失败即判定隔离不成立，不得实现路径 B |
 
 回归要求：两条路径的改动都不得改变默认 `run` 命令、`stop/reset` 语义、PCAP 与健康检查行为；
-本次完整回归（2026-09-16 复核，360 项，5 项按历史 UTM 目录缺失规则跳过）全部通过。
+本次完整回归（2026-09-16 复核，361 项，5 项按历史 UTM 目录缺失规则跳过）全部通过。
 
 ## 6. 推荐路径
 
@@ -427,10 +439,9 @@ failure:
   套用到自管 QEMU + SPICE（自管路径的窗口跟随已单独验收，剪贴板和鉴权边界仍待验收）；
 - 不允许 SPICE 以非本机方式暴露：TCP 仅 `127.0.0.1` + 每次运行鉴权，UNIX socket 仅
   0700 runtime 目录；不以 VNC 作为默认显示路径；
-- 本次路径 B 新增的是显式 `run --display cocoa|spice` 能力门禁与 SPICE 命令构造；默认不传参数时
-  仍是 Cocoa，绝不静默回退；SPICE 二进制与客户端只在经过许可/SBOM/签名核验的可选 runtime 中进入验收包；
-- 本轮不改变 UTM 后端；SPICE 后端与可选 runtime 配合 XFCE 适配已完成两档窗口跟随，
-  旧分发基盘未更新，当前不宣称所有既有分发包的动态分辨率已交付。
+- 本次路径 B 已将 `run --display auto` 设为默认；Kali 图形启动自动使用 SPICE，靶机和无头模式
+  保持 Cocoa/无图形；SPICE 二进制与客户端只在经过许可/SBOM/签名核验的 runtime 中进入验收包。
+- 本轮不改变 UTM 后端；当前 App 的 SPICE 后端与 XFCE 适配已完成两档窗口跟随、冷启动恢复和重连验证。
 
 ## 8. 仍需决策的问题
 

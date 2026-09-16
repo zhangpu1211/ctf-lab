@@ -1,4 +1,4 @@
-// CTFLab 图形入口（SwiftUI/AppKit，macOS 13+）。
+// CTFLab 图形入口（SwiftUI/AppKit，GUI 框架 macOS 13+；课堂 App 随包运行时要求 macOS 15.0+）。
 //
 // 只做三件事：驱动现有 CLI（dist verify / import --manifest / run / status / health /
 // stop --all / reset）、展示结果、按状态机门禁按钮。所有业务逻辑在 GuiCore.swift。
@@ -38,8 +38,6 @@ final class GuiModel: ObservableObject {
     @Published var verifyRows: [DistEntry] = []
     @Published var nodes: [StatusProfile] = []
     @Published var showResetConfirmation = false
-    @Published var showInternetConfirmation = false
-    @Published var showDynamicResolutionConfirmation = false
 
     /// 状态目录覆盖（仅用于测试/隔离验收；学生双击运行时使用 CLI 默认目录）。
     private let stateDirOverride = ProcessInfo.processInfo.environment["CTFLAB_GUI_STATE_DIR"]
@@ -101,6 +99,7 @@ final class GuiModel: ObservableObject {
             verifyRows = []
             // 导入状态属于状态目录，不等于新选择的分发目录已经导入；切换目录后必须重新导入。
             state.importedNodes.removeAll()
+            state.selectedNodes = Set(LabNode.required)
             state.healthyNodes.removeAll()
             state.pendingHealthNodes.removeAll()
             state.phase = .idle
@@ -174,7 +173,7 @@ final class GuiModel: ObservableObject {
         guard index < nodes.count else {
             state.phase = .imported
             state.progressText = ""
-            appendLog("三个节点导入完成。可点击“启动全部”。")
+            appendLog("三个节点导入完成。请选择要启动的节点。Kali 图形启动默认联网并自动适配分辨率。")
             refreshStatus()
             return
         }
@@ -202,11 +201,26 @@ final class GuiModel: ObservableObject {
         }
     }
 
-    func startAll() {
-        guard state.canStart else { return }
+    func setNodeSelected(_ node: LabNode, selected: Bool) {
+        guard !state.phase.isBusy && !state.anyRunning else { return }
+        if selected {
+            state.selectedNodes.insert(node)
+        } else {
+            state.selectedNodes.remove(node)
+        }
+    }
+
+    func startSelected() {
+        guard state.canStartSelected else {
+            state.lastError = state.selectedNodes.isEmpty
+                ? "请至少选择一个节点。"
+                : "所选节点尚未全部导入，或当前仍有节点运行。"
+            return
+        }
+        let selected = LabNode.required.filter { state.selectedNodes.contains($0) }
         state.phase = .busy
-        state.progressText = "正在启动三个节点…（首次启动需要等待来宾系统引导）"
-        run(.runAll) { [weak self] outcome in
+        state.progressText = "正在启动所选节点…（Kali 默认联网并自动适配分辨率）"
+        run(.run(nodes: selected)) { [weak self] outcome in
             guard let self else { return }
             self.state.phase = .idle
             self.state.progressText = ""
@@ -231,7 +245,8 @@ final class GuiModel: ObservableObject {
             case .failure(let message):
                 self.state.lastError = message
             }
-            self.checkHealthSequence(nodes: LabNode.required, index: 0)
+            let activeNodes = LabNode.required.filter { self.state.runningNodes.contains($0) }
+            self.checkHealthSequence(nodes: activeNodes, index: 0)
         }
     }
 
@@ -243,12 +258,6 @@ final class GuiModel: ObservableObject {
             return
         }
         let node = nodes[index]
-        guard state.runningNodes.contains(node) else {
-            state.healthyNodes.remove(node)
-            appendLog("\(node.displayName)：未运行，跳过健康检查")
-            checkHealthSequence(nodes: nodes, index: index + 1)
-            return
-        }
         run(.health(node: node)) { [weak self] outcome in
             guard let self else { return }
             switch outcome {
@@ -293,50 +302,6 @@ final class GuiModel: ObservableObject {
     func requestReset() {
         guard state.canReset else { return }
         showResetConfirmation = true
-    }
-
-    func requestKaliInternet() {
-        guard state.canKaliInternet else {
-            state.lastError = "Kali 联网维护要求 Kali 已导入且所有节点均已停止。"
-            return
-        }
-        showInternetConfirmation = true
-    }
-
-    func confirmKaliInternet() {
-        showInternetConfirmation = false
-        guard state.canKaliInternet else { return }
-        state.phase = .busy
-        state.progressText = "正在启动 Kali 联网维护模式…"
-        run(.runKaliInternet) { [weak self] outcome in
-            guard let self else { return }
-            self.state.phase = .idle
-            self.state.progressText = ""
-            if case .failure(let message) = outcome { self.state.lastError = message }
-            self.refreshStatus()
-        }
-    }
-
-    func requestKaliDynamicResolution() {
-        guard state.canKaliDynamicResolution else {
-            state.lastError = "Kali 动态分辨率要求 Kali 已导入且所有节点均已停止。"
-            return
-        }
-        showDynamicResolutionConfirmation = true
-    }
-
-    func confirmKaliDynamicResolution() {
-        showDynamicResolutionConfirmation = false
-        guard state.canKaliDynamicResolution else { return }
-        state.phase = .busy
-        state.progressText = "正在启动 Kali 动态分辨率模式…"
-        run(.runKaliDynamicResolution) { [weak self] outcome in
-            guard let self else { return }
-            self.state.phase = .idle
-            self.state.progressText = ""
-            if case .failure(let message) = outcome { self.state.lastError = message }
-            self.refreshStatus()
-        }
     }
 
     func confirmReset() {
@@ -462,6 +427,7 @@ struct ContentView: View {
                 errorBanner(error)
             }
             verifyTable
+            nodeSelection
             nodeTable
             logPanel
         }
@@ -472,18 +438,6 @@ struct ContentView: View {
             Button(GuiMessages.resetConfirmButton, role: .destructive) { model.confirmReset() }
         } message: {
             Text(GuiMessages.resetConfirmationBody)
-        }
-        .alert("开启 Kali 联网维护？", isPresented: $model.showInternetConfirmation) {
-            Button("取消", role: .cancel) {}
-            Button("开启联网", role: .destructive) { model.confirmKaliInternet() }
-        } message: {
-            Text("仅启动 Kali 的临时联网维护模式，不启动 Smoke/Basic。完成更新或下载后请点击“停止全部”，再用默认“启动全部”恢复隔离实验网。")
-        }
-        .alert("开启 Kali 动态分辨率？", isPresented: $model.showDynamicResolutionConfirmation) {
-            Button("取消", role: .cancel) {}
-            Button("启动动态分辨率", role: .none) { model.confirmKaliDynamicResolution() }
-        } message: {
-            Text("仅启动 Kali 的 SPICE 图形会话。窗口尺寸应驱动来宾真实分辨率变化；如果内置运行时缺少 SPICE 能力，启动会在创建虚拟机前明确失败，不会退回缩放模式。")
         }
     }
 
@@ -516,12 +470,8 @@ struct ContentView: View {
                 .disabled(!model.state.canVerify)
             Button("导入实验环境") { model.importAll() }
                 .disabled(!model.state.canImport)
-            Button("启动全部") { model.startAll() }
-                .disabled(!model.state.canStart)
-            Button("Kali 联网维护…") { model.requestKaliInternet() }
-                .disabled(!model.state.canKaliInternet)
-            Button("Kali 动态分辨率…") { model.requestKaliDynamicResolution() }
-                .disabled(!model.state.canKaliDynamicResolution)
+            Button("启动所选节点") { model.startSelected() }
+                .disabled(!model.state.canStartSelected)
             Button("检查状态") { model.checkStatus() }
                 .disabled(!model.state.canCheckStatus)
             Button("停止全部") { model.stopAll() }
@@ -533,6 +483,27 @@ struct ContentView: View {
                 ProgressView().controlSize(.small)
                 Text(model.state.progressText).font(.caption)
             }
+        }
+    }
+
+    private var nodeSelection: some View {
+        HStack(spacing: 12) {
+            Text("启动节点")
+                .font(.headline)
+            ForEach(LabNode.required) { node in
+                Toggle(node.displayName,
+                       isOn: Binding(
+                           get: { model.state.selectedNodes.contains(node) },
+                           set: { model.setNodeSelected(node, selected: $0) }
+                       ))
+                .toggleStyle(.checkbox)
+                .disabled(model.state.phase.isBusy || model.state.anyRunning
+                          || !model.state.importedNodes.contains(node))
+            }
+            Spacer()
+            Text("Kali 图形启动默认联网 + 自动分辨率")
+                .font(.caption)
+                .foregroundStyle(.secondary)
         }
     }
 

@@ -17,7 +17,8 @@
 
 - **内置 Python 3.12 解释器与 PyYAML**（python-build-standalone，见 §11）：启动器只使用 app 内
   解释器，缺失即报错，**不回退**系统 Python；接收者无需 venv/pip/联网；
-- 不改默认 QEMU 命令语义、不改 `run/stop/reset` 行为、不动 UTM 路径；
+- 不改 `stop/reset` 行为；`run` 的默认策略是 Kali 图形自动 SPICE + user-mode NAT，其他节点
+  Cocoa + 管理网隔离，显式 `--display cocoa` 可用于兼容性排障；不动 UTM 路径；
 - 不写入 app：状态、镜像、overlay、日志仍在 `~/Library/Application Support/CTFLab`；
 - 本地构建，不签名分发：默认 ad-hoc 签名；没有 Developer ID 身份时**不会**冒充正式签名。
 
@@ -146,7 +147,7 @@ CLI 启动器保留在 `Contents/Resources/bin/`（`ctflab-cli` 与兼容名 `CT
 
 - **不做第二套逻辑**：GUI 只调用既有 CLI（`dist verify --json`、`import <profile> <基盘> --manifest`、
   `run`、`status --json`、`health <profile> --json`、`stop --all`、`reset <profile>`），
-  另以固定动作调用 Kali-only 的 `run kali-arm64 --internet` 与 `run kali-arm64 --display spice`，
+  另以固定动作调用 `run` 的节点选择；Kali 的联网与 SPICE 自动分辨率由 CLI 默认策略统一处理，
   不解析任意 QEMU 参数、不绕过清单哈希；
 - **状态机门禁**：校验未通过时导入/启动禁用；未全部导入时启动/重置禁用；运行中禁止再次启动；
   执行中所有动作禁用；重新打开 App 时通过 `status --json` 恢复“已导入/运行中”显示；

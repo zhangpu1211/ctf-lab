@@ -159,6 +159,21 @@ def spice_client_command(client: str, endpoint: Path, clipboard: bool = False) -
     return [client, client_uri]
 
 
+def resolve_display_backend(profile_id: str, requested: str, *, headless: bool = False) -> str:
+    """解析 ``run --display auto``：Kali 图形模式使用 SPICE，其余节点使用 Cocoa。
+
+    自动模式只对图形启动启用 SPICE；无头运行不拉起客户端，也不要求宿主具备 SPICE
+    客户端。显式 ``cocoa``/``spice`` 仍由调用方执行各自的 profile 与能力门禁。
+    """
+    if requested not in {"auto", "cocoa", "spice"}:
+        raise CTFLabError(f"不支持的显示后端：{requested}（可选 auto、cocoa 或 spice）。")
+    if headless and requested == "auto":
+        return "cocoa"
+    if requested == "auto":
+        return "spice" if profile_id == "kali-arm64" else "cocoa"
+    return requested
+
+
 def sha256_file(path: Path, chunk_size: int = 8 * 1024 * 1024) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -1866,7 +1881,7 @@ class LabManager:
 
     def run(self, profile_ids: list[str], headless: bool = False, pcap: bool = False,
             allow_internet: bool = False, clipboard: bool = False,
-            display: str = "cocoa",
+            display: str = "auto",
             profile_overrides: dict[str, dict[str, Any]] | None = None) -> list[dict[str, Any]]:
         with self.operation_lock("启动 " + ",".join(profile_ids)):
             return self._run_unlocked(profile_ids, headless=headless, pcap=pcap,
@@ -1875,23 +1890,27 @@ class LabManager:
 
     def _run_unlocked(self, profile_ids: list[str], headless: bool = False, pcap: bool = False,
                       allow_internet: bool = False, clipboard: bool = False,
-                      display: str = "cocoa",
+                      display: str = "auto",
                       profile_overrides: dict[str, dict[str, Any]] | None = None) -> list[dict[str, Any]]:
         profile_overrides = profile_overrides or {}
         profile_ids = list(dict.fromkeys(PROFILE_ALIASES.get(profile_id, profile_id) for profile_id in profile_ids))
-        if display not in {"cocoa", "spice"}:
-            raise CTFLabError(f"不支持的显示后端：{display}（可选 cocoa 或 spice）。")
+        if display not in {"auto", "cocoa", "spice"}:
+            raise CTFLabError(f"不支持的显示后端：{display}（可选 auto、cocoa 或 spice）。")
         if display == "spice" and profile_ids != ["kali-arm64"]:
             raise CTFLabError("--display spice 只能单独启动 kali-arm64。")
         if display == "spice" and headless:
             raise CTFLabError("--display spice 不能与 --headless 同时使用。")
         if clipboard and (headless or "kali-arm64" not in profile_ids):
             raise CTFLabError("--clipboard 需要启动 Kali 图形窗口。")
-        if allow_internet and profile_ids != ["kali-arm64"]:
-            raise CTFLabError("--internet 只能单独启动 kali-arm64。")
+        if allow_internet and "kali-arm64" not in profile_ids:
+            raise CTFLabError("只有 Kali 可以联网；Smoke 和 Basic Pentesting 2 始终保持隔离。")
+        displays = {
+            profile_id: resolve_display_backend(profile_id, display, headless=headless)
+            for profile_id in profile_ids
+        }
         for profile_id in profile_ids:
             load_profile(profile_id)
-        if display == "spice":
+        if "spice" in displays.values():
             # 预检必须发生在创建实验网交换机和 overlay 之前；显式 SPICE 缺件不能留下
             # “虚拟机没启动但网络还在”的半完成状态。
             qemu = which_any(QEMU_ARM_NAMES)
@@ -1904,14 +1923,12 @@ class LabManager:
         for state in running:
             if state["profile_id"] == "kali-arm64" and "kali-arm64" in profile_ids and bool(state.get("clipboard_enabled")) != clipboard:
                 raise CTFLabError("切换剪贴板模式需要先 stop，再 run。")
-            if state["profile_id"] in profile_ids and state.get("display_backend", "cocoa") != display:
+            expected_display = displays.get(state["profile_id"])
+            if expected_display and state.get("display_backend", "cocoa") != expected_display:
                 raise CTFLabError("切换显示后端需要先 stop，再 run。")
-        if allow_internet and any(state["profile_id"] != "kali-arm64" for state in running):
-            raise CTFLabError("Kali 联网维护前请先停止其他靶机。")
-        if any(state.get("internet_enabled") for state in running) and profile_ids != ["kali-arm64"]:
-            raise CTFLabError("Kali 正在联网维护；请先停止它并以默认隔离模式重启，再启动靶机。")
         for state in running:
-            if state["profile_id"] in profile_ids and bool(state.get("internet_enabled")) != allow_internet:
+            expected_internet = state["profile_id"] == "kali-arm64"
+            if state["profile_id"] in profile_ids and bool(state.get("internet_enabled")) != expected_internet:
                 raise CTFLabError("切换联网模式需要先 stop，再 run。")
         lab_port = int(running[0]["lab_port"]) if running else self.allocate_lab_port()
         pcap_path: Path | None = None
@@ -1934,9 +1951,11 @@ class LabManager:
             overlay = self.ensure_overlay(profile_id)
             command, host_forwards = self.qemu_command(
                 profile_id, profile, overlay, lab_port, headless,
-                allow_internet=allow_internet,
+                # Kali 的管理网默认使用 user-mode NAT；脆弱靶机的管理网仍为
+                # restrict=on，实验网只经本地交换机互通。
+                allow_internet=profile_id == "kali-arm64",
                 clipboard=clipboard and profile_id == "kali-arm64",
-                display=display,
+                display=displays[profile_id],
             )
             log_path = self.logs_dir / f"{profile_id}.log"
             log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1977,13 +1996,13 @@ class LabManager:
                     "controller": profile.get("disk", {}).get("controller"),
                 }.items() if v} if profile_id in profile_overrides else None,
                 "headless": headless,
-                "internet_enabled": allow_internet,
+                "internet_enabled": profile_id == "kali-arm64",
                 "clipboard_enabled": clipboard and profile_id == "kali-arm64",
-                "display_backend": display,
-                "spice_endpoint": str(self.runtime_dir / profile_id / "spice" / "display.sock") if display == "spice" else None,
+                "display_backend": displays[profile_id],
+                "spice_endpoint": str(self.runtime_dir / profile_id / "spice" / "display.sock") if displays[profile_id] == "spice" else None,
             }
             write_json(self.runtime_state_path(profile_id), state)
-            if display == "spice":
+            if displays[profile_id] == "spice":
                 # QEMU 先创建服务端 socket，再启动受控客户端；客户端只接收固定的
                 # spice+unix URI，不接受用户拼接的 QEMU/网络参数。
                 endpoint = Path(str(state["spice_endpoint"]))
@@ -2921,7 +2940,7 @@ def cmd_run(manager: LabManager, args: argparse.Namespace) -> int:
         forwards = ", ".join(f"{name}=127.0.0.1:{port}" for name, port in state.get("host_forwards", {}).items()) or "无主机端口映射"
         print(f"已启动 {state['profile_id']}（PID {state['pid']}，实验网 TCP {state['lab_port']}；{forwards}）")
         if state.get("internet_enabled"):
-            print("  Kali 联网维护模式已开启；先 stop，再默认 run 才会恢复隔离。")
+            print("  Kali 默认通过 user-mode NAT 联网；Smoke/Basic Pentesting 2 仍保持管理网隔离。")
         if state.get("display_backend") == "spice":
             print(f"  SPICE 动态分辨率端点：{state['spice_endpoint']}")
     pcap_paths = {str(state.get("pcap_path")) for state in states if state.get("pcap_path")}
@@ -2983,7 +3002,7 @@ def cmd_status(manager: LabManager, args: argparse.Namespace) -> int:
         printed = True
         print(f"{profile_id}: running PID={state['pid']} lab=tcp://127.0.0.1:{state['lab_port']} log={state['log_path']}")
         if state.get("internet_enabled"):
-            print("  网络：Kali 联网维护模式")
+            print("  网络：Kali 默认 user-mode NAT（实验网仍经回环交换机隔离）")
         if state.get("host_forwards"):
             print("  端口：" + ", ".join(f"{key}=127.0.0.1:{value}" for key, value in state["host_forwards"].items()))
         lab_port = int(state.get("lab_port", 0))
@@ -3179,9 +3198,10 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--headless", action="store_true", help="不打开图形窗口，日志写入 logs/")
     run_parser.add_argument("--clipboard", action="store_true", help="显式允许 Mac 与 Kali 图形桌面双向共享文本剪贴板")
     run_parser.add_argument("--pcap", action="store_true", help="记录隔离实验网的 Ethernet PCAP")
-    run_parser.add_argument("--internet", action="store_true", help="仅为单独启动的 Kali 临时联网维护")
-    run_parser.add_argument("--display", choices=("cocoa", "spice"), default="cocoa",
-                            help="显示后端；默认 cocoa，Kali 可显式选择 spice 动态分辨率")
+    run_parser.add_argument("--internet", action="store_true",
+                            help="兼容旧命令的显式确认；Kali 图形启动默认联网，其他节点仍隔离")
+    run_parser.add_argument("--display", choices=("auto", "cocoa", "spice"), default="auto",
+                            help="显示后端；默认 auto：Kali 图形启动使用 SPICE 自动分辨率，其他节点使用 Cocoa")
 
     status_parser = subparsers.add_parser("status", help="查看运行状态")
     status_parser.add_argument("--json", action="store_true",

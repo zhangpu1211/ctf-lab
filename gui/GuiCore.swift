@@ -2,8 +2,8 @@
 //
 // 职责：状态机、按钮门禁、CLI 命令拼接、CLI JSON 解析、错误文案。
 // 约束：只调用现有 CLI 能力（dist verify / import --manifest / run / status / health /
-// stop --all / reset），不自行实现导入逻辑，不暴露任意 QEMU 参数；Kali 联网只能通过
-// 明确命名的维护动作进入，不能混入“启动全部”。
+// stop --all / reset），不自行实现导入逻辑，不暴露任意 QEMU 参数；启动动作只把用户
+// 选中的节点交给 CLI。Kali 的联网和图形分辨率由 CLI 的默认运行策略统一管理。
 
 import Foundation
 
@@ -149,6 +149,8 @@ public struct GuiState: Equatable {
     public var phase: GuiPhase = .idle
     public var importedNodes: Set<LabNode> = []
     public var runningNodes: Set<LabNode> = []
+    /// 启动选择默认全选，用户可在启动前取消任意靶机；导入仍按清单导入全部节点。
+    public var selectedNodes: Set<LabNode> = Set(LabNode.required)
     public var healthyNodes: Set<LabNode> = []
     public var pendingHealthNodes: Set<LabNode> = []
     public var lastError: String?
@@ -162,20 +164,15 @@ public struct GuiState: Equatable {
 
     public var canVerify: Bool { !(distDir ?? "").isEmpty && !phase.isBusy }
     public var canImport: Bool { verificationPassed && !anyRunning && !phase.isBusy }
-    public var canStart: Bool { verificationPassed && allImported && !anyRunning && !phase.isBusy }
+    public var canStartSelected: Bool {
+        verificationPassed && !selectedNodes.isEmpty
+            && selectedNodes.isSubset(of: importedNodes)
+            && !anyRunning && !phase.isBusy
+    }
+    public var canStart: Bool { canStartSelected }
     public var canCheckStatus: Bool { !phase.isBusy }
     public var canStop: Bool { anyRunning && !phase.isBusy }
     public var canReset: Bool { allImported && !anyRunning && !phase.isBusy }
-
-    /// 联网是 Kali 的单独维护模式，不能和实验网节点同时运行，也不能借“启动全部”隐式开启。
-    public var canKaliInternet: Bool {
-        importedNodes.contains(.kali) && !anyRunning && !phase.isBusy
-    }
-
-    /// 动态分辨率使用独立 SPICE 显示会话，只允许单独启动 Kali；后端缺失时由 CLI 在启动前拒绝。
-    public var canKaliDynamicResolution: Bool {
-        importedNodes.contains(.kali) && !anyRunning && !phase.isBusy
-    }
 
     /// 导入按钮的进度文案（导入中显示第几个节点）。
     public func importProgressText(index: Int, total: Int, node: LabNode) -> String {
@@ -198,9 +195,7 @@ public struct GuiState: Equatable {
 public enum CliAction: Equatable {
     case distVerify(dir: String)
     case importNode(node: LabNode, sourcePath: String, manifestPath: String)
-    case runAll
-    case runKaliInternet
-    case runKaliDynamicResolution
+    case run(nodes: [LabNode])
     case status
     case health(node: LabNode)
     case stopAll
@@ -218,12 +213,9 @@ public enum CliAction: Equatable {
         case .importNode(let node, let sourcePath, let manifestPath):
             // 与 CLI 一致：基盘是位置参数，--manifest 负责哈希校验并配对同目录的 NVRAM 模板。
             args += ["import", node.rawValue, sourcePath, "--manifest", manifestPath]
-        case .runAll:
-            args += ["run"] + LabNode.required.map(\.rawValue)
-        case .runKaliInternet:
-            args += ["run", LabNode.kali.rawValue, "--internet"]
-        case .runKaliDynamicResolution:
-            args += ["run", LabNode.kali.rawValue, "--display", "spice"]
+        case .run(let nodes):
+            let ordered = LabNode.required.filter { nodes.contains($0) }
+            args += ["run"] + ordered.map(\.rawValue)
         case .status:
             args += ["status", "--json"]
         case .health(let node):

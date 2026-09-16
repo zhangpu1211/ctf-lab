@@ -55,6 +55,11 @@ func runAll() {
     state.importedNodes = Set(LabNode.required)
     check(state.allImported, "三个节点全部导入")
     check(state.canStart, "全部导入且未运行时启动可用")
+    state.selectedNodes = [.kali, .smoke]
+    check(state.canStartSelected, "可只选择 Kali 与一个靶机启动")
+    state.selectedNodes = []
+    check(!state.canStartSelected, "未选择节点时启动禁用")
+    state.selectedNodes = Set(LabNode.required)
     check(state.canReset, "全部导入后重置可用")
     check(!state.canStop, "未运行时停止禁用")
 
@@ -87,17 +92,15 @@ func runAll() {
           "导入带基盘位置参数与 --manifest，路径含空格仍为单个参数")
     check(importArgs.count == 5, "导入命令参数个数固定（profile/source/--manifest/path）")
 
-    let runArgs = CliAction.runAll.arguments()
-    check(runArgs == ["run", "kali-arm64", "smoke", "basic-pentesting-2"], "启动三节点的顺序")
-    let internetArgs = CliAction.runKaliInternet.arguments()
-    check(internetArgs == ["run", "kali-arm64", "--internet"], "Kali 联网维护使用单独命令")
-    let dynamicArgs = CliAction.runKaliDynamicResolution.arguments()
-    check(dynamicArgs == ["run", "kali-arm64", "--display", "spice"], "Kali 动态分辨率使用 SPICE 命令")
+    let runArgs = CliAction.run(nodes: [.kali, .smoke]).arguments()
+    check(runArgs == ["run", "kali-arm64", "smoke"], "启动所选节点并保持固定顺序")
+    let targetOnlyArgs = CliAction.run(nodes: [.basic]).arguments()
+    check(targetOnlyArgs == ["run", "basic-pentesting-2"], "可只启动一个靶机")
     check(CliAction.stopAll.arguments() == ["stop", "--all"], "停止使用 stop --all")
     check(CliAction.status.arguments() == ["status", "--json"], "状态查询使用 JSON")
     check(CliAction.health(node: .smoke).arguments() == ["health", "smoke", "--json"], "健康检查按节点 JSON")
     check(CliAction.resetNode(node: .basic).arguments() == ["reset", "basic-pentesting-2"], "重置按节点")
-    check(CliAction.runAll.arguments().allSatisfy { !$0.contains(" ") || $0.hasPrefix("/") },
+    check(CliAction.run(nodes: [.kali, .smoke]).arguments().allSatisfy { !$0.contains(" ") || $0.hasPrefix("/") },
           "参数中不含被拼接的裸命令")
 
     // MARK: JSON 解析
