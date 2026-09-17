@@ -138,12 +138,14 @@ class CliJsonContractTests(unittest.TestCase):
                       source)
 
     def test_gui_resolves_base_path_from_manifest(self) -> None:
-        """GUI 从 DISTRIBUTION.json 的 profile+role=base 条目解析基盘文件。"""
+        """GUI 从 DISTRIBUTION.json 的 profile+role=base 条目解析任意课程节点。"""
         source = (GUI_DIR / "GuiCore.swift").read_text(encoding="utf-8")
         self.assertIn("func basePath(for node: LabNode)", source)
+        self.assertIn("func basePath(forProfileID profileID: String)", source)
+        self.assertIn("func baseProfileIDs()", source)
         self.assertIn('entry["role"] as? String) == "base"', source)
         app = (GUI_DIR / "GuiApp.swift").read_text(encoding="utf-8")
-        self.assertIn("layout.basePath(for: node)", app)
+        self.assertIn("layout.basePath(forProfileID: profileID)", app)
 
     def test_status_json_shape_covers_all_local_profiles(self) -> None:
         with tempfile.TemporaryDirectory() as state_dir:
@@ -190,13 +192,23 @@ class ResetSemanticsTests(unittest.TestCase):
                       f"GUI 必须引用 {ctflab_app.LAUNCHER_REL}（ctflab_app.LAUNCHER_REL）")
 
     def test_gui_exposes_selected_node_start_and_default_policy(self) -> None:
-        """GUI 把启动节点选择交给用户，Kali 的联网与自动分辨率由 CLI 默认策略负责。"""
+        """GUI 支持增量启动和单节点管理，Kali 的默认策略仍由 CLI 负责。"""
         source = (GUI_DIR / "GuiCore.swift").read_text(encoding="utf-8")
         app = (GUI_DIR / "GuiApp.swift").read_text(encoding="utf-8")
         self.assertIn("case run(nodes: [LabNode])", source)
+        self.assertIn("case runProfiles(profileIDs: [String])", source)
+        self.assertIn("case stopProfiles(profileIDs: [String])", source)
+        self.assertIn("startableSelectedProfileIDs", source)
+        start_gate = source.split("public var canStartSelected: Bool", 1)[1].split("public var canStart:", 1)[0]
+        self.assertNotIn("!anyRunning", start_gate,
+                         "已有节点运行时仍须允许启动其它已导入节点")
         self.assertIn("canStartSelected", source)
-        self.assertIn("启动所选节点", app)
-        self.assertIn("selectedNodes", app)
+        self.assertIn("启动未运行的所选节点", app)
+        self.assertIn("selectedProfileIDs", app)
+        self.assertIn("func startProfile", app)
+        self.assertIn("func stopProfile", app)
+        self.assertIn('Button("停止")', app)
+        self.assertIn("ForEach(LabNode.orderedProfileIDs(model.state.configuredProfileIDs)", app)
         self.assertNotIn("Kali 联网维护", app)
         self.assertNotIn("动态分辨率…", app)
 

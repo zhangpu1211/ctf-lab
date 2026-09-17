@@ -12,7 +12,7 @@
 | 构建/校验集成 | `tools/ctflab_app.py`（`swiftc` 编译、启动器位置、`MANIFEST.gui`、`signature_covers`、`app verify` 检查） | 已验证 |
 | CLI 机器可读输出 | `dist verify --json`、`status --json`、`health --json`（GUI 的唯一数据来源） | 已验证 |
 | 单元测试 | `tools/tests/test_ctflab_gui.py`（21 项：Swift 核心断言 + CLI JSON 契约 + 构建集成 + 文档守卫） | 已验证 |
-| 最终测试构建产物 | `/Users/pufei/Downloads/ctflab-app-build-macos15-auto-final2-20260916/CTFLab.app`（macOS 15.0 兼容 QEMU/SPICE，ad-hoc 签名，797 个登记文件） | 已验证 |
+| 最终测试构建产物 | `/Users/pufei/Downloads/ctflab-app-build-macos15-auto-final2-20260916/CTFLab.app`（当时按 macOS 15.0 兼容目标构建的 QEMU/SPICE，ad-hoc 签名，797 个登记文件；仅为历史验证证据，当前产品最低要求已提升至 macOS 26.0） | 已验证 |
 
 本次 GUI 验证未覆盖既有旧产物：`/Users/pufei/Downloads/ctflab-app-build-20260916/CTFLab.app` 与旧分发目录
 `/Users/pufei/Downloads/ctflab-dist-20260916/`；二者已由后续清理移除，验证截图与 JSON 证据保留。

@@ -42,7 +42,8 @@ GUI_SOURCE_DIR = "gui"
 # 编译进 app 的源码（测试文件只随包镜像、不参与编译，避免重复符号）。
 GUI_SOURCES = ("GuiCore.swift", "GuiApp.swift")
 GUI_MIRROR_EXTRA = ("GuiCoreTests.swift",)
-GUI_TARGET = "arm64-apple-macos13.0"
+# 产品与随包运行时统一以 macOS 26.0 为最低目标，避免 GUI 与 Info.plist/运行时出现相互矛盾的门槛。
+GUI_TARGET = "arm64-apple-macos26.0"
 CTFLAB_VERSION_FALLBACK = "0.1.0"
 BUNDLE_IDENTIFIER = "local.ctflab.app"
 RUNTIME_REL = "Contents/Resources/runtime"
@@ -105,10 +106,10 @@ PYTHON_VERSION_RE = re.compile(r"^Python\s+([0-9][0-9A-Za-z.]*)$")
 PBS_ASSET_RE = re.compile(r"^(cpython-\d+\.\d+\.\d+)\+(\d{8})-aarch64-apple-darwin-")
 
 QEMU_BINARIES = ("qemu-system-aarch64", "qemu-system-x86_64", "qemu-img")
-# 课堂分发包最低支持 macOS 15.0；QEMU 11.1.0 若用当前系统 SDK 构建会错误地引用
-# macOS 26 才提供的 strchrnul，导致旧系统在导入阶段直接 dyld 失败。
-MIN_BUNDLED_MACOS = "15.0"
-MIN_BUNDLED_MACOS_VERSION = (15, 0)
+# 课堂分发包最低支持 macOS 26.0。当前受控 QEMU 运行时使用 macOS 26 SDK 构建，
+# 并可合法引用 macOS 26 提供的系统符号；不再向旧系统承诺兼容性。
+MIN_BUNDLED_MACOS = "26.0"
+MIN_BUNDLED_MACOS_VERSION = (26, 0)
 # 外置 SPICE 客户端是可选运行时；未提供时保留默认 Cocoa App，显式请求 SPICE 会被 CLI 拒绝。
 SPICE_CLIENT_NAME = "spicy"
 # 只随包实际需要的固件/ROM/keymaps（aarch64 virt UEFI + x86_64 pc BIOS/UEFI 与三种网卡）。
@@ -843,8 +844,8 @@ def _info_plist(version: str) -> dict[str, Any]:
         "CFBundlePackageType": "APPL",
         "CFBundleShortVersionString": version,
         "CFBundleVersion": version,
-        # GUI 本身可在 macOS 13 编译，但随包 QEMU/SPICE 运行时以 macOS 15.0 为最低版本；
-        # 让 Finder 在启动前给出正确兼容性判断，避免进入 dyld 才失败。
+        # GUI 与随包 QEMU/SPICE 运行时统一以 macOS 26.0 为最低版本；让 Finder 在启动前
+        # 给出正确兼容性判断，避免进入 dyld 才失败。
         "LSMinimumSystemVersion": MIN_BUNDLED_MACOS,
         "NSHighResolutionCapable": True,
         "LSApplicationCategoryType": "public.app-category.developer-tools",
@@ -1554,7 +1555,8 @@ def verify_runtime_references(app: Path) -> list[str]:
             elif minimum > MIN_BUNDLED_MACOS_VERSION:
                 problems.append(
                     f"{path.name}: 最低 macOS {macho_version_text(minimum)} 高于支持目标 {MIN_BUNDLED_MACOS}")
-            if path.name in QEMU_BINARIES:
+            # macOS 26 之前不存在 strchrnul；最低版本提升到 26 后该符号是合法依赖。
+            if path.name in QEMU_BINARIES and MIN_BUNDLED_MACOS_VERSION < (26, 0):
                 symbols = _run_tool(["nm", "-u", str(path)], check=False).stdout
                 if "strchrnul" in symbols:
                     problems.append(f"{path.name}: 仍引用旧系统不存在的 strchrnul")
@@ -1615,6 +1617,8 @@ def verify_app(app_path: Path, *, check_signature: bool = True) -> dict[str, Any
     _expect(info.get("CFBundleIdentifier") == BUNDLE_IDENTIFIER, "Info.plist 的 CFBundleIdentifier 不正确。")
     _expect(str(info.get("CFBundleShortVersionString")) == str(manifest["version"]),
             "Info.plist 版本与 MANIFEST 不一致。")
+    _expect(str(info.get("LSMinimumSystemVersion")) == MIN_BUNDLED_MACOS,
+            f"Info.plist 的 LSMinimumSystemVersion 必须为 {MIN_BUNDLED_MACOS}。")
 
     launcher = (app_path / LAUNCHER_REL).read_text(encoding="utf-8")
     for pattern in FORBIDDEN_BINARY_PATTERNS:

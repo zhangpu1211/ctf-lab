@@ -1,4 +1,4 @@
-// CTFLab 图形入口（SwiftUI/AppKit，GUI 框架 macOS 13+；课堂 App 随包运行时要求 macOS 15.0+）。
+// CTFLab 图形入口（SwiftUI/AppKit，课堂 App 与随包运行时统一要求 macOS 26.0+）。
 //
 // 只做三件事：驱动现有 CLI（dist verify / import --manifest / run / status / health /
 // stop --all / reset）、展示结果、按状态机门禁按钮。所有业务逻辑在 GuiCore.swift。
@@ -69,19 +69,19 @@ final class GuiModel: ObservableObject {
         }
     }
 
-    private static func nodesToSet(_ profiles: [StatusProfile]) -> Set<LabNode> {
-        Set(profiles.compactMap { LabNode(rawValue: $0.id) })
+    private static func profileIDs(_ profiles: [StatusProfile]) -> Set<String> {
+        Set(profiles.map(\.id))
     }
 
-    /// 表格只展示三个实验节点；其余 profile（例如适配候选）不进入图形界面。
+    /// 运行管理展示 CLI 已登记的全部 profile。未知课程节点只使用 profile ID，不让 GUI
+    /// 猜测其硬件参数；实际白名单仍由 CLI/profile YAML 决定。
     private func applyStatusReport(_ report: StatusReport) {
-        let required = Set(LabNode.required.map(\.rawValue))
-        nodes = report.profiles.filter { required.contains($0.id) }
-        state.importedNodes = Self.nodesToSet(report.profiles.filter(\.imported))
-        state.runningNodes = Self.nodesToSet(report.profiles.filter(\.running))
+        nodes = report.profiles
+        state.importedProfileIDs = Self.profileIDs(report.profiles.filter(\.imported))
+        state.runningProfileIDs = Self.profileIDs(report.profiles.filter(\.running))
         // 状态刷新后必须丢弃上一次健康结果；否则重启后的节点会被显示成“通过”。
-        state.healthyNodes.removeAll()
-        state.pendingHealthNodes.removeAll()
+        state.healthyProfileIDs.removeAll()
+        state.pendingHealthProfileIDs.removeAll()
     }
 
     // MARK: 动作
@@ -92,16 +92,17 @@ final class GuiModel: ObservableObject {
         panel.canChooseFiles = false
         panel.allowsMultipleSelection = false
         panel.prompt = "选择分发目录"
-        panel.message = "选择包含 DISTRIBUTION.json、SHA256SUMS 与三个基盘的分发目录"
+        panel.message = "选择包含 DISTRIBUTION.json、SHA256SUMS 与课程基盘的分发目录"
         if panel.runModal() == .OK, let url = panel.url {
             state.distDir = url.path
             state.report = nil
             verifyRows = []
             // 导入状态属于状态目录，不等于新选择的分发目录已经导入；切换目录后必须重新导入。
-            state.importedNodes.removeAll()
-            state.selectedNodes = Set(LabNode.required)
-            state.healthyNodes.removeAll()
-            state.pendingHealthNodes.removeAll()
+            state.importedProfileIDs.removeAll()
+            state.configuredProfileIDs = Set(LabNode.required.map(\.rawValue))
+            state.selectedProfileIDs = state.configuredProfileIDs
+            state.healthyProfileIDs.removeAll()
+            state.pendingHealthProfileIDs.removeAll()
             state.phase = .idle
             state.lastError = nil
             let layout = DistributionLayout(dir: url.path)
@@ -129,6 +130,15 @@ final class GuiModel: ObservableObject {
                 if let report = GuiParsing.decodeDistReport(text) {
                     self.state.report = report
                     self.verifyRows = report.entries
+                    let baseProfiles = report.entries.compactMap { entry -> String? in
+                        guard entry.role == "base", let profile = entry.profile,
+                              !profile.isEmpty else { return nil }
+                        return profile
+                    }
+                    if report.ok && !baseProfiles.isEmpty {
+                        self.state.configuredProfileIDs = Set(baseProfiles)
+                        self.state.selectedProfileIDs = Set(baseProfiles)
+                    }
                     self.state.progressText = ""
                     self.state.phase = report.ok ? .verified : .failed
                     self.state.lastError = report.ok ? nil : GuiMessages.verifyFailedBanner
@@ -156,42 +166,41 @@ final class GuiModel: ObservableObject {
         guard let dir = state.distDir else { return }
         let layout = DistributionLayout(dir: dir)
         // 基盘路径来自分发清单（与老师生成的一致），缺失时明确报错而不是猜文件名。
-        var missing: [String] = []
-        for node in LabNode.required where layout.basePath(for: node) == nil {
-            missing.append(node.displayName)
-        }
-        guard missing.isEmpty else {
-            state.lastError = "分发清单里缺少这些节点的基盘条目：\(missing.joined(separator: "、"))"
+        let profileIDs = layout.baseProfileIDs()
+        guard !profileIDs.isEmpty else {
+            state.lastError = "分发清单里没有 role=base 的节点条目"
             appendLog(state.lastError ?? "")
             return
         }
+        state.configuredProfileIDs = Set(profileIDs)
+        state.selectedProfileIDs = Set(profileIDs)
         state.phase = .importing
-        importNext(nodes: LabNode.required, index: 0, layout: layout)
+        importNext(profileIDs: profileIDs, index: 0, layout: layout)
     }
 
-    private func importNext(nodes: [LabNode], index: Int, layout: DistributionLayout) {
-        guard index < nodes.count else {
+    private func importNext(profileIDs: [String], index: Int, layout: DistributionLayout) {
+        guard index < profileIDs.count else {
             state.phase = .imported
             state.progressText = ""
-            appendLog("三个节点导入完成。请选择要启动的节点。Kali 图形启动默认联网并自动适配分辨率。")
+            appendLog("\(profileIDs.count) 个节点导入完成。可随时追加启动未运行节点；Kali 图形启动默认联网并自动适配分辨率。")
             refreshStatus()
             return
         }
-        let node = nodes[index]
-        state.progressText = state.importProgressText(index: index, total: nodes.count, node: node)
-        guard let sourcePath = layout.basePath(for: node) else {
+        let profileID = profileIDs[index]
+        state.progressText = state.importProgressText(index: index, total: profileIDs.count, profileID: profileID)
+        guard let sourcePath = layout.basePath(forProfileID: profileID) else {
             state.phase = .failed
-            state.lastError = "分发清单里缺少 \(node.displayName) 的基盘条目"
+            state.lastError = "分发清单里缺少 \(LabNode.displayName(for: profileID)) 的基盘条目"
             return
         }
-        run(.importNode(node: node, sourcePath: sourcePath,
+        run(.importProfile(profileID: profileID, sourcePath: sourcePath,
                         manifestPath: layout.manifestPath)) { [weak self] outcome in
             guard let self else { return }
             switch outcome {
             case .success:
-                self.state.importedNodes.insert(node)
-                self.appendLog("\(node.displayName) 导入完成")
-                self.importNext(nodes: nodes, index: index + 1, layout: layout)
+                self.state.importedProfileIDs.insert(profileID)
+                self.appendLog("\(LabNode.displayName(for: profileID)) 导入完成")
+                self.importNext(profileIDs: profileIDs, index: index + 1, layout: layout)
             case .failure(let message):
                 self.state.phase = .failed
                 self.state.progressText = ""
@@ -201,26 +210,26 @@ final class GuiModel: ObservableObject {
         }
     }
 
-    func setNodeSelected(_ node: LabNode, selected: Bool) {
-        guard !state.phase.isBusy && !state.anyRunning else { return }
+    func setNodeSelected(_ profileID: String, selected: Bool) {
+        guard !state.phase.isBusy else { return }
         if selected {
-            state.selectedNodes.insert(node)
+            state.selectedProfileIDs.insert(profileID)
         } else {
-            state.selectedNodes.remove(node)
+            state.selectedProfileIDs.remove(profileID)
         }
     }
 
     func startSelected() {
         guard state.canStartSelected else {
-            state.lastError = state.selectedNodes.isEmpty
+            state.lastError = state.selectedProfileIDs.isEmpty
                 ? "请至少选择一个节点。"
-                : "所选节点尚未全部导入，或当前仍有节点运行。"
+                : "所选节点尚未全部导入，或所选节点均已在运行。"
             return
         }
-        let selected = LabNode.required.filter { state.selectedNodes.contains($0) }
+        let selected = LabNode.orderedProfileIDs(state.startableSelectedProfileIDs)
         state.phase = .busy
-        state.progressText = "正在启动所选节点…（Kali 默认联网并自动适配分辨率）"
-        run(.run(nodes: selected)) { [weak self] outcome in
+        state.progressText = "正在启动 \(selected.count) 个未运行节点…（Kali 默认联网并自动适配分辨率）"
+        run(.runProfiles(profileIDs: selected)) { [weak self] outcome in
             guard let self else { return }
             self.state.phase = .idle
             self.state.progressText = ""
@@ -233,8 +242,8 @@ final class GuiModel: ObservableObject {
         guard state.canCheckStatus else { return }
         state.phase = .busy
         state.progressText = "正在检查状态与健康…"
-        state.healthyNodes.removeAll()
-        state.pendingHealthNodes.removeAll()
+        state.healthyProfileIDs.removeAll()
+        state.pendingHealthProfileIDs.removeAll()
         run(.status) { [weak self] outcome in
             guard let self else { return }
             switch outcome {
@@ -245,44 +254,72 @@ final class GuiModel: ObservableObject {
             case .failure(let message):
                 self.state.lastError = message
             }
-            let activeNodes = LabNode.required.filter { self.state.runningNodes.contains($0) }
-            self.checkHealthSequence(nodes: activeNodes, index: 0)
+            let activeProfiles = self.nodes.filter(\.running).map(\.id)
+            self.checkHealthSequence(profileIDs: activeProfiles, index: 0)
         }
     }
 
-    private func checkHealthSequence(nodes: [LabNode], index: Int) {
-        guard index < nodes.count else {
+    private func checkHealthSequence(profileIDs: [String], index: Int) {
+        guard index < profileIDs.count else {
             state.phase = .idle
             state.progressText = ""
             appendLog("状态与健康检查完成。")
             return
         }
-        let node = nodes[index]
-        run(.health(node: node)) { [weak self] outcome in
+        let profileID = profileIDs[index]
+        run(.healthProfile(profileID: profileID)) { [weak self] outcome in
             guard let self else { return }
             switch outcome {
             case .success(let text), .failure(let text):
                 if let report = GuiParsing.decodeHealth(text) {
                     if report.isPending {
-                        self.state.pendingHealthNodes.insert(node)
-                        self.state.healthyNodes.remove(node)
+                        self.state.pendingHealthProfileIDs.insert(profileID)
+                        self.state.healthyProfileIDs.remove(profileID)
                     } else if report.ok {
-                        self.state.pendingHealthNodes.remove(node)
-                        self.state.healthyNodes.insert(node)
+                        self.state.pendingHealthProfileIDs.remove(profileID)
+                        self.state.healthyProfileIDs.insert(profileID)
                     } else {
-                        self.state.pendingHealthNodes.remove(node)
-                        self.state.healthyNodes.remove(node)
+                        self.state.pendingHealthProfileIDs.remove(profileID)
+                        self.state.healthyProfileIDs.remove(profileID)
                     }
                     let detail = report.checks.map {
                         "\($0.ok == true ? "OK" : ($0.ok == nil ? "WAIT" : "FAIL")) \($0.name)"
                     }.joined(separator: ", ")
                     let label = report.isPending ? "等待" : (report.ok ? "通过" : "未通过")
-                    self.appendLog("\(node.displayName) 健康检查：\(label)（\(detail)）")
+                    self.appendLog("\(LabNode.displayName(for: profileID)) 健康检查：\(label)（\(detail)）")
                 } else {
                     self.appendLog(text)
                 }
             }
-            self.checkHealthSequence(nodes: nodes, index: index + 1)
+            self.checkHealthSequence(profileIDs: profileIDs, index: index + 1)
+        }
+    }
+
+    /// 单节点操作给课程扩容留下入口：已运行的其他节点不会阻塞它。
+    func startProfile(_ profileID: String) {
+        guard !state.phase.isBusy, state.importedProfileIDs.contains(profileID),
+              !state.runningProfileIDs.contains(profileID) else { return }
+        state.phase = .busy
+        state.progressText = "正在启动 \(LabNode.displayName(for: profileID))…"
+        run(.runProfiles(profileIDs: [profileID])) { [weak self] outcome in
+            guard let self else { return }
+            self.state.phase = .idle
+            self.state.progressText = ""
+            if case .failure(let message) = outcome { self.state.lastError = message }
+            self.refreshStatus()
+        }
+    }
+
+    func stopProfile(_ profileID: String) {
+        guard !state.phase.isBusy, state.runningProfileIDs.contains(profileID) else { return }
+        state.phase = .busy
+        state.progressText = "正在停止 \(LabNode.displayName(for: profileID))…"
+        run(.stopProfiles(profileIDs: [profileID])) { [weak self] outcome in
+            guard let self else { return }
+            self.state.phase = .idle
+            self.state.progressText = ""
+            if case .failure(let message) = outcome { self.state.lastError = message }
+            self.refreshStatus()
         }
     }
 
@@ -316,7 +353,7 @@ final class GuiModel: ObservableObject {
         guard index < plan.count else {
             state.phase = .idle
             state.progressText = ""
-            appendLog("重置完成：三个节点的 overlay 已删除，基础镜像未受影响。")
+            appendLog("重置完成：\(plan.count) 个节点的 overlay 已删除，基础镜像未受影响。")
             refreshStatus()
             return
         }
@@ -470,7 +507,7 @@ struct ContentView: View {
                 .disabled(!model.state.canVerify)
             Button("导入实验环境") { model.importAll() }
                 .disabled(!model.state.canImport)
-            Button("启动所选节点") { model.startSelected() }
+            Button("启动未运行的所选节点") { model.startSelected() }
                 .disabled(!model.state.canStartSelected)
             Button("检查状态") { model.checkStatus() }
                 .disabled(!model.state.canCheckStatus)
@@ -488,20 +525,20 @@ struct ContentView: View {
 
     private var nodeSelection: some View {
         HStack(spacing: 12) {
-            Text("启动节点")
+            Text("启动选择")
                 .font(.headline)
-            ForEach(LabNode.required) { node in
-                Toggle(node.displayName,
+            ForEach(LabNode.orderedProfileIDs(model.state.configuredProfileIDs), id: \.self) { profileID in
+                Toggle(LabNode.displayName(for: profileID),
                        isOn: Binding(
-                           get: { model.state.selectedNodes.contains(node) },
-                           set: { model.setNodeSelected(node, selected: $0) }
+                           get: { model.state.selectedProfileIDs.contains(profileID) },
+                           set: { model.setNodeSelected(profileID, selected: $0) }
                        ))
                 .toggleStyle(.checkbox)
-                .disabled(model.state.phase.isBusy || model.state.anyRunning
-                          || !model.state.importedNodes.contains(node))
+                // 已有节点运行时仍可选择其余节点并追加启动；运行中的节点会被启动动作略过。
+                .disabled(model.state.phase.isBusy || !model.state.importedProfileIDs.contains(profileID))
             }
             Spacer()
-            Text("Kali 图形启动默认联网 + 自动分辨率")
+            Text("运行中的节点不会阻塞追加启动；Kali 默认联网 + 自动分辨率")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
@@ -554,13 +591,26 @@ struct ContentView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
             } else {
                 Table(model.nodes) {
-                    TableColumn("节点") { row in Text(row.name ?? row.id) }
+                    TableColumn("节点") { row in
+                        Text(row.name ?? LabNode.displayName(for: row.id))
+                    }
                     TableColumn("已导入") { row in Text(row.imported ? "是" : "否") }
                     TableColumn("运行中") { row in Text(row.running ? "PID \(row.pid ?? 0)" : "否") }
                     TableColumn("健康") { row in
-                        Text(model.state.healthyNodes.contains(where: { $0.rawValue == row.id })
-                             ? "通过" : (model.state.pendingHealthNodes.contains(where: { $0.rawValue == row.id })
+                        Text(model.state.healthyProfileIDs.contains(row.id)
+                             ? "通过" : (model.state.pendingHealthProfileIDs.contains(row.id)
                                          ? "等待" : (row.running ? "待检查" : "—")))
+                    }
+                    TableColumn("操作") { row in
+                        HStack(spacing: 6) {
+                            if row.running {
+                        Button("停止") { model.stopProfile(row.id) }
+                            .disabled(model.state.phase.isBusy)
+                            } else {
+                                Button("启动") { model.startProfile(row.id) }
+                                    .disabled(!row.imported || model.state.phase.isBusy)
+                            }
+                        }
                     }
                     TableColumn("日志") { row in
                         Text(row.logPath ?? "—").textSelection(.enabled).lineLimit(1)

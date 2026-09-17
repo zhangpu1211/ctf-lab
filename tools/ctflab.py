@@ -148,13 +148,25 @@ def spice_client_path() -> str | None:
     return shutil.which(SPICE_CLIENT_NAMES[0]) or shutil.which(SPICE_CLIENT_NAMES[1])
 
 
-def spice_client_command(client: str, endpoint: Path, clipboard: bool = False) -> list[str]:
-    """构造受控客户端命令；只有显式 `--clipboard` 才打开客户端剪贴板。"""
+def spice_client_command(client: str, endpoint: Path, clipboard: bool = False,
+                         qemu_pid: int | None = None) -> list[str]:
+    """构造受控客户端命令；只有显式 ``--clipboard`` 才打开剪贴板。
+
+    ``qemu_pid`` 不是用户可控参数。传入后，内置 ``spicy`` 会在 QEMU 异常退出时自行
+    结束，覆盖 SPICE 断开事件没有及时送达的孤儿窗口场景。
+    """
     client_uri = f"spice+unix://{endpoint}"
-    if Path(client).name == "spicy":
+    # 正式 App 固定命名为 spicy；本机 E2E 会把同一受控客户端编译成
+    # ctflab-spicy-<build-id>，仍使用 --uri 协议。其它客户端保留 remote-viewer 的 URI 参数约定。
+    client_name = Path(client).name.lower()
+    if client_name == "spicy" or client_name.startswith("ctflab-spicy"):
         command = [client, "--uri", client_uri]
         if clipboard:
             command.append("--clipboard")
+        if qemu_pid is not None:
+            if qemu_pid <= 0:
+                raise CTFLabError("SPICE 客户端监控需要有效的 QEMU PID。")
+            command += ["--qemu-pid", str(qemu_pid)]
         return command
     return [client, client_uri]
 
@@ -2014,7 +2026,8 @@ class LabManager:
                     self._stop_unlocked([profile_id])
                     reason = "SPICE socket 未建立" if not endpoint.exists() else "本地 SPICE 客户端不可用"
                     raise CTFLabError(f"{reason}；已清理本次 QEMU 启动，不会自动回退 Cocoa。")
-                client_command = spice_client_command(client, endpoint, clipboard)
+                client_command = spice_client_command(client, endpoint, clipboard,
+                                                      qemu_pid=process.pid)
                 client_log = self.logs_dir / f"{profile_id}-spice-client.log"
                 with client_log.open("a", encoding="utf-8") as client_handle:
                     try:

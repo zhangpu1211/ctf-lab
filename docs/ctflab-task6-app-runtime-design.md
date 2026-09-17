@@ -1,7 +1,7 @@
 # CTFLab Task 6.2 设计：包含受控 QEMU 运行时的 `CTFLab.app`
 
 > 状态：**已实现 + 真实 E2E 通过（限定范围）**，2026-09-15。本文件描述 `.app` 结构、运行时选择规则、
-> 动态库打包与改写、SBOM/许可证、签名分级与验收方式。
+> 动态库打包与改写、SBOM/许可证、签名分级与验收方式。当前产品最低系统版本为 **macOS 26.0**。
 > 许可证与 GPL 义务已在 Task 6.3B 闭环：项目代码 MIT（随包 `LICENSE`），`dtc`/libfdt 许可证文本
 > 由仓库 `tools/licenses/` 提供（`license_text_status=vendored`），QEMU 源码义务以随包
 > `SOURCE_OFFER.md`（GPL-2.0 §3 书面要约）履行。
@@ -11,12 +11,14 @@
 ## 1. 目标与边界
 
 目标：用户不再需要预装 Homebrew QEMU——`CTFLab.app` 自带 QEMU 运行时（aarch64 + x86_64 + qemu-img
-及其非系统动态库、firmware/ROM/keymaps），在干净 Mac 上直接可用。
+及其非系统动态库、firmware/ROM/keymaps），在 **macOS 26.0+ 的 Apple Silicon Mac** 上直接可用。
 
 边界：
 
 - **内置 Python 3.12 解释器与 PyYAML**（python-build-standalone，见 §11）：启动器只使用 app 内
   解释器，缺失即报错，**不回退**系统 Python；接收者无需 venv/pip/联网；
+- `Info.plist`、MANIFEST 与 Mach-O 最低版本统一声明 macOS 26.0；macOS 15 兼容构建只保留为历史
+  验证证据，不再作为当前产品的支持承诺；
 - 不改 `stop/reset` 行为；`run` 的默认策略是 Kali 图形自动 SPICE + user-mode NAT，其他节点
   Cocoa + 管理网隔离，显式 `--display cocoa` 可用于兼容性排障；不动 UTM 路径；
 - 不写入 app：状态、镜像、overlay、日志仍在 `~/Library/Application Support/CTFLab`；

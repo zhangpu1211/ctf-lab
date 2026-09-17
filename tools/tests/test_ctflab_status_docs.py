@@ -527,11 +527,24 @@ class SpiceDisplayCliTests(unittest.TestCase):
         endpoint = pathlib.Path("/tmp/ctflab/display.sock")
         disabled = ctflab.spice_client_command("/tmp/spicy", endpoint)
         enabled = ctflab.spice_client_command("/tmp/spicy", endpoint, clipboard=True)
+        monitored = ctflab.spice_client_command("/tmp/spicy", endpoint, qemu_pid=4242)
+        build_client = ctflab.spice_client_command("/tmp/ctflab-spicy-20260917", endpoint,
+                                                   qemu_pid=4242)
         self.assertNotIn("--clipboard", disabled)
         self.assertIn("--clipboard", enabled)
         self.assertEqual(disabled[:3], ["/tmp/spicy", "--uri", "spice+unix:///tmp/ctflab/display.sock"])
+        self.assertEqual(monitored[-2:], ["--qemu-pid", "4242"])
+        self.assertEqual(build_client[:3], ["/tmp/ctflab-spicy-20260917", "--uri",
+                                            "spice+unix:///tmp/ctflab/display.sock"])
+        with self.assertRaisesRegex(ctflab.CTFLabError, "有效的 QEMU PID"):
+            ctflab.spice_client_command("/tmp/spicy", endpoint, qemu_pid=0)
         source = (pathlib.Path(__file__).resolve().parents[2] / "tools" / "spice_client" / "ctflab_spicy.c").read_text(encoding="utf-8")
         self.assertIn('"auto-clipboard", allow_clipboard', source)
+        self.assertIn("watch_qemu_process", source)
+        self.assertIn("spice_main_channel_request_mouse_mode", source)
+        self.assertIn("schedule_guest_resize", source)
+        self.assertIn('"configure-event"', source)
+        self.assertIn('"resize-guest", FALSE', source)
 
 
 class DeliveryClaimGuardTests(unittest.TestCase):

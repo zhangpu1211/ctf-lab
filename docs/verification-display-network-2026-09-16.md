@@ -22,7 +22,8 @@ QEMU user-mode NAT 联网，Smoke/Basic 管理网使用 `restrict=on` 保持隔�
   同次启动还验证 Kali 的 user-mode NAT 路由为 eth1，经域名访问 Debian HTTPS 返回 200。
 - 交付 App：`/Users/pufei/Downloads/ctflab-app-build-macos15-auto-final2-20260916/CTFLab.app`。
   生产客户端不包含自动缩放测试钩子。QEMU 11.1.0、797 个登记文件、70 个动态库；本轮又将 QEMU
-  与 SPICE 客户端按 macOS 15.0 最低版本重建，以修复旧 App 在 macOS 26 构建标记上的启动失败。
+  与 SPICE 客户端按 macOS 15.0 最低版本重建，以修复当时旧 App 在 macOS 26 构建标记上的启动失败。
+  这段仅记录历史验证；当前产品最低要求已提升为 macOS 26.0。
 - 当前 Kali 的派生磁盘已安装适配；原始基盘未修改。旧分发目录已由后续清理移除，新版无人值守安装
   和新版分发目录均包含该适配。尚未做公证及跨用户客户端连接拒绝 E2E。
 
@@ -59,9 +60,15 @@ CTFLAB_APP="/Users/pufei/Downloads/ctflab-app-build-macos15-auto-final2-20260916
 
 ## 2. GUI 节点选择：已接入，App 构建已覆盖
 
-原生 GUI 已提供 Kali、Smoke、Basic Pentesting 2 三个复选框，默认全选；用户可取消任意靶机后点击
-“启动所选节点”。GUI 传入所选 profile，CLI 负责为 Kali 自动选择联网/SPICE，为靶机选择隔离/Cocoa。
-因此 Kali+Smoke、Kali+Basic、Kali+两台靶机以及仅 Kali 等组合使用同一套生命周期保护。
+原生 GUI 现在从 `DISTRIBUTION.json` 的 `role=base` 条目动态生成启动选择，并在状态表展示全部已登记
+profile；用户可取消任意靶机后点击“启动未运行的所选节点”，或在单行直接启动/停止。因此一个节点已运行时，
+其余已导入节点仍可启动；后续课程增加靶机无需为了 GUI 再写固定枚举。GUI 传入所选 profile，CLI 负责为
+Kali 自动选择联网/SPICE，为靶机选择隔离/Cocoa。
+
+2026-09-17 的客户端改动已通过 Swift 核心、GUI 源码与 C 语法/受控命令回归。真实 Kali 已用新客户端
+连入（main/display/cursor/inputs 通道存在），正常 `stop kali-arm64` 后客户端进程消失；另一个无磁盘、
+无网络的 QEMU+SPICE 最小会话中，直接结束 QEMU 后客户端也自行退出。真实 Kali 桌面上的点击坐标与连续
+窗口拖动复测尚未执行，不能据此把黑屏刷新或像素偏移宣称为已完全消除。
 
 ## 3. 动态分辨率：SPICE 窗口跟随已验证，按钮已移除
 
@@ -75,8 +82,9 @@ CTFLAB_APP="/Users/pufei/Downloads/ctflab-app-build-macos15-auto-final2-20260916
 - 未满足能力时在创建实验网、overlay 和 QEMU 进程前失败，明确写出缺件，不静默回退 Cocoa。
 
 本轮用 QEMU 11.1.0 源码构建了带 SPICE 的 arm64 运行时，并把 `spicy` 及其动态库闭包纳入最终 App；
-QEMU 与客户端以 `MACOSX_DEPLOYMENT_TARGET=15.0`、macOS 15.4 SDK 重建，避免出现
-`built for macOS 26.0` / `_strchrnul` 启动错误：
+QEMU 与客户端当时以 `MACOSX_DEPLOYMENT_TARGET=15.0`、macOS 15.4 SDK 重建，避免出现
+`built for macOS 26.0` / `_strchrnul` 启动错误。这是历史兼容性实验，不是当前发布要求：
+当前产品只支持 macOS 26.0+：
 
 - 验收 App：`/Users/pufei/Downloads/ctflab-app-build-macos15-auto-final2-20260916/CTFLab.app`；
 - `app verify`：797 个登记文件、70 个动态库、许可证文本完整性 `True`；

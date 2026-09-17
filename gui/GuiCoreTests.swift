@@ -52,27 +52,31 @@ func runAll() {
     check(state.canImport, "校验通过后导入可用")
     check(!state.canStart, "未导入时启动仍禁用")
 
-    state.importedNodes = Set(LabNode.required)
+    state.importedProfileIDs = Set(LabNode.required.map(\.rawValue))
     check(state.allImported, "三个节点全部导入")
     check(state.canStart, "全部导入且未运行时启动可用")
-    state.selectedNodes = [.kali, .smoke]
+    state.selectedProfileIDs = Set([LabNode.kali.rawValue, LabNode.smoke.rawValue])
     check(state.canStartSelected, "可只选择 Kali 与一个靶机启动")
-    state.selectedNodes = []
+    state.selectedProfileIDs = []
     check(!state.canStartSelected, "未选择节点时启动禁用")
-    state.selectedNodes = Set(LabNode.required)
+    state.selectedProfileIDs = Set(LabNode.required.map(\.rawValue))
     check(state.canReset, "全部导入后重置可用")
     check(!state.canStop, "未运行时停止禁用")
 
-    state.runningNodes = [.kali, .smoke, .basic]
+    state.runningProfileIDs = Set(LabNode.required.map(\.rawValue))
     check(state.canStop, "运行中停止可用")
-    check(!state.canStart, "运行中启动禁用")
+    check(!state.canStart, "所选节点均运行时启动禁用")
+    state.runningProfileIDs = [LabNode.kali.rawValue]
+    state.selectedProfileIDs = Set([LabNode.kali.rawValue, LabNode.smoke.rawValue])
+    check(state.canStart, "Kali 运行时仍可追加启动 Smoke")
+    check(state.startableSelectedProfileIDs == Set([LabNode.smoke.rawValue]), "启动时自动略过已运行节点")
 
     state.phase = .importing
     check(!state.canImport && !state.canReset && !state.canStop, "执行中所有动作禁用")
     check(state.phase.isBusy, "执行中标记为忙碌")
     state.phase = .idle
 
-    check(state.importProgressText(index: 1, total: 3, node: .smoke).contains("2/3"),
+    check(state.importProgressText(index: 1, total: 3, profileID: LabNode.smoke.rawValue).contains("2/3"),
           "导入进度文案包含序号")
 
     // MARK: 命令拼接
@@ -96,6 +100,10 @@ func runAll() {
     check(runArgs == ["run", "kali-arm64", "smoke"], "启动所选节点并保持固定顺序")
     let targetOnlyArgs = CliAction.run(nodes: [.basic]).arguments()
     check(targetOnlyArgs == ["run", "basic-pentesting-2"], "可只启动一个靶机")
+    let appendedArgs = CliAction.runProfiles(profileIDs: ["webserver", "smoke", "kali-arm64"]).arguments()
+    check(appendedArgs == ["run", "kali-arm64", "smoke", "webserver"], "追加节点按稳定顺序启动")
+    check(CliAction.stopProfiles(profileIDs: ["webserver"]).arguments() == ["stop", "webserver"],
+          "可停止单个扩展节点")
     check(CliAction.stopAll.arguments() == ["stop", "--all"], "停止使用 stop --all")
     check(CliAction.status.arguments() == ["status", "--json"], "状态查询使用 JSON")
     check(CliAction.health(node: .smoke).arguments() == ["health", "smoke", "--json"], "健康检查按节点 JSON")
@@ -156,11 +164,11 @@ func runAll() {
     // MARK: 重置门禁
 
     var resetState = GuiState()
-    resetState.importedNodes = Set(LabNode.required)
+    resetState.importedProfileIDs = Set(LabNode.required.map(\.rawValue))
     check(ResetGate.plan(state: resetState, confirmed: false) == nil, "未确认时不产生重置命令")
     let plan = ResetGate.plan(state: resetState, confirmed: true)
     check(plan?.count == 3, "确认后按节点逐个重置")
-    check(plan?.first == .resetNode(node: .kali), "重置顺序从 Kali 开始")
+    check(plan?.first == .resetProfile(profileID: LabNode.kali.rawValue), "重置顺序从 Kali 开始")
 
     let notImported = GuiState()
     check(ResetGate.plan(state: notImported, confirmed: true) == nil, "未导入时即使确认也不重置")
@@ -203,6 +211,10 @@ check(!AppLayout.cliRelativePath.hasPrefix("/"), "CLI 相对路径不得以 / �
           "从清单解析 Smoke 基盘路径")
     check(layout.basePath(for: .basic)?.hasSuffix("basic-pentesting-2-base.qcow2") == true,
           "从清单解析 Basic 基盘路径")
+    check(layout.baseProfileIDs() == ["kali-arm64", "smoke", "basic-pentesting-2"],
+          "分发清单可列出可管理的所有基盘节点")
+    check(layout.basePath(forProfileID: "basic-pentesting-2")?.hasSuffix("basic-pentesting-2-base.qcow2") == true,
+          "扩展管理路径按 profile ID 解析基盘")
     let rootURL = URL(fileURLWithPath: layout.dir).standardizedFileURL
     let baseURL = URL(fileURLWithPath: layout.basePath(for: .kali) ?? "").standardizedFileURL
     check(baseURL.path.hasPrefix(rootURL.path + "/"),

@@ -68,7 +68,7 @@ class FakePythonRuntime:
 
     @staticmethod
     def _clang(args: list[str]) -> None:
-        result = subprocess.run([CLANG, "-mmacosx-version-min=15.0", *args],
+        result = subprocess.run([CLANG, "-mmacosx-version-min=26.0", *args],
                                 capture_output=True, text=True)
         if result.returncode != 0:
             raise RuntimeError(result.stderr)
@@ -167,7 +167,7 @@ class FakeRuntime:
 
     @staticmethod
     def _clang(args: list[str]) -> None:
-        result = subprocess.run([CLANG, "-mmacosx-version-min=15.0", *args],
+        result = subprocess.run([CLANG, "-mmacosx-version-min=26.0", *args],
                                 capture_output=True, text=True)
         if result.returncode != 0:
             raise RuntimeError(result.stderr)
@@ -223,7 +223,7 @@ class AppTestCase(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             stub_c = pathlib.Path(temp) / "gui.c"
             stub_c.write_text("int main(void) { return 0; }\n", encoding="utf-8")
-            result = subprocess.run([CLANG, "-mmacosx-version-min=15.0", "-o", str(cls.fake_gui), str(stub_c)],
+            result = subprocess.run([CLANG, "-mmacosx-version-min=26.0", "-o", str(cls.fake_gui), str(stub_c)],
                                     capture_output=True, text=True)
             if result.returncode != 0:
                 raise RuntimeError(result.stderr)
@@ -274,6 +274,8 @@ class StructureTests(AppTestCase):
         self.assertEqual(info["CFBundleExecutable"], ctflab_app.GUI_EXECUTABLE)
         self.assertEqual(info["CFBundleIdentifier"], ctflab_app.BUNDLE_IDENTIFIER)
         self.assertEqual(info["CFBundleShortVersionString"], "0.1.0")
+        self.assertEqual(info["LSMinimumSystemVersion"], "26.0")
+        self.assertEqual(ctflab_app.MIN_BUNDLED_MACOS_VERSION, (26, 0))
 
     def test_launcher_has_no_developer_paths(self) -> None:
         result = self.build()

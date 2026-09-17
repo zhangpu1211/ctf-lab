@@ -7,7 +7,7 @@
 
 import Foundation
 
-/// 实验三节点（GUI 只管理这三个 profile）。
+/// 内置三节点只是首个课程包的显示别名和默认顺序；运行管理不再限定这三个 ID。
 public enum LabNode: String, CaseIterable, Identifiable {
     case kali = "kali-arm64"
     case smoke = "smoke"
@@ -25,6 +25,20 @@ public enum LabNode: String, CaseIterable, Identifiable {
 
     /// 顺序即导入/重置顺序：Kali 优先（其 NVRAM 模板来自分发目录）。
     public static let required: [LabNode] = [.kali, .smoke, .basic]
+
+    /// 后续课程包可以登记更多 profile。未知 ID 仍可被 GUI 管理，只是显示原始 ID，
+    /// 不猜测其硬件或 QEMU 参数。
+    public static func displayName(for profileID: String) -> String {
+        LabNode(rawValue: profileID)?.displayName ?? profileID
+    }
+
+    /// 统一排序：保留课堂三节点的依赖顺序，其余已登记节点按 ID 稳定排列。
+    public static func orderedProfileIDs<S: Sequence>(_ profileIDs: S) -> [String]
+    where S.Element == String {
+        let unique = Set(profileIDs)
+        let known = required.map(\.rawValue).filter { unique.contains($0) }
+        return known + unique.subtracting(Set(known)).sorted()
+    }
 }
 
 /// .app 内固定布局（与 tools/ctflab_app.py 的常量保持一致；有守卫测试比对）。
@@ -147,27 +161,33 @@ public struct GuiState: Equatable {
     public var distDir: String?
     public var report: DistReport?
     public var phase: GuiPhase = .idle
-    public var importedNodes: Set<LabNode> = []
-    public var runningNodes: Set<LabNode> = []
-    /// 启动选择默认全选，用户可在启动前取消任意靶机；导入仍按清单导入全部节点。
-    public var selectedNodes: Set<LabNode> = Set(LabNode.required)
-    public var healthyNodes: Set<LabNode> = []
-    public var pendingHealthNodes: Set<LabNode> = []
+    /// 所有集合都使用 profile ID，而非固定枚举：后续课程包的节点可被同一个管理器启动、
+    /// 停止和重置，不需要为每台靶机重新编译 GUI。
+    public var configuredProfileIDs: Set<String> = Set(LabNode.required.map(\.rawValue))
+    public var importedProfileIDs: Set<String> = []
+    public var runningProfileIDs: Set<String> = []
+    /// 启动选择默认全选；已运行的节点保留在选择中，但启动时会自动略过它们。
+    public var selectedProfileIDs: Set<String> = Set(LabNode.required.map(\.rawValue))
+    public var healthyProfileIDs: Set<String> = []
+    public var pendingHealthProfileIDs: Set<String> = []
     public var lastError: String?
     public var progressText: String = ""
 
     public init() {}
 
     public var verificationPassed: Bool { report?.ok == true }
-    public var allImported: Bool { Set(LabNode.required).isSubset(of: importedNodes) }
-    public var anyRunning: Bool { !runningNodes.isEmpty }
+    public var allImported: Bool { configuredProfileIDs.isSubset(of: importedProfileIDs) }
+    public var anyRunning: Bool { !runningProfileIDs.isEmpty }
+    public var startableSelectedProfileIDs: Set<String> {
+        selectedProfileIDs.subtracting(runningProfileIDs)
+    }
 
     public var canVerify: Bool { !(distDir ?? "").isEmpty && !phase.isBusy }
     public var canImport: Bool { verificationPassed && !anyRunning && !phase.isBusy }
     public var canStartSelected: Bool {
-        verificationPassed && !selectedNodes.isEmpty
-            && selectedNodes.isSubset(of: importedNodes)
-            && !anyRunning && !phase.isBusy
+        verificationPassed && !startableSelectedProfileIDs.isEmpty
+            && selectedProfileIDs.isSubset(of: importedProfileIDs)
+            && !phase.isBusy
     }
     public var canStart: Bool { canStartSelected }
     public var canCheckStatus: Bool { !phase.isBusy }
@@ -175,8 +195,8 @@ public struct GuiState: Equatable {
     public var canReset: Bool { allImported && !anyRunning && !phase.isBusy }
 
     /// 导入按钮的进度文案（导入中显示第几个节点）。
-    public func importProgressText(index: Int, total: Int, node: LabNode) -> String {
-        "正在导入 \(node.displayName)（\(index + 1)/\(total)）…"
+    public func importProgressText(index: Int, total: Int, profileID: String) -> String {
+        "正在导入 \(LabNode.displayName(for: profileID))（\(index + 1)/\(total)）…"
     }
 
     public var statusLine: String {
@@ -196,10 +216,15 @@ public enum CliAction: Equatable {
     case distVerify(dir: String)
     case importNode(node: LabNode, sourcePath: String, manifestPath: String)
     case run(nodes: [LabNode])
+    case importProfile(profileID: String, sourcePath: String, manifestPath: String)
+    case runProfiles(profileIDs: [String])
     case status
     case health(node: LabNode)
+    case healthProfile(profileID: String)
     case stopAll
+    case stopProfiles(profileIDs: [String])
     case resetNode(node: LabNode)
+    case resetProfile(profileID: String)
 
     /// 参数数组：不做 shell 拼接，路径（含空格）保持为单个参数。
     public func arguments(stateDir: String? = nil) -> [String] {
@@ -214,16 +239,25 @@ public enum CliAction: Equatable {
             // 与 CLI 一致：基盘是位置参数，--manifest 负责哈希校验并配对同目录的 NVRAM 模板。
             args += ["import", node.rawValue, sourcePath, "--manifest", manifestPath]
         case .run(let nodes):
-            let ordered = LabNode.required.filter { nodes.contains($0) }
-            args += ["run"] + ordered.map(\.rawValue)
+            args += ["run"] + LabNode.orderedProfileIDs(nodes.map(\.rawValue))
+        case .importProfile(let profileID, let sourcePath, let manifestPath):
+            args += ["import", profileID, sourcePath, "--manifest", manifestPath]
+        case .runProfiles(let profileIDs):
+            args += ["run"] + LabNode.orderedProfileIDs(profileIDs)
         case .status:
             args += ["status", "--json"]
         case .health(let node):
             args += ["health", node.rawValue, "--json"]
+        case .healthProfile(let profileID):
+            args += ["health", profileID, "--json"]
         case .stopAll:
             args += ["stop", "--all"]
+        case .stopProfiles(let profileIDs):
+            args += ["stop"] + LabNode.orderedProfileIDs(profileIDs)
         case .resetNode(let node):
             args += ["reset", node.rawValue]
+        case .resetProfile(let profileID):
+            args += ["reset", profileID]
         }
         return args
     }
@@ -270,6 +304,19 @@ public struct DistributionLayout {
         }.compactMap { $0 }
     }
 
+    /// 只接纳 role=base 的 profile；NVRAM 等附属文件不会生成重复节点。
+    public func baseProfileIDs() -> [String] {
+        LabNode.orderedProfileIDs(manifestEntries().compactMap { entry in
+            guard (entry["role"] as? String) == "base",
+                  let profile = entry["profile"] as? String,
+                  !profile.isEmpty,
+                  let file = entry["file"] as? String else {
+                return nil
+            }
+            return pathInsideDistribution(file) == nil ? nil : profile
+        })
+    }
+
     private func manifestEntries() -> [[String: Any]] {
         guard let data = FileManager.default.contents(atPath: manifestPath),
               let manifest = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -281,8 +328,13 @@ public struct DistributionLayout {
 
     /// 某个节点在分发目录里的基盘文件路径（role = base）；找不到返回 nil。
     public func basePath(for node: LabNode) -> String? {
+        basePath(forProfileID: node.rawValue)
+    }
+
+    /// 后续 profile 与首批三节点共用同一条白名单路径校验。
+    public func basePath(forProfileID profileID: String) -> String? {
         let match = manifestEntries().first { entry in
-            (entry["profile"] as? String) == node.rawValue
+            (entry["profile"] as? String) == profileID
                 && (entry["role"] as? String) == "base"
                 && (entry["file"] as? String) != nil
         }
@@ -345,6 +397,8 @@ public enum GuiMessages {
 public enum ResetGate {
     public static func plan(state: GuiState, confirmed: Bool) -> [CliAction]? {
         guard confirmed, state.allImported else { return nil }
-        return LabNode.required.map { .resetNode(node: $0) }
+        return LabNode.orderedProfileIDs(state.configuredProfileIDs).map {
+            .resetProfile(profileID: $0)
+        }
     }
 }

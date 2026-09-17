@@ -64,17 +64,19 @@ ctflab run kali-arm64                           # 3) 启动 Kali（默认联网�
 
 ## 图形入口
 
-`CTFLab.app` 的主入口是原生 SwiftUI 界面（Apple Silicon；随包 QEMU/SPICE 运行时要求 macOS 15.0+，
+`CTFLab.app` 的主入口是原生 SwiftUI 界面（Apple Silicon；随包 QEMU/SPICE 运行时要求 macOS 26.0+，
 不依赖 Electron/Node/浏览器）：
 
-- 流程：选择课程分发目录 → 校验（逐文件大小与 SHA-256，失败即禁用导入与启动）→ 导入三个节点 →
-  勾选要启动的节点（通常是 Kali + 一个或多个靶机）→ 启动所选节点 → 检查状态（health）→
+- 流程：选择课程分发目录 → 校验（逐文件大小与 SHA-256，失败即禁用导入与启动）→ 导入分发包声明的基础节点 →
+  勾选要启动的节点（通常是 Kali + 一个或多个靶机）→ 启动未运行的所选节点 → 检查状态（health）→
   停止全部 → 重置（先弹确认框，明确提示 overlay 改动会丢失）；
 - 图形界面只调用内置 CLI：`dist verify --json`、`import <profile> <基盘> --manifest`、`run`、
-  `status --json`、`health --json`、`stop --all`、`reset <profile>`；启动所选节点时由 CLI 自动为 Kali
+  `status --json`、`health --json`、`stop --all`、`reset <profile>`；已运行的节点不会阻塞其余节点启动，表格也可逐节点启动或停止。启动所选节点时由 CLI 自动为 Kali
   配置联网与 SPICE 自动分辨率，为其他节点保持隔离，不解析任意 QEMU 参数、不绕过清单哈希；命令行可直接
   使用 `run kali-arm64 smoke` 或 `run kali-arm64 smoke basic-pentesting-2`；路径含空格按单一参数传递；
 - 重新打开 App 会通过 `status` 恢复已导入/运行中显示；重复导入是幂等的，不覆盖已验证基盘；
+  Kali 的 SPICE 客户端会随该节点的 QEMU 退出而自行关闭；窗口尺寸在来宾 agent 与绝对鼠标模式
+  就绪后再协商，并合并连续拖动的中间尺寸，以降低刷新与点击偏移；
 - CLI 保留在 `CTFLab.app/Contents/Resources/bin/ctflab-cli`（兼容名 `CTFLab`），
   供开发、脚本化与故障排查使用，与图形界面共享同一状态目录与同一导入逻辑。
 
