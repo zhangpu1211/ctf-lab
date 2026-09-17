@@ -70,6 +70,11 @@ Kali 自动选择联网/SPICE，为靶机选择隔离/Cocoa。
 无网络的 QEMU+SPICE 最小会话中，直接结束 QEMU 后客户端也自行退出。真实 Kali 桌面上的点击坐标与连续
 窗口拖动复测尚未执行，不能据此把黑屏刷新或像素偏移宣称为已完全消除。
 
+同日新增“添加 x86 镜像…”向导：只读 `inspect --json` 后显示候选与置信度，用户确认才运行
+`onboard --architecture x86_64`；候选 profile 外置到用户状态目录，既不改写 App 也不覆盖内置课程 profile。
+首次 `probe` 失败后，用户可显式执行受控启动矩阵；矩阵命中不自动持久化。该向导目前只完成单元/编译验证，
+尚未以任意真实外来 x86_64 镜像完成 GUI E2E。
+
 ## 3. 动态分辨率：SPICE 窗口跟随已验证，按钮已移除
 
 已接入并通过定向测试：
@@ -108,7 +113,7 @@ Kali 基盘哈希为 `974a319f596170d171e75a5ee3e0f0fd4d28439ab10373c14f0fd9348b
 
 ## 4. 回归
 
-- 最终完整回归：`python3 -m unittest discover -s tools/tests -q`，输出 `Ran 361 tests ... OK (skipped=5)`；即 356 项实际执行通过、5 项按历史 UTM 交付目录缺失规则跳过。负向口令用例输出的 `FAIL guest-password` 是预期失败样本，不是 unittest 失败；
+- 最终完整回归：`python3 -m unittest discover -s tools/tests -q`，输出 `Ran 365 tests ... OK (skipped=5)`；即 360 项实际执行通过、5 项按历史 UTM 交付目录缺失规则跳过。负向口令用例输出的 `FAIL guest-password` 是预期失败样本，不是 unittest 失败；
 - `python3 -m py_compile tools/ctflab.py tools/ctflab_app.py tools/ctflab_dist.py`：通过；
 - Swift 核心测试：通过；
 - 定向 CLI/GUI/安装器测试：通过；

@@ -108,6 +108,16 @@ func runAll() {
     check(CliAction.status.arguments() == ["status", "--json"], "状态查询使用 JSON")
     check(CliAction.health(node: .smoke).arguments() == ["health", "smoke", "--json"], "健康检查按节点 JSON")
     check(CliAction.resetNode(node: .basic).arguments() == ["reset", "basic-pentesting-2"], "重置按节点")
+    let inspectArgs = CliAction.inspectImage(sourcePath: "/tmp/legacy image.ova").arguments()
+    check(inspectArgs == ["inspect", "/tmp/legacy image.ova", "--json"],
+          "x86 向导先调用只读 inspect JSON，含空格路径不拆分")
+    let onboardArgs = CliAction.onboardX86(sourcePath: "/tmp/legacy image.ova", profileID: "legacy-image").arguments()
+    check(onboardArgs == ["onboard", "/tmp/legacy image.ova", "--id", "legacy-image", "--architecture", "x86_64"],
+          "x86 向导只固定架构，不传任意 QEMU 参数")
+    check(CliAction.probeProfile(profileID: "legacy-image", matrix: false).arguments()
+          == ["probe", "legacy-image"], "首次启动探测不隐式运行矩阵")
+    check(CliAction.probeProfile(profileID: "legacy-image", matrix: true).arguments()
+          == ["probe", "legacy-image", "--matrix"], "回退矩阵必须由用户显式请求")
     check(CliAction.run(nodes: [.kali, .smoke]).arguments().allSatisfy { !$0.contains(" ") || $0.hasPrefix("/") },
           "参数中不含被拼接的裸命令")
 
@@ -123,6 +133,24 @@ func runAll() {
     check(decoded?.ok == true, "解析分发校验 JSON")
     check(decoded?.entries.first?.size == 8103198720, "解析条目大小")
     check(GuiParsing.decodeDistReport("not json") == nil, "非法 JSON 返回 nil")
+
+    let inspectionJSON = """
+    {"source_path":"/tmp/legacy image.ova","format":"vmdk","virtual_size":4294967296,
+     "source_sha256":"abc","candidate":{"architecture":"x86_64","firmware":"bios","machine":"pc",
+     "memory_mb":2048,"cpus":2,"disk_bus":"scsi","disk_controller":"lsi53c895a","network_adapter":"pcnet"},
+     "confidence":{"architecture":{"level":"medium","reason":"OVF"},"firmware":{"level":"high","reason":"MBR"},
+     "disk":{"level":"medium","reason":"OVF"},"network":{"level":"low","reason":"unknown"}},
+     "warnings":["未验证"]}
+    """
+    let inspection = GuiParsing.decodeInspection(inspectionJSON)
+    check(inspection?.candidate.architecture == "x86_64", "解析只读镜像候选架构")
+    check(inspection?.candidate.diskController == "lsi53c895a", "解析候选磁盘控制器")
+    check(inspection?.confidence.network.level == "low", "解析候选置信度，不把推测当事实")
+    check(GuiParsing.decodeInspection("not json") == nil, "非法镜像识别 JSON 返回 nil")
+    check(ImageOnboardingRules.suggestedProfileID(sourcePath: "/tmp/Old Vulnerable_Box.ova") == "old-vulnerable-box",
+          "从镜像名生成可编辑的安全配置 ID")
+    check(ImageOnboardingRules.validProfileID("old-vulnerable-box"), "合法 x86 候选 ID 通过")
+    check(!ImageOnboardingRules.validProfileID("Old_Box"), "不安全候选 ID 在 GUI 前置拦截")
 
     let statusJSON = """
     {"schema": 1, "state_dir": "/tmp/state", "profiles": [

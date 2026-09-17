@@ -42,7 +42,11 @@ except ImportError:  # pragma: no cover - 在不含 PyYAML 的分发环境中给
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-PROFILE_DIR = PROJECT_ROOT / "tools" / "ctflab_profiles"
+# 内置 profile 跟随源码/App 资源，只读；用户通过 GUI/CLI 接入的新镜像必须写在状态目录外部，
+# 这样 App 签名与升级不会被改写，也不会把课堂内置配置交给候选镜像覆盖。
+BUILTIN_PROFILE_DIR = PROJECT_ROOT / "tools" / "ctflab_profiles"
+# 兼容既有测试和引用；新代码请通过 profile_path()/available_profiles() 访问。
+PROFILE_DIR = BUILTIN_PROFILE_DIR
 DEFAULT_STATE_DIR = Path.home() / "Library" / "Application Support" / "CTFLab"
 # 版本是打包（Task 6.1）、内容包版本门禁与 SBOM 的单一来源。
 CTFLAB_VERSION = "0.1.0"
@@ -420,16 +424,44 @@ def prepare_unattended_installer_assets(iso_path: Path, iso_hash: str, destinati
 
 def profile_path(profile_id: str) -> Path:
     profile_id = PROFILE_ALIASES.get(profile_id, profile_id)
-    candidate = PROFILE_DIR / f"{profile_id}.yaml"
-    if not candidate.exists():
-        raise CTFLabError(f"未知配置：{profile_id}。可用配置：{', '.join(available_profiles())}")
-    return candidate
+    built_in = BUILTIN_PROFILE_DIR / f"{profile_id}.yaml"
+    if built_in.is_file() and not built_in.is_symlink():
+        return built_in
+    candidate = user_profile_dir() / f"{profile_id}.yaml"
+    if candidate.is_file() and not candidate.is_symlink():
+        return candidate
+    raise CTFLabError(f"未知配置：{profile_id}。可用配置：{', '.join(available_profiles())}")
+
+
+def user_profile_dir() -> Path:
+    """返回用户候选 profile 的唯一可写目录。
+
+    `CTFLAB_PROFILE_DIR` 仅供隔离验收或 GUI 的临时状态目录覆盖；正常运行固定在
+    `~/Library/Application Support/CTFLab/profiles`。该函数不创建目录，纯读取命令不会产生文件。
+    """
+    configured = os.environ.get("CTFLAB_PROFILE_DIR")
+    return Path(configured).expanduser() if configured else DEFAULT_STATE_DIR / "profiles"
+
+
+def profile_exists(profile_id: str) -> bool:
+    """内置和用户目录任一存在同名常规文件即视为已占用，禁止候选覆盖。"""
+    profile_id = PROFILE_ALIASES.get(profile_id, profile_id)
+    return any(
+        path.is_file() and not path.is_symlink()
+        for path in (BUILTIN_PROFILE_DIR / f"{profile_id}.yaml", user_profile_dir() / f"{profile_id}.yaml")
+    )
 
 
 def available_profiles() -> list[str]:
-    if not PROFILE_DIR.exists():
-        return []
-    return sorted(path.stem for path in PROFILE_DIR.glob("*.yaml"))
+    # 内置 profile 优先，用户同名文件既不覆盖也不显示为第二份；符号链接一律不作为配置载入。
+    profile_ids: set[str] = set()
+    for directory in (BUILTIN_PROFILE_DIR, user_profile_dir()):
+        if not directory.is_dir():
+            continue
+        for path in directory.glob("*.yaml"):
+            if path.is_file() and not path.is_symlink():
+                profile_ids.add(path.stem)
+    return sorted(profile_ids)
 
 
 def validate_profile(data: dict[str, Any], path: Path) -> None:
@@ -2575,7 +2607,7 @@ def cmd_onboard(manager: LabManager, args: argparse.Namespace) -> int:
     profile_id = args.id.lower()
     if not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,47}[a-z0-9])?", profile_id):
         raise CTFLabError("配置 id 只能包含小写字母、数字和连字符，长度 1～49，且不能以连字符开头或结尾。")
-    if profile_id in PROFILE_ALIASES or (PROFILE_DIR / f"{profile_id}.yaml").exists():
+    if profile_id in PROFILE_ALIASES or profile_exists(profile_id):
         raise CTFLabError(f"配置 {profile_id} 已存在；为避免覆盖已验证参数，请换一个 id。")
     try:
         report = inspect_image(args.source, calculate_hash=True)
@@ -2618,13 +2650,23 @@ def cmd_onboard(manager: LabManager, args: argparse.Namespace) -> int:
         mac=manager.lab_mac(profile_id),
         overrides=overrides,
     )
-    validate_profile(profile, PROFILE_DIR / f"{profile_id}.yaml")
+    destination = user_profile_dir() / f"{profile_id}.yaml"
+    validate_profile(profile, destination)
     if yaml is None:
         raise CTFLabError("当前 Python 缺少 PyYAML，无法生成配置。")
-    destination = PROFILE_DIR / f"{profile_id}.yaml"
-    temporary = destination.with_suffix(".yaml.tmp")
-    temporary.write_text(yaml.safe_dump(profile, allow_unicode=True, sort_keys=False), encoding="utf-8")
-    temporary.replace(destination)
+    destination.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+    # 临时文件与目标处于同一目录；用硬链接排他发布，避免并发或外部进程覆盖另一份候选配置。
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{profile_id}-", suffix=".yaml", dir=destination.parent)
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(yaml.safe_dump(profile, allow_unicode=True, sort_keys=False))
+        try:
+            os.link(temporary, destination)
+        except FileExistsError as exc:
+            raise CTFLabError(f"配置 {profile_id} 已存在；为避免覆盖已验证参数，请换一个 id。") from exc
+    finally:
+        temporary.unlink(missing_ok=True)
     detection_path = manager.images_dir / profile_id / "detection.json"
     write_json(detection_path, report)
     print(f"候选配置已生成：{destination}")

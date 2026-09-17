@@ -55,12 +55,14 @@ ctflab run kali-arm64                           # 3) 启动 Kali（默认联网�
 ./tools/ctflab inspect /path/to/machine.ova
 ./tools/ctflab onboard /path/to/machine.ova --id machine-1
 ./tools/ctflab probe machine-1 --timeout 180
+./tools/ctflab probe machine-1 --matrix --matrix-timeout 90  # 首次探测失败时，显式尝试受控回退矩阵
 
 ./tools/ctflab stop --all
 ./tools/ctflab reset smoke
 ```
 
-自动探测输出的是候选，不是启动保证。磁盘文件通常无法可靠提供客体 CPU 架构、来宾网卡名、登录状态和服务清单；低置信度字段必须核对来源，probe 截图也必须排除 UEFI Shell 或错误画面。
+自动探测输出的是候选，不是启动保证。磁盘文件通常无法可靠提供客体 CPU 架构、来宾网卡名、登录状态和服务清单；低置信度字段必须核对来源，probe 截图也必须排除 UEFI Shell 或错误画面。`onboard` 生成的候选配置写入用户状态目录
+`~/Library/Application Support/CTFLab/profiles/`，不会改写内置课程 profile 或 `.app` 本体；回退矩阵的命中只对本次探测有效，需人工复核后才可固化。
 
 ## 图形入口
 
@@ -70,8 +72,11 @@ ctflab run kali-arm64                           # 3) 启动 Kali（默认联网�
 - 流程：选择课程分发目录 → 校验（逐文件大小与 SHA-256，失败即禁用导入与启动）→ 导入分发包声明的基础节点 →
   勾选要启动的节点（通常是 Kali + 一个或多个靶机）→ 启动未运行的所选节点 → 检查状态（health）→
   停止全部 → 重置（先弹确认框，明确提示 overlay 改动会丢失）；
+- “添加 x86 镜像…”向导复用 `inspect --json`、`onboard` 与 `probe`：先只读识别并展示架构、固件、磁盘、网卡的置信度，
+  经用户确认后才创建候选 profile 和派生基盘；首次探测失败时可显式运行 BIOS/UEFI × SCSI/IDE/SATA/VirtIO 的受控矩阵，
+  但矩阵命中不会自动写回配置；
 - 图形界面只调用内置 CLI：`dist verify --json`、`import <profile> <基盘> --manifest`、`run`、
-  `status --json`、`health --json`、`stop --all`、`reset <profile>`；已运行的节点不会阻塞其余节点启动，表格也可逐节点启动或停止。启动所选节点时由 CLI 自动为 Kali
+  `status --json`、`health --json`、`stop --all`、`reset <profile>`、`inspect --json`、`onboard`、`probe`；已运行的节点不会阻塞其余节点启动，表格也可逐节点启动或停止。启动所选节点时由 CLI 自动为 Kali
   配置联网与 SPICE 自动分辨率，为其他节点保持隔离，不解析任意 QEMU 参数、不绕过清单哈希；命令行可直接
   使用 `run kali-arm64 smoke` 或 `run kali-arm64 smoke basic-pentesting-2`；路径含空格按单一参数传递；
 - 重新打开 App 会通过 `status` 恢复已导入/运行中显示；重复导入是幂等的，不覆盖已验证基盘；

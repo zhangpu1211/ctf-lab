@@ -38,6 +38,12 @@ final class GuiModel: ObservableObject {
     @Published var verifyRows: [DistEntry] = []
     @Published var nodes: [StatusProfile] = []
     @Published var showResetConfirmation = false
+    @Published var showImageOnboarding = false
+    @Published var onboardingSourcePath = ""
+    @Published var onboardingProfileID = ""
+    @Published var onboardingReport: ImageInspectionReport?
+    @Published var onboardingImportedProfileID: String?
+    @Published var onboardingMessage = ""
 
     /// 状态目录覆盖（仅用于测试/隔离验收；学生双击运行时使用 CLI 默认目录）。
     private let stateDirOverride = ProcessInfo.processInfo.environment["CTFLAB_GUI_STATE_DIR"]
@@ -112,6 +118,107 @@ final class GuiModel: ObservableObject {
                 appendLog("自动识别：DISTRIBUTION.json、SHA256SUMS 与 \(detection.found.count - 2) 个载荷文件齐全，请点击“校验分发目录”。")
             } else {
                 appendLog("自动识别：缺少 \(detection.missing.joined(separator: "、"))；校验将给出详细原因。")
+            }
+        }
+    }
+
+    /// 新镜像只读选取：不转换、不导入，也不会修改原始镜像。
+    func chooseX86Image() {
+        guard !state.phase.isBusy else { return }
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = true
+        panel.allowsMultipleSelection = false
+        panel.prompt = "选择镜像"
+        panel.message = "选择 QCOW2、VMDK、VDI、VHD/VHDX、RAW、OVA，或只含一个磁盘的虚拟机目录"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        onboardingSourcePath = url.path
+        onboardingProfileID = ImageOnboardingRules.suggestedProfileID(sourcePath: url.path)
+        onboardingReport = nil
+        onboardingImportedProfileID = nil
+        onboardingMessage = "原始镜像只读；请先执行“只读识别”，确认候选硬件后再导入。"
+        showImageOnboarding = true
+    }
+
+    func inspectOnboardingImage() {
+        guard !onboardingSourcePath.isEmpty else { return }
+        state.phase = .busy
+        state.progressText = "正在只读识别镜像…"
+        onboardingReport = nil
+        onboardingImportedProfileID = nil
+        run(.inspectImage(sourcePath: onboardingSourcePath)) { [weak self] outcome in
+            guard let self else { return }
+            self.state.phase = .idle
+            self.state.progressText = ""
+            switch outcome {
+            case .success(let text):
+                guard let report = GuiParsing.decodeInspection(text) else {
+                    self.onboardingMessage = "识别结果无法解析；未导入、未修改原始镜像。"
+                    self.state.lastError = self.onboardingMessage
+                    return
+                }
+                self.onboardingReport = report
+                if report.candidate.architecture != "x86_64" {
+                    self.onboardingMessage = "识别为 \(report.candidate.architecture)，本向导只接入 x86_64；未导入。"
+                } else {
+                    self.onboardingMessage = "识别完成：候选参数仍需人工确认；未启动、未导入。"
+                }
+            case .failure(let message):
+                self.onboardingMessage = "只读识别失败；未导入、未修改原始镜像。"
+                self.state.lastError = message
+            }
+        }
+    }
+
+    /// 用户确认 x86_64 候选后才调用既有 onboard。CLI 在用户状态目录排他写入 profile 并转换派生基盘。
+    func importOnboardingCandidate() {
+        guard let report = onboardingReport, report.candidate.architecture == "x86_64" else {
+            onboardingMessage = "请先完成 x86_64 只读识别。"
+            return
+        }
+        guard ImageOnboardingRules.validProfileID(onboardingProfileID) else {
+            onboardingMessage = "配置 ID 只能用小写字母、数字和连字符，长度 1～49，且不能以连字符开头或结尾。"
+            return
+        }
+        state.phase = .importing
+        state.progressText = "正在创建候选配置并导入派生基盘…"
+        run(.onboardX86(sourcePath: onboardingSourcePath, profileID: onboardingProfileID)) { [weak self] outcome in
+            guard let self else { return }
+            self.state.phase = .idle
+            self.state.progressText = ""
+            switch outcome {
+            case .success:
+                self.onboardingImportedProfileID = self.onboardingProfileID
+                self.state.configuredProfileIDs.insert(self.onboardingProfileID)
+                self.state.selectedProfileIDs.insert(self.onboardingProfileID)
+                self.onboardingMessage = "候选配置和派生基盘已创建；尚未启动验证，请执行“启动探测”。"
+                self.appendLog("x86_64 候选 \(self.onboardingProfileID) 已导入；原始镜像保持不变。")
+                self.refreshStatus()
+            case .failure(let message):
+                self.onboardingMessage = "候选导入失败；原始镜像未修改。若已生成候选 profile，可修正后重试。"
+                self.state.lastError = message
+            }
+        }
+    }
+
+    func probeOnboardingCandidate(matrix: Bool) {
+        guard let profileID = onboardingImportedProfileID, !state.phase.isBusy else { return }
+        state.phase = .busy
+        state.progressText = matrix ? "正在运行受控启动回退矩阵…" : "正在启动探测候选镜像…"
+        run(.probeProfile(profileID: profileID, matrix: matrix)) { [weak self] outcome in
+            guard let self else { return }
+            self.state.phase = .idle
+            self.state.progressText = ""
+            switch outcome {
+            case .success:
+                self.onboardingMessage = matrix
+                    ? "回退矩阵完成：命中结果仅对本次探测有效，请查看截图和报告后再人工固化配置。"
+                    : "启动探测完成：请查看日志中的截图、网络和服务证据；这不等同于已验证交付。"
+            case .failure(let message):
+                self.onboardingMessage = matrix
+                    ? "回退矩阵未找到可用候选，或需要人工查看失败截图；原始镜像未修改。"
+                    : "首次启动探测未通过；可运行受控回退矩阵，不会自动改写候选配置。"
+                self.state.lastError = message
             }
         }
     }
@@ -385,6 +492,10 @@ final class GuiModel: ObservableObject {
         ]
         if let home = ProcessInfo.processInfo.environment["HOME"] { environment["HOME"] = home }
         if let stateDir = stateDirOverride { environment["CTFLAB_GUI_STATE_DIR"] = stateDir }
+        if let stateDir = stateDirOverride {
+            environment["CTFLAB_PROFILE_DIR"] = URL(fileURLWithPath: stateDir)
+                .appendingPathComponent("profiles").path
+        }
         process.environment = environment
         let pipe = Pipe()
         process.standardOutput = pipe
@@ -476,6 +587,9 @@ struct ContentView: View {
         } message: {
             Text(GuiMessages.resetConfirmationBody)
         }
+        .sheet(isPresented: $model.showImageOnboarding) {
+            ImageOnboardingSheet(model: model)
+        }
     }
 
     private var header: some View {
@@ -507,6 +621,8 @@ struct ContentView: View {
                 .disabled(!model.state.canVerify)
             Button("导入实验环境") { model.importAll() }
                 .disabled(!model.state.canImport)
+            Button("添加 x86 镜像…") { model.chooseX86Image() }
+                .disabled(model.state.phase.isBusy)
             Button("启动未运行的所选节点") { model.startSelected() }
                 .disabled(!model.state.canStartSelected)
             Button("检查状态") { model.checkStatus() }
@@ -646,6 +762,111 @@ struct ContentView: View {
         let formatter = ByteCountFormatter()
         formatter.countStyle = .file
         return formatter.string(fromByteCount: bytes)
+    }
+}
+
+/// 未知 x86_64 镜像的引导式接入界面。只展示 CLI 的白名单候选和证据，不提供任意 QEMU 参数输入。
+private struct ImageOnboardingSheet: View {
+    @ObservedObject var model: GuiModel
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("添加 x86_64 镜像").font(.title3).bold()
+            Text("流程：只读识别 → 你确认候选 → 生成用户配置并导入派生基盘 → 启动探测。原始镜像不会被覆盖。")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+
+            LabeledContent("镜像") {
+                Text(model.onboardingSourcePath.isEmpty ? "（未选择）" : model.onboardingSourcePath)
+                    .lineLimit(1).truncationMode(.middle).textSelection(.enabled)
+            }
+            HStack {
+                Button("重新选择…") { model.chooseX86Image() }
+                Button("只读识别") { model.inspectOnboardingImage() }
+                    .disabled(model.onboardingSourcePath.isEmpty || model.state.phase.isBusy)
+                if model.state.phase.isBusy { ProgressView().controlSize(.small) }
+            }
+
+            if let report = model.onboardingReport {
+                GroupBox("候选硬件（不是已验证事实）") {
+                    Grid(alignment: .leading, horizontalSpacing: 14, verticalSpacing: 6) {
+                        candidateRow("架构", report.candidate.architecture,
+                                     report.confidence.architecture)
+                        candidateRow("固件", report.candidate.firmware,
+                                     report.confidence.firmware)
+                        candidateRow("磁盘", diskText(report.candidate), report.confidence.disk)
+                        candidateRow("网卡", report.candidate.networkAdapter,
+                                     report.confidence.network)
+                        GridRow {
+                            Text("资源").foregroundStyle(.secondary)
+                            Text("\(report.candidate.cpus) vCPU / \(report.candidate.memoryMB) MB")
+                            Text(report.format ?? "未知格式").foregroundStyle(.secondary)
+                        }
+                    }
+                    if !report.warnings.isEmpty {
+                        Divider().padding(.vertical, 4)
+                        ForEach(report.warnings, id: \.self) { warning in
+                            Label(warning, systemImage: "exclamationmark.triangle")
+                                .font(.caption).foregroundStyle(.orange)
+                        }
+                    }
+                }
+                .textSelection(.enabled)
+
+                HStack {
+                    Text("配置 ID")
+                    TextField("例如 old-vulnbox", text: $model.onboardingProfileID)
+                        .frame(width: 250)
+                    Spacer()
+                    Button("创建候选并导入") { model.importOnboardingCandidate() }
+                        .disabled(report.candidate.architecture != "x86_64"
+                                  || !ImageOnboardingRules.validProfileID(model.onboardingProfileID)
+                                  || model.state.phase.isBusy)
+                }
+                Text("此操作会在用户状态目录创建候选 profile 和只读基盘副本；不会覆盖已有同名配置。")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+
+            if model.onboardingImportedProfileID != nil {
+                HStack {
+                    Button("启动探测") { model.probeOnboardingCandidate(matrix: false) }
+                        .disabled(model.state.phase.isBusy)
+                    Button("运行受控回退矩阵") { model.probeOnboardingCandidate(matrix: true) }
+                        .disabled(model.state.phase.isBusy)
+                }
+                Text("矩阵仅尝试 BIOS/UEFI 与 SCSI、IDE、SATA、VirtIO 白名单组合；命中结果不会自动写回配置。")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+
+            if !model.onboardingMessage.isEmpty {
+                Text(model.onboardingMessage).font(.callout).textSelection(.enabled)
+            }
+            HStack {
+                Spacer()
+                Button("关闭") { dismiss() }
+            }
+        }
+        .padding(20)
+        .frame(minHeight: 430)
+        .frame(width: 760)
+    }
+
+    @ViewBuilder
+    private func candidateRow(_ label: String, _ value: String, _ confidence: InspectionConfidence) -> some View {
+        GridRow {
+            Text(label).foregroundStyle(.secondary)
+            Text(value)
+            Text("\(confidence.level)：\(confidence.reason)")
+                .font(.caption).foregroundStyle(.secondary)
+        }
+    }
+
+    private func diskText(_ candidate: ImageCandidate) -> String {
+        if let controller = candidate.diskController, !controller.isEmpty {
+            return "\(candidate.diskBus) / \(controller)"
+        }
+        return candidate.diskBus
     }
 }
 

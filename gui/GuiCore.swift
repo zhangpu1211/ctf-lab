@@ -2,7 +2,7 @@
 //
 // 职责：状态机、按钮门禁、CLI 命令拼接、CLI JSON 解析、错误文案。
 // 约束：只调用现有 CLI 能力（dist verify / import --manifest / run / status / health /
-// stop --all / reset），不自行实现导入逻辑，不暴露任意 QEMU 参数；启动动作只把用户
+// stop --all / reset / inspect / onboard / probe），不自行实现导入逻辑，不暴露任意 QEMU 参数；启动动作只把用户
 // 选中的节点交给 CLI。Kali 的联网和图形分辨率由 CLI 的默认运行策略统一管理。
 
 import Foundation
@@ -143,6 +143,78 @@ public struct HealthReport: Codable, Hashable {
     }
 }
 
+// MARK: - 新镜像只读识别
+
+/// `inspect --json` 的 UI 必需子集。候选硬件与置信度必须并列展示，不能把推测降格为事实。
+public struct ImageCandidate: Codable, Hashable {
+    public let architecture: String
+    public let firmware: String
+    public let machine: String
+    public let memoryMB: Int
+    public let cpus: Int
+    public let diskBus: String
+    public let diskController: String?
+    public let networkAdapter: String
+
+    enum CodingKeys: String, CodingKey {
+        case architecture, firmware, machine, cpus
+        case memoryMB = "memory_mb"
+        case diskBus = "disk_bus"
+        case diskController = "disk_controller"
+        case networkAdapter = "network_adapter"
+    }
+}
+
+public struct InspectionConfidence: Codable, Hashable {
+    public let level: String
+    public let reason: String
+}
+
+public struct InspectionConfidenceSet: Codable, Hashable {
+    public let architecture: InspectionConfidence
+    public let firmware: InspectionConfidence
+    public let disk: InspectionConfidence
+    public let network: InspectionConfidence
+}
+
+public struct ImageInspectionReport: Codable, Hashable {
+    public let sourcePath: String
+    public let format: String?
+    public let virtualSize: Int64?
+    public let sourceSHA256: String?
+    public let candidate: ImageCandidate
+    public let confidence: InspectionConfidenceSet
+    public let warnings: [String]
+
+    enum CodingKeys: String, CodingKey {
+        case format, candidate, confidence, warnings
+        case sourcePath = "source_path"
+        case virtualSize = "virtual_size"
+        case sourceSHA256 = "source_sha256"
+    }
+}
+
+public enum ImageOnboardingRules {
+    /// 从文件名给出可编辑的安全 id；CLI 仍会做最终校验与排他写入。
+    public static func suggestedProfileID(sourcePath: String) -> String {
+        let name = URL(fileURLWithPath: sourcePath).deletingPathExtension().lastPathComponent.lowercased()
+        let normalized = name.map { character in
+            character.isASCII && (character.isLetter || character.isNumber) ? String(character) : "-"
+        }.joined()
+        let compact = normalized.split(separator: "-", omittingEmptySubsequences: true).joined(separator: "-")
+        let trimmed = String(compact.prefix(49)).trimmingCharacters(in: CharacterSet(charactersIn: "-"))
+        return trimmed.isEmpty ? "x86-lab" : trimmed
+    }
+
+    public static func validProfileID(_ profileID: String) -> Bool {
+        guard !profileID.isEmpty, profileID.count <= 49,
+              profileID.first != "-", profileID.last != "-" else { return false }
+        return profileID.allSatisfy {
+            $0.isASCII && ($0.isLowercase || $0.isNumber || $0 == "-")
+        }
+    }
+}
+
 // MARK: - 状态机
 
 public enum GuiPhase: Equatable {
@@ -225,6 +297,9 @@ public enum CliAction: Equatable {
     case stopProfiles(profileIDs: [String])
     case resetNode(node: LabNode)
     case resetProfile(profileID: String)
+    case inspectImage(sourcePath: String)
+    case onboardX86(sourcePath: String, profileID: String)
+    case probeProfile(profileID: String, matrix: Bool)
 
     /// 参数数组：不做 shell 拼接，路径（含空格）保持为单个参数。
     public func arguments(stateDir: String? = nil) -> [String] {
@@ -258,6 +333,15 @@ public enum CliAction: Equatable {
             args += ["reset", node.rawValue]
         case .resetProfile(let profileID):
             args += ["reset", profileID]
+        case .inspectImage(let sourcePath):
+            args += ["inspect", sourcePath, "--json"]
+        case .onboardX86(let sourcePath, let profileID):
+            // x86 向导只明确架构；固件、磁盘控制器、网卡仍由 inspect 证据生成候选，
+            // 不在 GUI 中拼接任意 QEMU 原始参数。
+            args += ["onboard", sourcePath, "--id", profileID, "--architecture", "x86_64"]
+        case .probeProfile(let profileID, let matrix):
+            args += ["probe", profileID]
+            if matrix { args += ["--matrix"] }
         }
         return args
     }
@@ -370,6 +454,11 @@ public enum GuiParsing {
     public static func decodeHealth(_ text: String) -> HealthReport? {
         guard let data = text.data(using: .utf8) else { return nil }
         return try? JSONDecoder().decode(HealthReport.self, from: data)
+    }
+
+    public static func decodeInspection(_ text: String) -> ImageInspectionReport? {
+        guard let data = text.data(using: .utf8) else { return nil }
+        return try? JSONDecoder().decode(ImageInspectionReport.self, from: data)
     }
 }
 

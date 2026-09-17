@@ -209,6 +209,11 @@ class ResetSemanticsTests(unittest.TestCase):
         self.assertIn("func stopProfile", app)
         self.assertIn('Button("停止")', app)
         self.assertIn("ForEach(LabNode.orderedProfileIDs(model.state.configuredProfileIDs)", app)
+        self.assertIn('Button("添加 x86 镜像…")', app)
+        self.assertIn("ImageOnboardingSheet", app)
+        self.assertIn("只读识别", app)
+        self.assertIn("运行受控回退矩阵", app)
+        self.assertIn("CTFLAB_PROFILE_DIR", app)
         self.assertNotIn("Kali 联网维护", app)
         self.assertNotIn("动态分辨率…", app)
 
@@ -252,7 +257,8 @@ class GuiSourceGuardTests(unittest.TestCase):
         """GUI 只能调用既有 CLI 子命令，不得自带导入/QEMU 参数逻辑。"""
         source = (GUI_DIR / "GuiCore.swift").read_text(encoding="utf-8")
         for needle in ('"dist", "verify"', '"import"', '"--manifest"', '"run"', '"status"',
-                       '"health"', '"stop", "--all"', '"reset"'):
+                       '"health"', '"stop", "--all"', '"reset"', '"inspect"', '"onboard"',
+                       '"probe"', '"--matrix"'):
             self.assertIn(needle, source, f"缺少 CLI 能力引用：{needle}")
         for forbidden in ("-m ", "qemu-system", "-drive", "overlay.qcow2"):
             self.assertNotIn(forbidden, source, f"GUI 不得直接构造 QEMU 参数：{forbidden}")
@@ -370,7 +376,8 @@ class GuiDocsGuardTests(unittest.TestCase):
         gui_section = text.index("## 2. 图形界面流程")
         cli_section = text.index("## 3. 命令行流程")
         self.assertLess(gui_section, cli_section, "图形流程必须排在命令行之前")
-        for needle in ("双击", "校验分发目录", "导入实验环境", "启动所选节点", "检查状态", "重置"):
+        for needle in ("双击", "校验分发目录", "导入实验环境", "启动所选节点", "检查状态", "重置",
+                       "添加 x86 镜像", "只读识别", "受控回退矩阵"):
             self.assertIn(needle, text)
         self.assertIn("Contents/Resources/bin/CTFLab", text)
 

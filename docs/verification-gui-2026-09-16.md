@@ -10,7 +10,7 @@
 | 原生图形入口源码 | `gui/GuiCore.swift`（状态机/命令构造）、`gui/GuiApp.swift`（SwiftUI）、`gui/GuiCoreTests.swift`（无 XCTest 的核心测试） | 已验证 |
 | `.app` 主入口 | `Contents/MacOS/CTFLabGUI`（`CFBundleExecutable`）；CLI 启动器保留在 `Contents/Resources/bin/{ctflab-cli,CTFLab}` | 已验证 |
 | 构建/校验集成 | `tools/ctflab_app.py`（`swiftc` 编译、启动器位置、`MANIFEST.gui`、`signature_covers`、`app verify` 检查） | 已验证 |
-| CLI 机器可读输出 | `dist verify --json`、`status --json`、`health --json`（GUI 的唯一数据来源） | 已验证 |
+| CLI 机器可读输出 | `dist verify --json`、`status --json`、`health --json` 与 `inspect --json`（GUI 的机器可读数据来源） | 已验证 |
 | 单元测试 | `tools/tests/test_ctflab_gui.py`（21 项：Swift 核心断言 + CLI JSON 契约 + 构建集成 + 文档守卫） | 已验证 |
 | 最终测试构建产物 | `/Users/pufei/Downloads/ctflab-app-build-macos15-auto-final2-20260916/CTFLab.app`（当时按 macOS 15.0 兼容目标构建的 QEMU/SPICE，ad-hoc 签名，797 个登记文件；仅为历史验证证据，当前产品最低要求已提升至 macOS 26.0） | 已验证 |
 
@@ -45,19 +45,24 @@
 - 构建集成：真实 `gui/` 源码经 `swiftc` 编译进 app、`Info.plist` 主入口、`MANIFEST.gui`、
   主可执行文件由代码签名覆盖、缺 GUI 入口/缺 `MANIFEST.gui` 时 `verify_app` 拒绝；
 - 重置门禁：未确认时 `ResetGate` 不产生任何 reset 命令。
+- **x86_64 接入向导（仅单元/编译验证）**：向导依次调用 `inspect --json`、用户确认后的
+  `onboard --architecture x86_64`、`probe` 与用户显式请求的 `probe --matrix`；候选 profile 排他写入
+  `~/Library/Application Support/CTFLab/profiles/`，内置 profile 与 App 不可覆盖。矩阵命中不自动写回配置。
 
 ## 4. 未验证 / 后续任务
 
 - **未验证**：Developer ID 签名与公证后的首次打开体验（当前 ad-hoc，学生首次打开仍需在
   “系统设置 → 隐私与安全性”手动放行一次，与既有文档一致）；GUI 在浅色/深色之外的辅助功能
-  （VoiceOver）未测试；GUI 未做“记住上次分发目录”的持久化（每次启动需重新选择，属体验项）。
+  （VoiceOver）未测试；GUI 未做“记住上次分发目录”的持久化（每次启动需重新选择，属体验项）；
+  新 x86_64 向导尚未用任意真实外来镜像完成 GUI 点击、冷启动、重启、DHCP/服务验证，不能据此宣称
+  “任意 x86_64 镜像已适配”。
 - **后续任务**：把 GUI 的导入/启动流程接入课程分发自动化（例如一键脚本），以及
   `CTFLab.app` 的签名/公证流水线。
 
 ## 5. 回归与边界
 
-- `python3 -m unittest discover -s tools/tests`：当前全量 **361 项**（356 项实际执行通过，5 项历史 UTM 目录缺失跳过）；GUI 定向测试与 Swift 核心测试均通过；
-- `swiftc` 构建检查：`GuiCore.swift + GuiCoreTests.swift` 编译并运行 58 条检查全部通过；
+- `python3 -m unittest discover -s tools/tests`：当前全量 **365 项**（360 项实际执行通过，5 项历史 UTM 目录缺失跳过）；GUI 定向测试与 Swift 核心测试均通过；
+- `swiftc` 构建检查：`GuiCore.swift + GuiCoreTests.swift` 编译并运行 80 条检查全部通过；
   `GuiCore.swift + GuiApp.swift` 以 `-parse-as-library` 编译通过（app 构建即真实编译）；
 - `python3 -m py_compile tools/ctflab.py tools/ctflab_app.py tools/ctflab_dist.py` 通过；
 - 图形界面遵守既有边界：原始镜像只读 + overlay 运行、回环隔离实验网；Kali 默认通过 user-mode NAT
