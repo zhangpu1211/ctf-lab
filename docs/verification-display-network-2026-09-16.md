@@ -60,10 +60,10 @@ CTFLAB_APP="/Users/pufei/Downloads/ctflab-app-build-macos15-auto-final2-20260916
 
 ## 2. GUI 节点选择：已接入，App 构建已覆盖
 
-原生 GUI 现在从 `DISTRIBUTION.json` 的 `role=base` 条目动态生成启动选择，并在状态表展示全部已登记
-profile；用户可取消任意靶机后点击“启动未运行的所选节点”，或在单行直接启动/停止。因此一个节点已运行时，
-其余已导入节点仍可启动；后续课程增加靶机无需为了 GUI 再写固定枚举。GUI 传入所选 profile，CLI 负责为
-Kali 自动选择联网/SPICE，为靶机选择隔离/Cocoa。
+原生 GUI 从 `DISTRIBUTION.json` 的 `role=base` 条目生成当前节点选择，并在状态表展示全部已登记
+profile；本机历史基盘明确标为“本机已登记”，不等同于当前分发目录已导入。用户一次选择一个节点后启动或停止；
+其它节点运行时不阻塞当前节点操作。后续课程增加靶机无需为了 GUI 再写固定枚举。GUI 传入所选 profile，CLI
+默认给 Kali 联网与 Cocoa 固定显示；SPICE 只能由显式参数请求。
 
 2026-09-17 的客户端改动已通过 Swift 核心、GUI 源码与 C 语法/受控命令回归。真实 Kali 已用新客户端
 连入（main/display/cursor/inputs 通道存在），正常 `stop kali-arm64` 后客户端进程消失；另一个无磁盘、
@@ -75,12 +75,11 @@ Kali 自动选择联网/SPICE，为靶机选择隔离/Cocoa。
 首次 `probe` 失败后，用户可显式执行受控启动矩阵；矩阵命中不自动持久化。该向导目前只完成单元/编译验证，
 尚未以任意真实外来 x86_64 镜像完成 GUI E2E。
 
-## 3. 动态分辨率：SPICE 窗口跟随已验证，按钮已移除
+## 3. 动态分辨率：SPICE 实验路径有历史验证，但不再作为默认启动路径
 
 已接入并通过定向测试：
 
-- `run --display auto` 是默认策略：图形 Kali 自动使用 SPICE，靶机自动使用 Cocoa；
-  `--headless` 不启动图形客户端；
+- `run --display auto` 是默认策略：所有图形节点使用 Cocoa 固定显示；`--headless` 不启动图形客户端；
 - 显式 `--display spice` 仍只允许单独的 Kali 图形会话，显式 `--display cocoa` 用于排障；
 - 显式请求 SPICE 前探测 `spice` 显示后端、`spicevmc`、`virtserialport` 和本地 `remote-viewer`/`spicy`；
 - SPICE 使用 0700 runtime 目录下的 UNIX socket，保留唯一 virtio-serial + spicevmc agent transport；
@@ -113,7 +112,7 @@ Kali 基盘哈希为 `974a319f596170d171e75a5ee3e0f0fd4d28439ab10373c14f0fd9348b
 
 ## 4. 回归
 
-- 最终完整回归：`python3 -m unittest discover -s tools/tests -q`，输出 `Ran 365 tests ... OK (skipped=5)`；即 360 项实际执行通过、5 项按历史 UTM 交付目录缺失规则跳过。负向口令用例输出的 `FAIL guest-password` 是预期失败样本，不是 unittest 失败；
+- 最终完整回归：`python3 -m unittest discover -s tools/tests -q`，输出 `Ran 366 tests ... OK (skipped=5)`；即 361 项实际执行通过、5 项按历史 UTM 交付目录缺失规则跳过。负向口令用例输出的 `FAIL guest-password` 是预期失败样本，不是 unittest 失败；
 - `python3 -m py_compile tools/ctflab.py tools/ctflab_app.py tools/ctflab_dist.py`：通过；
 - Swift 核心测试：通过；
 - 定向 CLI/GUI/安装器测试：通过；

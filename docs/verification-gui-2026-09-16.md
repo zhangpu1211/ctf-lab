@@ -24,22 +24,22 @@
 
 | 步骤 | 结果 | 证据 |
 |---|---|---|
-| 打开 App（状态恢复到默认状态目录） | 窗口显示“请选择并校验分发目录”，节点表显示三个节点“已导入=是” | `01-launched.png` |
+| 打开 App（状态恢复到默认状态目录） | 窗口显示“请选择并校验分发目录”；节点表将历史基础镜像标为“本机已登记”，不把它表述为当前分发目录已导入 | `01-launched.png`（历史截图中的旧文案已被后续 UI 修正） |
 | 选择分发目录（含空格路径的对话框操作：`⌘⇧G` + 路径） | 显示所选绝对路径；校验按钮启用，导入/启动/停止/重置禁用 | `03-open-panel.png`、`04-dir-selected.png` |
 | 校验分发目录（真实 10GB 校验） | 表格逐文件显示大小（1.43GB/8.1GB/67.1MB/267.6MB）与“通过” | `05-verified.png` |
 | 错误目录被拒绝 | 选 `/tmp/ctflab-empty-dist`：横幅显示“未找到分发清单 …/DISTRIBUTION.json”、退出码 1、可复制；导入/启动保持禁用 | `06-wrong-dir-rejected.png` |
 | **导入实验环境可调用并真实完成** | 三次 `import <profile> <基盘> --manifest DISTRIBUTION.json` 全部完成（App 内 `qemu-img convert` 解压分发基盘到隔离状态目录，约 22GB）；节点表全部“已导入=是”，启动按钮启用 | `08-importing.png`、`10-imported.png` |
-| **选择并启动所选节点** | 复选框默认全选；取消靶机后可仅启动 Kali 或 Kali+指定靶机。CLI 自动给 Kali user-mode NAT + SPICE，给靶机 restrict + Cocoa | GUI 源码/Swift 核心测试与最终 App CLI 实测 |
+| **选择并启动所选节点** | 单选菜单不默认选择；一次只启动一个明确选中的已导入节点。CLI 自动给 Kali user-mode NAT + Cocoa 固定显示，给靶机 restrict + Cocoa；SPICE 仅由显式参数请求 | GUI 源码/Swift 核心测试（本轮 UI 语义未重新做点击 E2E） |
 | **检查状态（健康）** | 三个节点均显示 PID、“健康=通过”与日志路径 | `12-health-checked.png` |
-| 停止全部 | 无 QEMU、无交换机、无运行状态残留 | `13-stopped.png` |
+| 停止所选节点 | 仅停止当前选择的实例；`stop --all` 保留为 CLI 故障恢复命令 | 本轮 GUI 单元/编译测试（UI 语义未重新做点击 E2E） |
 | 重置（确认框 + 取消 + 确认） | 确认框逐字提示“overlay 中的实验改动（安装的软件、产生的文件、被攻击后的状态）会全部丢失”；取消后 overlay 保留；确认后三节点 overlay 被删除、基盘保留 | `14-reset-confirm.png`、`15-reset-done.png` |
 | 失败可见性（实机缺陷复现） | 早期版本漏传 `import` 的位置参数，GUI 原样显示 CLI 用法错误、退出码与可复制文本（该缺陷已修复并加契约测试） | `08-importing.png`（同一路径的失败态截图已覆盖） |
 
 ## 3. 仅单元测试覆盖（未逐项点击）
 
 - 状态机门禁组合（未校验/校验失败/执行中/未全部导入/运行中）与按钮启用状态：Swift 核心 58 条断言；
-- 命令拼接：`--manifest` 基盘位置参数、路径含空格、节点选择、Kali 默认联网/自动显示与显式 `--display spice`、
-  `stop --all`、逐节点 `reset`；
+- 命令拼接：`--manifest` 基盘位置参数、路径含空格、单节点选择、Kali 默认联网/Cocoa 固定显示与显式 `--display spice`、
+  逐节点 `stop`、逐节点 `reset`；
 - JSON 解析：分发报告（含缺失/大小不符/哈希不符三类失败）、状态报告、健康报告；字段名契约由
   Python 测试锁定（`dist verify --json`、`status --json`、`health --json`）；
 - 构建集成：真实 `gui/` 源码经 `swiftc` 编译进 app、`Info.plist` 主入口、`MANIFEST.gui`、
@@ -61,11 +61,11 @@
 
 ## 5. 回归与边界
 
-- `python3 -m unittest discover -s tools/tests`：当前全量 **365 项**（360 项实际执行通过，5 项历史 UTM 目录缺失跳过）；GUI 定向测试与 Swift 核心测试均通过；
+- `python3 -m unittest discover -s tools/tests`：当前全量 **366 项**（361 项实际执行通过，5 项历史 UTM 目录缺失跳过）；GUI 定向测试与 Swift 核心测试均通过；
 - `swiftc` 构建检查：`GuiCore.swift + GuiCoreTests.swift` 编译并运行 80 条检查全部通过；
   `GuiCore.swift + GuiApp.swift` 以 `-parse-as-library` 编译通过（app 构建即真实编译）；
 - `python3 -m py_compile tools/ctflab.py tools/ctflab_app.py tools/ctflab_dist.py` 通过；
 - 图形界面遵守既有边界：原始镜像只读 + overlay 运行、回环隔离实验网；Kali 默认通过 user-mode NAT
-  联网并自动使用 SPICE，Smoke/Basic 始终使用 restrict + Cocoa；动态分辨率不再需要单独按钮；
+  联网并使用 Cocoa 固定显示，Smoke/Basic 始终使用 restrict + Cocoa；SPICE 动态分辨率只可显式请求；
   不把口令写入命令行/日志/JSON、不把磁盘与日志加入 Git；
 - 本轮未提交、未推送；未修改既有最终 App 与分发目录。

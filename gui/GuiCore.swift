@@ -101,6 +101,7 @@ public struct StatusProfile: Codable, Hashable, Identifiable {
     public let id: String
     public let name: String?
     public let imported: Bool
+    public let importState: String?
     public let running: Bool
     public let pid: Int?
     public let logPath: String?
@@ -109,6 +110,7 @@ public struct StatusProfile: Codable, Hashable, Identifiable {
 
     enum CodingKeys: String, CodingKey {
         case id, name, imported, running, pid
+        case importState = "import_state"
         case logPath = "log_path"
         case baseSHA256 = "base_sha256"
         case stalePid = "stale_pid"
@@ -235,11 +237,13 @@ public struct GuiState: Equatable {
     public var phase: GuiPhase = .idle
     /// 所有集合都使用 profile ID，而非固定枚举：后续课程包的节点可被同一个管理器启动、
     /// 停止和重置，不需要为每台靶机重新编译 GUI。
-    public var configuredProfileIDs: Set<String> = Set(LabNode.required.map(\.rawValue))
+    /// 当前已校验的分发清单或已创建的候选配置。内置 profile 只是“可识别的配置”，
+    /// 不是已导入节点，因此初始值必须为空。
+    public var configuredProfileIDs: Set<String> = []
     public var importedProfileIDs: Set<String> = []
     public var runningProfileIDs: Set<String> = []
-    /// 启动选择默认全选；已运行的节点保留在选择中，但启动时会自动略过它们。
-    public var selectedProfileIDs: Set<String> = Set(LabNode.required.map(\.rawValue))
+    /// 图形入口一次只操作一个明确选中的节点，避免批量启动/停止的意外影响。
+    public var selectedProfileID: String?
     public var healthyProfileIDs: Set<String> = []
     public var pendingHealthProfileIDs: Set<String> = []
     public var lastError: String?
@@ -250,21 +254,23 @@ public struct GuiState: Equatable {
     public var verificationPassed: Bool { report?.ok == true }
     public var allImported: Bool { configuredProfileIDs.isSubset(of: importedProfileIDs) }
     public var anyRunning: Bool { !runningProfileIDs.isEmpty }
-    public var startableSelectedProfileIDs: Set<String> {
-        selectedProfileIDs.subtracting(runningProfileIDs)
-    }
-
     public var canVerify: Bool { !(distDir ?? "").isEmpty && !phase.isBusy }
     public var canImport: Bool { verificationPassed && !anyRunning && !phase.isBusy }
     public var canStartSelected: Bool {
-        verificationPassed && !startableSelectedProfileIDs.isEmpty
-            && selectedProfileIDs.isSubset(of: importedProfileIDs)
+        guard let selectedProfileID else { return false }
+        return verificationPassed
+            && importedProfileIDs.contains(selectedProfileID)
+            && !runningProfileIDs.contains(selectedProfileID)
             && !phase.isBusy
     }
     public var canStart: Bool { canStartSelected }
     public var canCheckStatus: Bool { !phase.isBusy }
-    public var canStop: Bool { anyRunning && !phase.isBusy }
-    public var canReset: Bool { allImported && !anyRunning && !phase.isBusy }
+    public var canStopSelected: Bool {
+        guard let selectedProfileID else { return false }
+        return runningProfileIDs.contains(selectedProfileID) && !phase.isBusy
+    }
+    public var canStop: Bool { canStopSelected }
+    public var canReset: Bool { !configuredProfileIDs.isEmpty && allImported && !anyRunning && !phase.isBusy }
 
     /// 导入按钮的进度文案（导入中显示第几个节点）。
     public func importProgressText(index: Int, total: Int, profileID: String) -> String {
@@ -485,7 +491,7 @@ public enum GuiMessages {
 /// 重置门禁：未确认时不允许产生任何 reset 命令（GUI 必须先弹确认框）。
 public enum ResetGate {
     public static func plan(state: GuiState, confirmed: Bool) -> [CliAction]? {
-        guard confirmed, state.allImported else { return nil }
+        guard confirmed, !state.configuredProfileIDs.isEmpty, state.allImported else { return nil }
         return LabNode.orderedProfileIDs(state.configuredProfileIDs).map {
             .resetProfile(profileID: $0)
         }

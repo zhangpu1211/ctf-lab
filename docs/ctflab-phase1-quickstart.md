@@ -96,9 +96,9 @@ Kali 默认联网，但仍只通过 QEMU user-mode NAT 访问外网；Smoke、Ba
 
 `--from-runtime` 展平当前 overlay 为新只读基盘，归档原运行目录并保留旧基盘；这样后续 `reset` 不会丢失已固化的软件。务必先正常关机，不能把强制停止等同于文件系统已干净卸载。归档会额外占用磁盘空间。
 
-图形界面由 QEMU 独立窗口提供，`--headless` 不打开窗口。Kali 图形启动默认使用内置 SPICE 客户端和
-`spice-vdagent` 自动适配分辨率；Smoke、Basic Pentesting 2 仍使用 Cocoa 固定显示。新版 App 已验证
-Kali 窗口尺寸跟随、冷启动恢复与联网；3D 加速未验收，不能承诺与商业虚拟机相同体验。详见[2026-09-13
+图形界面由 QEMU 独立窗口提供，`--headless` 不打开窗口。默认图形显示使用 Cocoa 固定显示；只有明确传入
+`--display spice` 才尝试 SPICE 与 `spice-vdagent` 的动态分辨率路径。SPICE 依赖受控 QEMU 构建，缺件会拒绝该显式请求，
+普通 `run kali-arm64` 不会因此失败。3D 加速未验收，不能承诺与商业虚拟机相同体验。详见[2026-09-13
 图形体验验证](verification-2026-09-13.md)、[联网与动态分辨率验证](verification-display-network-2026-09-16.md)
 与[动态分辨率设计](ctflab-dynamic-resolution-design.md)。
 
@@ -187,9 +187,8 @@ Kali 图形会话处于活动状态时，ACPI 电源键会打开来宾自己的�
 
 ### 图形体验增量（2026-09-16）
 
-`run` 的 `--display auto` 是默认策略：Kali 图形模式使用 SPICE 和 XFCE 自启动适配，窗口尺寸会驱动来宾
-真实分辨率变化；Smoke、Basic Pentesting 2 使用 Cocoa `zoom-to-fit`。无头模式不启动 SPICE 客户端。
-如需调试兼容性，可显式传 `--display cocoa`；显式 `--display spice` 仍只允许单独的 Kali 图形会话，缺少
+`run` 的 `--display auto` 是默认策略：所有图形节点使用 Cocoa 固定显示，无头模式不启动图形客户端。
+如需调试已验证的实验显示路径，可显式传 `--display spice`；它仍只允许单独的 Kali 图形会话，缺少
 SPICE 能力时会在创建虚拟机前失败，不自动回退。见[联网与动态分辨率验证](verification-display-network-2026-09-16.md)
 与[动态分辨率设计](ctflab-dynamic-resolution-design.md)。
 

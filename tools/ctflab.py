@@ -176,17 +176,18 @@ def spice_client_command(client: str, endpoint: Path, clipboard: bool = False,
 
 
 def resolve_display_backend(profile_id: str, requested: str, *, headless: bool = False) -> str:
-    """解析 ``run --display auto``：Kali 图形模式使用 SPICE，其余节点使用 Cocoa。
+    """解析 ``run --display auto``：默认始终使用稳定的 Cocoa 固定显示。
 
-    自动模式只对图形启动启用 SPICE；无头运行不拉起客户端，也不要求宿主具备 SPICE
-    客户端。显式 ``cocoa``/``spice`` 仍由调用方执行各自的 profile 与能力门禁。
+    SPICE 动态分辨率依赖特定 QEMU 构建、spicevmc 与本地客户端；能力缺失或显示链路
+    不稳定时，不能让一次普通 ``run kali-arm64`` 因可选功能而无法启动。因而只有用户
+    显式传 ``--display spice`` 才进入 SPICE 能力门禁；``auto`` 和 ``cocoa`` 都不创建
+    SPICE 端点或 agent transport。无头模式同样解析为 Cocoa（随后由调用方转为
+    ``-display none``）。
     """
     if requested not in {"auto", "cocoa", "spice"}:
         raise CTFLabError(f"不支持的显示后端：{requested}（可选 auto、cocoa 或 spice）。")
-    if headless and requested == "auto":
-        return "cocoa"
     if requested == "auto":
-        return "spice" if profile_id == "kali-arm64" else "cocoa"
+        return "cocoa"
     return requested
 
 
@@ -3012,6 +3013,13 @@ def _status_report(manager: LabManager) -> dict[str, Any]:
     for profile_id in available_profiles():
         profile = load_profile(profile_id)
         image = manager.image_state(profile_id) or {}
+        # image.json 只是一次导入的登记记录。基础盘若后来被用户移动或清理，不能继续
+        # 在 GUI 中误报“已导入”；状态查询不重算大盘哈希，只做存在性核验并给出失效状态。
+        base_path_text = str(image.get("base_path") or "")
+        base_exists = bool(base_path_text) and Path(base_path_text).is_file()
+        imported = bool(image) and base_exists
+        import_state = ("registered" if imported else
+                        "missing-base" if image else "not-imported")
         state = running.get(profile_id) or {}
         lab_port = int(state.get("lab_port", 0) or 0)
         network = (manager.network_state(lab_port) or {}) if lab_port else {}
@@ -3020,7 +3028,8 @@ def _status_report(manager: LabManager) -> dict[str, Any]:
             "name": str(profile.get("name", profile_id)),
             "architecture": str((profile.get("guest") or {}).get("architecture", "")),
             "firmware": str((profile.get("guest") or {}).get("firmware", "")),
-            "imported": bool(image),
+            "imported": imported,
+            "import_state": import_state,
             "source_format": image.get("source_format"),
             "base_path": image.get("base_path"),
             "base_sha256": image.get("base_sha256"),
@@ -3256,7 +3265,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--internet", action="store_true",
                             help="兼容旧命令的显式确认；Kali 图形启动默认联网，其他节点仍隔离")
     run_parser.add_argument("--display", choices=("auto", "cocoa", "spice"), default="auto",
-                            help="显示后端；默认 auto：Kali 图形启动使用 SPICE 自动分辨率，其他节点使用 Cocoa")
+                            help="显示后端；默认 auto 使用稳定的 Cocoa 固定显示；仅显式 spice 才尝试动态分辨率")
 
     status_parser = subparsers.add_parser("status", help="查看运行状态")
     status_parser.add_argument("--json", action="store_true",

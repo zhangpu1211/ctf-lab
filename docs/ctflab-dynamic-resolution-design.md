@@ -34,7 +34,7 @@
 > 独立验证记录中。旧 schema 迁移标签仅用于 schema 2 兼容迁移，不作为当前 fixture 或当前结构状态
 > 输出，避免 E2E 完成后产生歧义。
 > 本文仍保留路径对比与历史边界基线；当前验收 App 已随包携带 SPICE QEMU 与本地客户端，`run --display auto`
-> 默认给 Kali 选择 SPICE，靶机选择 Cocoa，不改变实验网与 overlay 语义。
+> 默认图形显示使用 Cocoa，不改变实验网与 overlay 语义；SPICE 仅在用户显式选择时启用。
 > 两条路径的默认关闭边界：A 的导出包默认不带网卡、默认关闭 UTM Clipboard Sharing；
 > B 的动态分辨率保留唯一的 virtio-serial + spicevmc agent transport；剪贴板按 `--clipboard`
 > 条件开关：未授权时 `disable-copy-paste=on`/`disable-agent-file-xfer=on` 且客户端关闭
@@ -409,7 +409,7 @@ failure:
 | B（负向：未授权剪贴板 + 未授权客户端） | agent transport 存在、未传 `--clipboard`：宿主侧放入英文、中文、多行哨兵文本，来宾侧确认剪贴板无内容；来宾侧写入哨兵文本，宿主剪贴板哈希不变；受控客户端 clipboard sharing 已关闭；另一未授权本地客户端无法连接端点 → 任一层失败即判定隔离不成立，不得实现路径 B |
 
 回归要求：两条路径的改动都不得改变默认 `run` 命令、`stop/reset` 语义、PCAP 与健康检查行为；
-本次完整回归（2026-09-17 复核，365 项，5 项按历史 UTM 目录缺失规则跳过）全部通过。
+本次完整回归（2026-09-17 复核，366 项，5 项按历史 UTM 目录缺失规则跳过）全部通过。
 
 ## 6. 推荐路径
 
@@ -439,8 +439,8 @@ failure:
   套用到自管 QEMU + SPICE（自管路径的窗口跟随已单独验收，剪贴板和鉴权边界仍待验收）；
 - 不允许 SPICE 以非本机方式暴露：TCP 仅 `127.0.0.1` + 每次运行鉴权，UNIX socket 仅
   0700 runtime 目录；不以 VNC 作为默认显示路径；
-- 本次路径 B 已将 `run --display auto` 设为默认；Kali 图形启动自动使用 SPICE，靶机和无头模式
-  保持 Cocoa/无图形；SPICE 二进制与客户端只在经过许可/SBOM/签名核验的 runtime 中进入验收包。
+- 路径 B 不得劫持 `run --display auto`：默认保持 Cocoa/无图形；只有显式 `--display spice` 才使用
+  SPICE。SPICE 二进制与客户端只在经过许可/SBOM/签名核验的 runtime 中进入验收包。
 - 本轮不改变 UTM 后端；当前 App 的 SPICE 后端与 XFCE 适配已完成两档窗口跟随、冷启动恢复和重连验证。
 
 ## 8. 仍需决策的问题

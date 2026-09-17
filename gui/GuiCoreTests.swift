@@ -49,17 +49,20 @@ func runAll() {
     check(state.report?.entries.first?.statusText == "哈希不符", "失败状态中文文案")
 
     state.report = okReport
+    // 真实 GUI 会从已校验清单写入本次课程的节点集合；这里显式模拟该步骤。
+    state.configuredProfileIDs = Set(LabNode.required.map(\.rawValue))
     check(state.canImport, "校验通过后导入可用")
     check(!state.canStart, "未导入时启动仍禁用")
 
     state.importedProfileIDs = Set(LabNode.required.map(\.rawValue))
     check(state.allImported, "三个节点全部导入")
+    state.selectedProfileID = LabNode.kali.rawValue
     check(state.canStart, "全部导入且未运行时启动可用")
-    state.selectedProfileIDs = Set([LabNode.kali.rawValue, LabNode.smoke.rawValue])
-    check(state.canStartSelected, "可只选择 Kali 与一个靶机启动")
-    state.selectedProfileIDs = []
+    state.selectedProfileID = LabNode.smoke.rawValue
+    check(state.canStartSelected, "可选择一个已导入靶机启动")
+    state.selectedProfileID = nil
     check(!state.canStartSelected, "未选择节点时启动禁用")
-    state.selectedProfileIDs = Set(LabNode.required.map(\.rawValue))
+    state.selectedProfileID = LabNode.kali.rawValue
     check(state.canReset, "全部导入后重置可用")
     check(!state.canStop, "未运行时停止禁用")
 
@@ -67,9 +70,10 @@ func runAll() {
     check(state.canStop, "运行中停止可用")
     check(!state.canStart, "所选节点均运行时启动禁用")
     state.runningProfileIDs = [LabNode.kali.rawValue]
-    state.selectedProfileIDs = Set([LabNode.kali.rawValue, LabNode.smoke.rawValue])
-    check(state.canStart, "Kali 运行时仍可追加启动 Smoke")
-    check(state.startableSelectedProfileIDs == Set([LabNode.smoke.rawValue]), "启动时自动略过已运行节点")
+    state.selectedProfileID = LabNode.smoke.rawValue
+    check(state.canStart, "Kali 运行时仍可单独启动 Smoke")
+    state.selectedProfileID = LabNode.kali.rawValue
+    check(state.canStopSelected, "当前选择的运行节点可停止")
 
     state.phase = .importing
     check(!state.canImport && !state.canReset && !state.canStop, "执行中所有动作禁用")
@@ -192,6 +196,7 @@ func runAll() {
     // MARK: 重置门禁
 
     var resetState = GuiState()
+    resetState.configuredProfileIDs = Set(LabNode.required.map(\.rawValue))
     resetState.importedProfileIDs = Set(LabNode.required.map(\.rawValue))
     check(ResetGate.plan(state: resetState, confirmed: false) == nil, "未确认时不产生重置命令")
     let plan = ResetGate.plan(state: resetState, confirmed: true)

@@ -1,6 +1,6 @@
 # CTFLab Mac M 跨架构靶场实施方案
 
-> 状态（2026-09-17）：Phase 1 **核心课堂版已收口**。核心运行器、ARM64 Kali + UEFI、隔离实验网、生命周期保护、受控 QEMU/Python 运行时、许可证闭环和路线 A 基盘分发链均已落地并有独立验证记录；最近完整回归为 365 项（5 项按历史 UTM 交付目录缺失规则跳过），`.app` smoke E2E 为 15/15，最终分发目录中的三个压缩基盘 + NVRAM 已完成 Kali 29/29 E2E。当前 App 主路径的 SPICE 动态分辨率已完成窗口跟随、冷启动恢复和重连验证；未完成的是剪贴板隔离/未授权客户端等额外边界专项。新增 x86_64 镜像向导已完成代码/单元验证，真实外来镜像 GUI E2E 仍未完成。正式发布边界仍单独保留：Developer ID 签名/公证、真实新 macOS 用户验收、真实网盘上传/下载、第三方靶盘再分发条款，以及不属于当前课堂主路径的 Go 交换机、主机直连和靶机应用级回连。本文是后续开发、测试、打包和验收的范围基线。验收状态只使用四类标签：**已验证 / 部分验证 / 未验证 / 后续任务**（定义见第 7 节）。
+> 状态（2026-09-17）：Phase 1 **核心课堂版已收口**。核心运行器、ARM64 Kali + UEFI、隔离实验网、生命周期保护、受控 QEMU/Python 运行时、许可证闭环和路线 A 基盘分发链均已落地并有独立验证记录；最近完整回归为 366 项（5 项按历史 UTM 交付目录缺失规则跳过），`.app` smoke E2E 为 15/15，最终分发目录中的三个压缩基盘 + NVRAM 已完成 Kali 29/29 E2E。当前 App 默认使用 Cocoa 固定显示；SPICE 动态分辨率仅为显式实验路径，未完成的是剪贴板隔离/未授权客户端等额外边界专项。新增 x86_64 镜像向导已完成代码/单元验证，真实外来镜像 GUI E2E 仍未完成。正式发布边界仍单独保留：Developer ID 签名/公证、真实新 macOS 用户验收、真实网盘上传/下载、第三方靶盘再分发条款，以及不属于当前课堂主路径的 Go 交换机、主机直连和靶机应用级回连。本文是后续开发、测试、打包和验收的范围基线。验收状态只使用四类标签：**已验证 / 部分验证 / 未验证 / 后续任务**（定义见第 7 节）。
 
 ## 1. 目标与边界
 
@@ -96,9 +96,9 @@ Phase 0 的成功标准不是“成功转成 qcow2”，而是“在当前 Mac M
 
 - **Kali ARM64：** 使用 `qemu-system-aarch64`、`-accel hvf`、VirtIO 磁盘/网卡/显示设备；这是日常图形桌面和工具的主力。
 - **x86 靶机：** 使用 `qemu-system-x86_64`、`-accel tcg,thread=multi`；性能重点是服务可用和漏洞复现，不把它作为图形工作站。
-- **显示：** 首版输出独立的本地图形窗口，使用 `virtio-gpu`。`run --display auto` 为默认策略：Kali
-  图形会话使用带 `spicevmc` agent transport 的 SPICE 自动分辨率，x86 靶机使用 Cocoa；无头模式不启动
-  SPICE 客户端。显式 `--display cocoa` 保留作兼容性排障，能力缺失时不静默回退。
+- **显示：** 首版输出独立的本地图形窗口，使用 `virtio-gpu`。`run --display auto` 默认使用稳定的 Cocoa
+  固定显示；只有用户显式选择 `--display spice`，Kali 图形会话才使用带 `spicevmc` agent transport 的
+  SPICE 实验路径。无头模式不启动图形客户端；显式 SPICE 缺件时在启动前报错，不影响默认 Cocoa。
 - **存储：** 所有实验运行从不可变基础镜像创建 qcow2 overlay，重置时删除 overlay 后重新创建，基础镜像不被修改。
 
 ### 3.2 网络策略
@@ -464,10 +464,10 @@ entitlement 丢失缺陷（HVF `HV_NO_DEVICE`），并在复核中收紧为 enti
 
 2026-09-16（图形入口）证据：`CTFLab.app` 主入口改为原生 SwiftUI/AppKit（`Contents/MacOS/CTFLabGUI`），
 CLI 保留在 `Contents/Resources/bin/{ctflab-cli,CTFLab}` 供开发与排障；学生双击 App 即可完成
-“选择分发目录 → 校验 → 导入三个节点 → 选择节点 → 启动所选节点 → 检查状态（健康）→ 停止全部 → 重置（带确认框）”，
+“选择分发目录 → 校验 → 导入三个节点 → 选择一个节点 → 启动/停止所选节点 → 检查状态（健康）→ 重置（带确认框）”，
 不再需要手输 import 命令。GUI 只调用既有 CLI（`dist verify --json`、`import <profile> <基盘> --manifest`、
-`run`、`status --json`、`health --json`、`stop --all`、`reset <profile>`），启动所选节点时由 CLI 默认给 Kali
-联网和 SPICE 自动分辨率，为靶机保持隔离，不解析任意 QEMU 参数、不绕过清单哈希。验证：GUI 单元测试（Swift 核心 + CLI JSON 契约 +
+`run`、`status --json`、`health --json`、`stop <profile>`、`reset <profile>`），启动所选节点时由 CLI 默认给 Kali
+联网和 Cocoa 固定显示，为靶机保持隔离，不解析任意 QEMU 参数、不绕过清单哈希。`stop --all` 仅保留为 CLI 故障恢复命令。验证：GUI 单元测试（Swift 核心 + CLI JSON 契约 +
 构建集成）与实机点击验证（校验通过/错误目录拒绝/导入完成/三节点启动并健康通过/停止无残留/重置确认）
 见 `docs/verification-gui-2026-09-16.md`；**未做** Developer ID 签名与公证。
 

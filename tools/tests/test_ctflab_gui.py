@@ -154,9 +154,23 @@ class CliJsonContractTests(unittest.TestCase):
         ids = {profile["id"] for profile in report["profiles"]}
         self.assertLessEqual({"kali-arm64", "smoke", "basic-pentesting-2"}, ids)
         for profile in report["profiles"]:
-            for key in ("imported", "running", "log_path", "base_sha256"):
+            for key in ("imported", "import_state", "running", "log_path", "base_sha256"):
                 self.assertIn(key, profile)
             self.assertIsInstance(profile["imported"], bool)
+
+    def test_status_marks_missing_registered_base_as_not_imported(self) -> None:
+        """历史 image.json 的盘被清理后，GUI 不得仍展示为“已导入”。"""
+        with tempfile.TemporaryDirectory() as state_dir:
+            manager = ctflab.LabManager(pathlib.Path(state_dir))
+            manager.image_state_path("smoke").parent.mkdir(parents=True)
+            manager.image_state_path("smoke").write_text(json.dumps({
+                "base_path": "/definitely/missing/base.qcow2",
+                "base_sha256": "a" * 64,
+            }), encoding="utf-8")
+            report = ctflab._status_report(manager)
+        smoke = next(profile for profile in report["profiles"] if profile["id"] == "smoke")
+        self.assertFalse(smoke["imported"])
+        self.assertEqual(smoke["import_state"], "missing-base")
 
     def test_dist_verify_json_failure_still_prints_json(self) -> None:
         """GUI 解析 JSON；失败时也必须打印 JSON 并以退出码 1 表示失败。"""
@@ -191,23 +205,25 @@ class ResetSemanticsTests(unittest.TestCase):
         self.assertIn(ctflab_app.LAUNCHER_REL, source,
                       f"GUI 必须引用 {ctflab_app.LAUNCHER_REL}（ctflab_app.LAUNCHER_REL）")
 
-    def test_gui_exposes_selected_node_start_and_default_policy(self) -> None:
-        """GUI 支持增量启动和单节点管理，Kali 的默认策略仍由 CLI 负责。"""
+    def test_gui_exposes_single_selected_node_management_and_default_policy(self) -> None:
+        """GUI 一次只操作一个选中节点；默认显示后端仍由 CLI 统一决定。"""
         source = (GUI_DIR / "GuiCore.swift").read_text(encoding="utf-8")
         app = (GUI_DIR / "GuiApp.swift").read_text(encoding="utf-8")
         self.assertIn("case run(nodes: [LabNode])", source)
         self.assertIn("case runProfiles(profileIDs: [String])", source)
         self.assertIn("case stopProfiles(profileIDs: [String])", source)
-        self.assertIn("startableSelectedProfileIDs", source)
         start_gate = source.split("public var canStartSelected: Bool", 1)[1].split("public var canStart:", 1)[0]
-        self.assertNotIn("!anyRunning", start_gate,
-                         "已有节点运行时仍须允许启动其它已导入节点")
+        self.assertIn("selectedProfileID", start_gate)
+        self.assertNotIn("!anyRunning", start_gate, "其它节点运行时不得阻塞当前节点操作")
         self.assertIn("canStartSelected", source)
-        self.assertIn("启动未运行的所选节点", app)
-        self.assertIn("selectedProfileIDs", app)
+        self.assertIn("启动所选节点", app)
+        self.assertIn("停止所选节点", app)
+        self.assertIn("selectedProfileID", app)
+        self.assertIn("func stopSelected", app)
+        self.assertNotIn('Button("停止全部")', app)
         self.assertIn("func startProfile", app)
         self.assertIn("func stopProfile", app)
-        self.assertIn('Button("停止")', app)
+        self.assertIn("Picker(\"当前节点\"", app)
         self.assertIn("ForEach(LabNode.orderedProfileIDs(model.state.configuredProfileIDs)", app)
         self.assertIn('Button("添加 x86 镜像…")', app)
         self.assertIn("ImageOnboardingSheet", app)

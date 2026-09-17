@@ -105,8 +105,8 @@ final class GuiModel: ObservableObject {
             verifyRows = []
             // 导入状态属于状态目录，不等于新选择的分发目录已经导入；切换目录后必须重新导入。
             state.importedProfileIDs.removeAll()
-            state.configuredProfileIDs = Set(LabNode.required.map(\.rawValue))
-            state.selectedProfileIDs = state.configuredProfileIDs
+            state.configuredProfileIDs.removeAll()
+            state.selectedProfileID = nil
             state.healthyProfileIDs.removeAll()
             state.pendingHealthProfileIDs.removeAll()
             state.phase = .idle
@@ -190,7 +190,7 @@ final class GuiModel: ObservableObject {
             case .success:
                 self.onboardingImportedProfileID = self.onboardingProfileID
                 self.state.configuredProfileIDs.insert(self.onboardingProfileID)
-                self.state.selectedProfileIDs.insert(self.onboardingProfileID)
+                self.state.selectedProfileID = self.onboardingProfileID
                 self.onboardingMessage = "候选配置和派生基盘已创建；尚未启动验证，请执行“启动探测”。"
                 self.appendLog("x86_64 候选 \(self.onboardingProfileID) 已导入；原始镜像保持不变。")
                 self.refreshStatus()
@@ -244,7 +244,9 @@ final class GuiModel: ObservableObject {
                     }
                     if report.ok && !baseProfiles.isEmpty {
                         self.state.configuredProfileIDs = Set(baseProfiles)
-                        self.state.selectedProfileIDs = Set(baseProfiles)
+                        // 校验只登记“本次分发目录有哪些节点”；它不等于已导入，
+                        // 也不替用户默认勾选或批量启动任何节点。
+                        self.state.selectedProfileID = nil
                     }
                     self.state.progressText = ""
                     self.state.phase = report.ok ? .verified : .failed
@@ -280,7 +282,7 @@ final class GuiModel: ObservableObject {
             return
         }
         state.configuredProfileIDs = Set(profileIDs)
-        state.selectedProfileIDs = Set(profileIDs)
+        state.selectedProfileID = nil
         state.phase = .importing
         importNext(profileIDs: profileIDs, index: 0, layout: layout)
     }
@@ -289,7 +291,7 @@ final class GuiModel: ObservableObject {
         guard index < profileIDs.count else {
             state.phase = .imported
             state.progressText = ""
-            appendLog("\(profileIDs.count) 个节点导入完成。可随时追加启动未运行节点；Kali 图形启动默认联网并自动适配分辨率。")
+            appendLog("\(profileIDs.count) 个节点导入完成。请选择一个节点再启动；Kali 默认使用稳定的固定显示。")
             refreshStatus()
             return
         }
@@ -317,26 +319,21 @@ final class GuiModel: ObservableObject {
         }
     }
 
-    func setNodeSelected(_ profileID: String, selected: Bool) {
+    func selectNode(_ profileID: String?) {
         guard !state.phase.isBusy else { return }
-        if selected {
-            state.selectedProfileIDs.insert(profileID)
-        } else {
-            state.selectedProfileIDs.remove(profileID)
-        }
+        state.selectedProfileID = profileID
     }
 
     func startSelected() {
-        guard state.canStartSelected else {
-            state.lastError = state.selectedProfileIDs.isEmpty
-                ? "请至少选择一个节点。"
-                : "所选节点尚未全部导入，或所选节点均已在运行。"
+        guard let selectedProfileID = state.selectedProfileID, state.canStartSelected else {
+            state.lastError = state.selectedProfileID == nil
+                ? "请先选择一个已导入的节点。"
+                : "所选节点尚未导入、已在运行，或分发目录尚未校验。"
             return
         }
-        let selected = LabNode.orderedProfileIDs(state.startableSelectedProfileIDs)
         state.phase = .busy
-        state.progressText = "正在启动 \(selected.count) 个未运行节点…（Kali 默认联网并自动适配分辨率）"
-        run(.runProfiles(profileIDs: selected)) { [weak self] outcome in
+        state.progressText = "正在启动 \(LabNode.displayName(for: selectedProfileID))…（Kali 默认固定显示）"
+        run(.runProfiles(profileIDs: [selectedProfileID])) { [weak self] outcome in
             guard let self else { return }
             self.state.phase = .idle
             self.state.progressText = ""
@@ -402,39 +399,27 @@ final class GuiModel: ObservableObject {
         }
     }
 
-    /// 单节点操作给课程扩容留下入口：已运行的其他节点不会阻塞它。
+    /// 表格快捷键仍先把该行设为当前选择，再复用同一条单节点启动路径。
     func startProfile(_ profileID: String) {
-        guard !state.phase.isBusy, state.importedProfileIDs.contains(profileID),
-              !state.runningProfileIDs.contains(profileID) else { return }
-        state.phase = .busy
-        state.progressText = "正在启动 \(LabNode.displayName(for: profileID))…"
-        run(.runProfiles(profileIDs: [profileID])) { [weak self] outcome in
-            guard let self else { return }
-            self.state.phase = .idle
-            self.state.progressText = ""
-            if case .failure(let message) = outcome { self.state.lastError = message }
-            self.refreshStatus()
-        }
+        selectNode(profileID)
+        startSelected()
     }
 
     func stopProfile(_ profileID: String) {
-        guard !state.phase.isBusy, state.runningProfileIDs.contains(profileID) else { return }
-        state.phase = .busy
-        state.progressText = "正在停止 \(LabNode.displayName(for: profileID))…"
-        run(.stopProfiles(profileIDs: [profileID])) { [weak self] outcome in
-            guard let self else { return }
-            self.state.phase = .idle
-            self.state.progressText = ""
-            if case .failure(let message) = outcome { self.state.lastError = message }
-            self.refreshStatus()
-        }
+        selectNode(profileID)
+        stopSelected()
     }
 
-    func stopAll() {
-        guard state.canStop else { return }
+    func stopSelected() {
+        guard let selectedProfileID = state.selectedProfileID, state.canStopSelected else {
+            state.lastError = state.selectedProfileID == nil
+                ? "请先选择一个运行中的节点。"
+                : "所选节点当前未运行。"
+            return
+        }
         state.phase = .busy
-        state.progressText = "正在停止全部实例…"
-        run(.stopAll) { [weak self] outcome in
+        state.progressText = "正在停止 \(LabNode.displayName(for: selectedProfileID))…"
+        run(.stopProfiles(profileIDs: [selectedProfileID])) { [weak self] outcome in
             guard let self else { return }
             self.state.phase = .idle
             self.state.progressText = ""
@@ -623,12 +608,12 @@ struct ContentView: View {
                 .disabled(!model.state.canImport)
             Button("添加 x86 镜像…") { model.chooseX86Image() }
                 .disabled(model.state.phase.isBusy)
-            Button("启动未运行的所选节点") { model.startSelected() }
+            Button("启动所选节点") { model.startSelected() }
                 .disabled(!model.state.canStartSelected)
             Button("检查状态") { model.checkStatus() }
                 .disabled(!model.state.canCheckStatus)
-            Button("停止全部") { model.stopAll() }
-                .disabled(!model.state.canStop)
+            Button("停止所选节点") { model.stopSelected() }
+                .disabled(!model.state.canStopSelected)
             Button("重置…") { model.requestReset() }
                 .disabled(!model.state.canReset)
             Spacer()
@@ -641,20 +626,24 @@ struct ContentView: View {
 
     private var nodeSelection: some View {
         HStack(spacing: 12) {
-            Text("启动选择")
+            Text("当前节点")
                 .font(.headline)
-            ForEach(LabNode.orderedProfileIDs(model.state.configuredProfileIDs), id: \.self) { profileID in
-                Toggle(LabNode.displayName(for: profileID),
-                       isOn: Binding(
-                           get: { model.state.selectedProfileIDs.contains(profileID) },
-                           set: { model.setNodeSelected(profileID, selected: $0) }
-                       ))
-                .toggleStyle(.checkbox)
-                // 已有节点运行时仍可选择其余节点并追加启动；运行中的节点会被启动动作略过。
-                .disabled(model.state.phase.isBusy || !model.state.importedProfileIDs.contains(profileID))
+            Picker("当前节点", selection: Binding(
+                get: { model.state.selectedProfileID ?? "" },
+                set: { model.selectNode($0.isEmpty ? nil : $0) }
+            )) {
+                Text("请选择…").tag("")
+                ForEach(LabNode.orderedProfileIDs(model.state.configuredProfileIDs), id: \.self) { profileID in
+                    let imported = model.state.importedProfileIDs.contains(profileID)
+                    Text("\(LabNode.displayName(for: profileID))（\(imported ? "本机已登记" : "未导入")）")
+                        .tag(profileID)
+                }
             }
+            .labelsHidden()
+            .pickerStyle(.menu)
+            .disabled(model.state.phase.isBusy || model.state.configuredProfileIDs.isEmpty)
             Spacer()
-            Text("运行中的节点不会阻塞追加启动；Kali 默认联网 + 自动分辨率")
+            Text("一次只操作一个节点；Kali 默认联网 + 固定显示")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
@@ -710,23 +699,20 @@ struct ContentView: View {
                     TableColumn("节点") { row in
                         Text(row.name ?? LabNode.displayName(for: row.id))
                     }
-                    TableColumn("已导入") { row in Text(row.imported ? "是" : "否") }
+                    TableColumn("本机基盘") { row in
+                        Text(row.imported ? "已登记" :
+                             (row.importState == "missing-base" ? "记录失效" : "未导入"))
+                    }
                     TableColumn("运行中") { row in Text(row.running ? "PID \(row.pid ?? 0)" : "否") }
                     TableColumn("健康") { row in
                         Text(model.state.healthyProfileIDs.contains(row.id)
                              ? "通过" : (model.state.pendingHealthProfileIDs.contains(row.id)
                                          ? "等待" : (row.running ? "待检查" : "—")))
                     }
-                    TableColumn("操作") { row in
-                        HStack(spacing: 6) {
-                            if row.running {
-                        Button("停止") { model.stopProfile(row.id) }
-                            .disabled(model.state.phase.isBusy)
-                            } else {
-                                Button("启动") { model.startProfile(row.id) }
-                                    .disabled(!row.imported || model.state.phase.isBusy)
-                            }
-                        }
+                    TableColumn("提示") { row in
+                        if row.running { Text("选择后可停止") }
+                        else if row.imported { Text("选择后可启动") }
+                        else { Text("需先导入") }
                     }
                     TableColumn("日志") { row in
                         Text(row.logPath ?? "—").textSelection(.enabled).lineLimit(1)
