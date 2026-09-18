@@ -175,18 +175,20 @@ def spice_client_command(client: str, endpoint: Path, clipboard: bool = False,
     return [client, client_uri]
 
 
-def resolve_display_backend(profile_id: str, requested: str, *, headless: bool = False) -> str:
-    """解析 ``run --display auto``：默认始终使用稳定的 Cocoa 固定显示。
+def resolve_display_backend(profile_id: str, requested: str, *, headless: bool = False,
+                            spice_supported: bool = False) -> str:
+    """解析显示后端；Kali 的 ``auto`` 在能力完整时默认使用真实动态分辨率。
 
-    SPICE 动态分辨率依赖特定 QEMU 构建、spicevmc 与本地客户端；能力缺失或显示链路
-    不稳定时，不能让一次普通 ``run kali-arm64`` 因可选功能而无法启动。因而只有用户
-    显式传 ``--display spice`` 才进入 SPICE 能力门禁；``auto`` 和 ``cocoa`` 都不创建
-    SPICE 端点或 agent transport。无头模式同样解析为 Cocoa（随后由调用方转为
-    ``-display none``）。
+    ``auto`` 只在 Kali 图形模式且 QEMU、spicevmc、virtserialport 与受控客户端均通过
+    能力探测时选择 SPICE；缺件时退化为 Cocoa，使普通启动仍可用。用户显式请求
+    ``spice`` 时不允许退化，仍由调用方在创建网络和 overlay 前明确失败。无头与靶机
+    始终使用 Cocoa 语义（随后由命令构造器转为 ``-display none`` 或固定显示）。
     """
     if requested not in {"auto", "cocoa", "spice"}:
         raise CTFLabError(f"不支持的显示后端：{requested}（可选 auto、cocoa 或 spice）。")
     if requested == "auto":
+        if profile_id == "kali-arm64" and not headless and spice_supported:
+            return "spice"
         return "cocoa"
     return requested
 
@@ -1949,8 +1951,17 @@ class LabManager:
             raise CTFLabError("--clipboard 需要启动 Kali 图形窗口。")
         if allow_internet and "kali-arm64" not in profile_ids:
             raise CTFLabError("只有 Kali 可以联网；Smoke 和 Basic Pentesting 2 始终保持隔离。")
+        auto_capabilities: dict[str, Any] | None = None
+        if display == "auto" and "kali-arm64" in profile_ids and not headless:
+            qemu = which_any(QEMU_ARM_NAMES)
+            if qemu:
+                auto_capabilities = self.probe_spice(qemu)
+        auto_spice_supported = bool(auto_capabilities and auto_capabilities.get("supported"))
         displays = {
-            profile_id: resolve_display_backend(profile_id, display, headless=headless)
+            profile_id: resolve_display_backend(
+                profile_id, display, headless=headless,
+                spice_supported=auto_spice_supported,
+            )
             for profile_id in profile_ids
         }
         for profile_id in profile_ids:
@@ -2044,6 +2055,11 @@ class LabManager:
                 "internet_enabled": profile_id == "kali-arm64",
                 "clipboard_enabled": clipboard and profile_id == "kali-arm64",
                 "display_backend": displays[profile_id],
+                "display_requested": display,
+                "display_auto_fallback": (
+                    display == "auto" and profile_id == "kali-arm64"
+                    and not headless and displays[profile_id] == "cocoa"
+                ),
                 "spice_endpoint": str(self.runtime_dir / profile_id / "spice" / "display.sock") if displays[profile_id] == "spice" else None,
             }
             write_json(self.runtime_state_path(profile_id), state)
@@ -3265,7 +3281,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--internet", action="store_true",
                             help="兼容旧命令的显式确认；Kali 图形启动默认联网，其他节点仍隔离")
     run_parser.add_argument("--display", choices=("auto", "cocoa", "spice"), default="auto",
-                            help="显示后端；默认 auto 使用稳定的 Cocoa 固定显示；仅显式 spice 才尝试动态分辨率")
+                            help="显示后端；默认 auto 在 Kali 的 SPICE 能力完整时使用真实自动分辨率，缺件时退化为 Cocoa；显式 spice 缺件会失败")
 
     status_parser = subparsers.add_parser("status", help="查看运行状态")
     status_parser.add_argument("--json", action="store_true",

@@ -291,7 +291,7 @@ final class GuiModel: ObservableObject {
         guard index < profileIDs.count else {
             state.phase = .imported
             state.progressText = ""
-            appendLog("\(profileIDs.count) 个节点导入完成。请选择一个节点再启动；Kali 默认使用稳定的固定显示。")
+            appendLog("\(profileIDs.count) 个节点导入完成。请选择一个节点再启动；Kali 默认使用真实自动分辨率。")
             refreshStatus()
             return
         }
@@ -332,7 +332,9 @@ final class GuiModel: ObservableObject {
             return
         }
         state.phase = .busy
-        state.progressText = "正在启动 \(LabNode.displayName(for: selectedProfileID))…（Kali 默认固定显示）"
+        state.progressText = selectedProfileID == LabNode.kali.rawValue
+            ? "正在启动 \(LabNode.displayName(for: selectedProfileID))…（自动分辨率）"
+            : "正在启动 \(LabNode.displayName(for: selectedProfileID))…"
         run(.runProfiles(profileIDs: [selectedProfileID])) { [weak self] outcome in
             guard let self else { return }
             self.state.phase = .idle
@@ -643,7 +645,7 @@ struct ContentView: View {
             .pickerStyle(.menu)
             .disabled(model.state.phase.isBusy || model.state.configuredProfileIDs.isEmpty)
             Spacer()
-            Text("一次只操作一个节点；Kali 默认联网 + 固定显示")
+            Text("一次只操作一个节点；Kali 默认联网 + 自动分辨率")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }

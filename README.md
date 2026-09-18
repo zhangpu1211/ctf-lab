@@ -20,8 +20,9 @@ CTFLab 是面向 Apple Silicon Mac 的本地虚拟靶场运行器。它使用 QE
 - `CTFLab.app` 自带受控 QEMU 与 Python 运行时（含 PyYAML），目标机器无需安装任何环境；
 - 基盘分发链（路线 A）：`dist prepare/verify` 生成 zstd 压缩基盘、`DISTRIBUTION.json`、`SHA256SUMS`
   与分发说明；`import --manifest/--expect-sha256` 强制核对下载文件哈希并把校验证据写入导入记录。
-- 默认图形显示使用 Cocoa 固定显示，避免可选的 SPICE 组件缺失阻塞普通启动；只有显式
-  `--display spice` 才探测 SPICE QEMU、`spicevmc`、`virtserialport` 与本地客户端。无头模式不启动图形客户端。
+- Kali 默认使用 SPICE 真实自动分辨率：启动前探测 SPICE QEMU、`spicevmc`、`virtserialport`
+  与受控客户端；能力完整时窗口尺寸会驱动来宾实际分辨率。能力缺失时 `auto` 明确退化为 Cocoa 固定显示，
+  显式 `--display spice` 缺件时会在创建虚拟机前拒绝。无头模式不启动图形客户端。
 
 ## 快速开始
 
@@ -35,7 +36,7 @@ CTFLab 是面向 Apple Silicon Mac 的本地虚拟靶场运行器。它使用 QE
 shasum -a 256 -c SHA256SUMS                     # 1) 校验下载完整性
 ctflab import kali-arm64 kali-arm64-base.qcow2 --manifest DISTRIBUTION.json
                                                 # 2) 清单自动核对哈希并套用配套 NVRAM 模板
-ctflab run kali-arm64                           # 3) 启动 Kali（默认联网、固定显示）
+ctflab run kali-arm64                           # 3) 启动 Kali（默认联网、真实自动分辨率）
 ```
 
 哈希不一致时导入会直接失败并打印期望值与实际值：重新下载，不要绕过校验。
@@ -78,17 +79,17 @@ ctflab run kali-arm64                           # 3) 启动 Kali（默认联网�
   但矩阵命中不会自动写回配置；
 - 图形界面只调用内置 CLI：`dist verify --json`、`import <profile> <基盘> --manifest`、`run`、
   `status --json`、`health --json`、`stop <profile>`、`reset <profile>`、`inspect --json`、`onboard`、`probe`；
-  已运行的其它节点不会阻塞当前节点操作。启动所选节点时由 CLI 自动为 Kali配置联网并使用稳定的固定显示，为其他节点保持隔离，
+  已运行的其它节点不会阻塞当前节点操作。启动所选节点时由 CLI 自动为 Kali 配置联网并优先使用 SPICE 真实自动分辨率，为其他节点保持隔离，
   不解析任意 QEMU 参数、不绕过清单哈希；命令行可直接
   使用 `run kali-arm64 smoke` 或 `run kali-arm64 smoke basic-pentesting-2`；路径含空格按单一参数传递；
 - 重新打开 App 会通过 `status` 恢复已导入/运行中显示；重复导入是幂等的，不覆盖已验证基盘；
-  显式启用 SPICE 时，其客户端会随该节点的 QEMU 退出而自行关闭；默认 Cocoa 显示不依赖 SPICE。
+  SPICE 客户端会随该节点的 QEMU 退出而自行关闭；能力缺失时自动退化的 Cocoa 显示不依赖 SPICE。
 - CLI 保留在 `CTFLab.app/Contents/Resources/bin/ctflab-cli`（兼容名 `CTFLab`），
   供开发、脚本化与故障排查使用，与图形界面共享同一状态目录与同一导入逻辑。
 
 Smoke/Basic 的 x86 靶机静态控制台 E2E 已在限定范围内通过；旧 UTM 路径的历史记录仍保留为边界说明，
 其中固定显示与动态分辨率结论不适用于显式请求的 SPICE 实验路径。
-当前 App 默认使用 Cocoa 固定显示；只有显式 `--display spice` 才尝试带 SPICE QEMU 与本地 `spicy` 客户端的动态分辨率路径。缺件时，显式请求会在创建虚拟机前拒绝。当前验收包与限制见
+当前 App 的 Kali 默认选择带 SPICE QEMU 与本地 `spicy` 客户端的真实自动分辨率路径；`auto` 在能力缺失时退化为 Cocoa 固定显示，显式 `--display spice` 缺件时不会回退。当前验收包与限制见
 [`联网与动态分辨率验证记录`](docs/verification-display-network-2026-09-16.md)。
 
 ## 测试
@@ -119,7 +120,7 @@ python3 -m py_compile tools/ctflab.py tools/ctflab_inspect.py tools/ctflab_netwo
 - [Task 6.3B 验证记录：许可证闭环与内置 Python 运行时（2026-09-15）](docs/verification-task6-3b-2026-09-15.md)
 - [基盘分发指南（路线 A：网盘 / 课程资料区）](docs/ctflab-distribution-guide.md)
 - [分发链验证记录：压缩基盘与可校验导入（2026-09-16）](docs/verification-distribution-2026-09-16.md)
-- [联网与动态分辨率功能验证记录（2026-09-16）](docs/verification-display-network-2026-09-16.md)
+- [联网与动态分辨率功能验证记录（2026-09-16／18）](docs/verification-display-network-2026-09-16.md)
 
 ## 许可证
 

@@ -407,6 +407,16 @@ def _formula_version(formula: str, opt_root: Path = Path("/opt/homebrew/opt")) -
     return None
 
 
+def qemu_source_description(qemu_root: Path) -> str:
+    """给 QEMU 二进制记录真实来源类别，不把上游源码构建误写成 Homebrew bottle。"""
+    binary = Path(qemu_root) / "bin" / "qemu-system-aarch64"
+    formula = _formula_of(binary)
+    if formula == "qemu":
+        return f"Homebrew qemu {_formula_version('qemu') or '?'}"
+    version = _qemu_semver(_qemu_version(binary)) or "unknown"
+    return f"Upstream QEMU {version} source build"
+
+
 def collect_license_texts(formula: str) -> list[tuple[str, Path]]:
     """收集某个 formula 的许可证文本；找不到时返回空列表（由调用方决定是否失败）。"""
     keg = Path("/opt/homebrew/opt") / formula
@@ -698,7 +708,8 @@ def _plus_three_years(generated_at: str) -> str:
 
 
 def build_source_offer(*, qemu_version: str | None, formula_version: str | None,
-                       generated_at: str) -> tuple[dict[str, Any], str]:
+                       generated_at: str,
+                       source_description: str | None = None) -> tuple[dict[str, Any], str]:
     """生成 QEMU 对应源码的书面要约（GPL-2.0 §3）与机器可读元数据。
 
     源码归档哈希必须与随包二进制版本匹配；未登记的版本无法编造哈希，直接失败。
@@ -714,7 +725,7 @@ def build_source_offer(*, qemu_version: str | None, formula_version: str | None,
         "qemu_version": qemu_version,
         "url": url,
         "sha256": sha256,
-        "source_formula": f"Homebrew qemu {formula_version or '?'}",
+        "source_formula": source_description or f"Homebrew qemu {formula_version or '?'}",
         "valid_until": valid_until,
         "text_file": SOURCE_OFFER_REL,
     }
@@ -730,8 +741,9 @@ def build_source_offer(*, qemu_version: str | None, formula_version: str | None,
         f"- 对应源码归档：{url}",
         f"- 归档 SHA-256：`{sha256}`",
         f"- 随包二进制版本：{qemu_version}（{meta['source_formula']}）",
-        "- 构建配方：Homebrew qemu formula 及其补丁集（构建时 formula 版本记录在 `SBOM.json` 的",
-        "  QEMU 组件 `source` 字段；配方历史见 https://github.com/Homebrew/homebrew-core/blob/HEAD/Formula/q/qemu.rb ）",
+        "- 构建配方：`--target-list=aarch64-softmmu,x86_64-softmmu --enable-hvf --enable-cocoa",
+        "  --enable-spice --enable-spice-protocol --enable-slirp --disable-pvg`；第三方动态库来自",
+        "  Homebrew keg，版本和许可证文本记录在 `SBOM.json`。",
         "- 获取方式：通过 CTFLab 源码仓库（私有镜像 zhangpu1211/ctf-lab）的联系渠道提出请求；",
         "  我们按 GPL 要求提供源码（下载链接、介质或成本价复制）。",
         "",
@@ -1012,6 +1024,7 @@ def build_sbom(*, version: str, generated_at: str, qemu_root: Path, libs: dict[s
     import ctflab_package  # noqa: PLC0415  函数内导入，避免循环依赖
 
     vendored_index = vendored_index or {}
+    qemu_source = qemu_source_description(qemu_root)
     qemu_bins = []
     for name in QEMU_BINARIES:
         source = qemu_root / "bin" / name
@@ -1023,7 +1036,7 @@ def build_sbom(*, version: str, generated_at: str, qemu_root: Path, libs: dict[s
             "license": KNOWN_LICENSES["qemu"],
             "bundled": True,
             # SBOM 记录可复现的来源类别与版本，不写入构建机绝对路径。
-            "source": f"Homebrew qemu {_formula_version('qemu') or '?'}",
+            "source": qemu_source,
         })
     dylib_components = []
     for name, source in sorted(libs.items()):
@@ -1061,7 +1074,7 @@ def build_sbom(*, version: str, generated_at: str, qemu_root: Path, libs: dict[s
         "version": _qemu_version(qemu_root / "bin" / "qemu-system-aarch64"),
         "license": KNOWN_LICENSES["qemu"],
         "bundled": True,
-        "source": f"Homebrew qemu {_formula_version('qemu') or '?'}",
+        "source": qemu_source,
         "binaries": qemu_bins,
         "runtime_assets": {
             "share_files": qemu_share,
@@ -1386,7 +1399,8 @@ def build_app(
         offer_meta, offer_text = build_source_offer(
             qemu_version=_qemu_semver(_qemu_version(qemu_root / "bin" / "qemu-system-aarch64")),
             formula_version=_formula_version("qemu"),
-            generated_at=generated_at)
+            generated_at=generated_at,
+            source_description=qemu_source_description(qemu_root))
         (resources / "SOURCE_OFFER.md").write_text(offer_text, encoding="utf-8")
 
         # 7) SBOM / 许可证说明 / MANIFEST（在签名后计算最终文件哈希）
@@ -1432,7 +1446,7 @@ def build_app(
                                   if spice_client is not None else None),
                 "share_files": copied_share,
                 "qemu_version": _qemu_version(qemu_root / "bin" / "qemu-system-aarch64"),
-                "source": f"Homebrew qemu {_formula_version('qemu') or '?'}",
+                "source": qemu_source_description(qemu_root),
                 "entitlements": {
                     name: entitlement_record(value)
                     for name, value in sorted(bundled_entitlements.items())

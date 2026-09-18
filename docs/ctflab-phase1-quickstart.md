@@ -96,8 +96,9 @@ Kali 默认联网，但仍只通过 QEMU user-mode NAT 访问外网；Smoke、Ba
 
 `--from-runtime` 展平当前 overlay 为新只读基盘，归档原运行目录并保留旧基盘；这样后续 `reset` 不会丢失已固化的软件。务必先正常关机，不能把强制停止等同于文件系统已干净卸载。归档会额外占用磁盘空间。
 
-图形界面由 QEMU 独立窗口提供，`--headless` 不打开窗口。默认图形显示使用 Cocoa 固定显示；只有明确传入
-`--display spice` 才尝试 SPICE 与 `spice-vdagent` 的动态分辨率路径。SPICE 依赖受控 QEMU 构建，缺件会拒绝该显式请求，
+图形界面由 QEMU 独立窗口提供，`--headless` 不打开窗口。Kali 默认通过受控 SPICE QEMU 与
+`spice-vdagent` 使用真实自动分辨率；完整能力缺失时 `auto` 退化为 Cocoa 固定显示。明确传入
+`--display spice` 时缺件会拒绝该请求，
 普通 `run kali-arm64` 不会因此失败。3D 加速未验收，不能承诺与商业虚拟机相同体验。详见[2026-09-13
 图形体验验证](verification-2026-09-13.md)、[联网与动态分辨率验证](verification-display-network-2026-09-16.md)
 与[动态分辨率设计](ctflab-dynamic-resolution-design.md)。
@@ -185,9 +186,10 @@ Kali 图形会话处于活动状态时，ACPI 电源键会打开来宾自己的�
 
 不要用 Cocoa 窗口红色关闭按钮代替来宾关机：关闭窗口会先弹 “Are you sure you want to quit QEMU?” 确认框，确认后 QEMU 发送 ACPI 电源键，但仍需要来宾确认并在来宾退出后才会结束；窗口关闭后无法重新显示同一实例。后台使用应从一开始选择 `--headless`。
 
-### 图形体验增量（2026-09-16）
+### 图形体验增量（2026-09-16，2026-09-18 复核）
 
-`run` 的 `--display auto` 是默认策略：所有图形节点使用 Cocoa 固定显示，无头模式不启动图形客户端。
+`run` 的 `--display auto` 是默认策略：Kali 在 SPICE 能力完整时使用真实自动分辨率，x86 靶机使用
+Cocoa 固定显示；无头模式不启动图形客户端。
 如需调试已验证的实验显示路径，可显式传 `--display spice`；它仍只允许单独的 Kali 图形会话，缺少
 SPICE 能力时会在创建虚拟机前失败，不自动回退。见[联网与动态分辨率验证](verification-display-network-2026-09-16.md)
 与[动态分辨率设计](ctflab-dynamic-resolution-design.md)。

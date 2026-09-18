@@ -9,9 +9,11 @@
   `qemu-vdagent` 限定为经授权的文本剪贴板路径，SPICE 显示与动态分辨率仍未实现；Task 2
   验收允许持久锁文件但不允许锁被持有；
 - 设计文档边界：路径 A 的历史 UTM 导出仍默认无网卡、默认关闭 UTM Clipboard Sharing；路径 B 当前
-  使用 SPICE agent transport、本机端点和按条件的剪贴板开关，未验证的剪贴板/客户端鉴权边界必须保留；
+  使用 SPICE agent transport、本机端点和按条件的剪贴板开关，普通窗口跟随/点击定位已有限定验证，
+  未验证的剪贴板/客户端鉴权/全屏边界必须保留；
   离线导出不得声称图形会话 agent 已连接；
-- 当前阶段 CLI 边界：`run --display auto` 默认 Cocoa，SPICE 只能显式请求；无头模式不启动图形客户端；
+- 当前阶段 CLI 边界：`run --display auto` 对 Kali 做能力探测，完整时默认 SPICE、缺件时退化 Cocoa；
+  显式 SPICE 缺件不回退；无头模式不启动图形客户端；
   旧断言更新时不能抹掉历史 UTM 范围限制。
 """
 
@@ -398,10 +400,10 @@ class DesignBoundaryTests(unittest.TestCase):
 
     def test_cli_scope_wording_is_precise(self) -> None:
         flat = normalized(self.text)
-        self.assertIn("默认图形显示使用 Cocoa", flat)
+        self.assertIn("`run --display auto` 对 Kali 在完整能力可用时默认使用 SPICE", flat)
         self.assertIn("spice_probe:", flat)
-        self.assertIn("SPICE 仅在用户显式选择时启用", flat)
-        self.assertIn("默认保持 Cocoa/无图形", flat)
+        self.assertIn("能力缺失时退化为 Cocoa", flat)
+        self.assertIn("显式 SPICE 缺件不回退", flat)
         self.assertIn("显式 `--display spice`", flat)
         self.assertNotIn("本次新增的仅有路径 A 的 `utm-export`", flat)
         self.assertNotIn("本次未新增动态分辨率相关 CLI", flat)
@@ -453,7 +455,7 @@ class DesignBoundaryTests(unittest.TestCase):
 
 
 class SpiceDisplayCliTests(unittest.TestCase):
-    """CLI 显示契约：默认固定 Cocoa；SPICE 只能由用户显式请求。"""
+    """CLI 显示契约：Kali auto 能力完整时默认 SPICE，缺件时安全退化 Cocoa。"""
 
     def run_options(self) -> set[str]:
         parser = ctflab.build_parser()
@@ -466,10 +468,13 @@ class SpiceDisplayCliTests(unittest.TestCase):
     def test_run_has_display_option(self) -> None:
         self.assertIn("--display", self.run_options())
 
-    def test_auto_display_selects_cocoa_for_all_profiles(self) -> None:
+    def test_auto_display_selects_spice_for_graphical_kali_when_supported(self) -> None:
         self.assertEqual(ctflab.resolve_display_backend("kali-arm64", "auto"), "cocoa")
+        self.assertEqual(ctflab.resolve_display_backend(
+            "kali-arm64", "auto", spice_supported=True), "spice")
         self.assertEqual(ctflab.resolve_display_backend("smoke", "auto"), "cocoa")
-        self.assertEqual(ctflab.resolve_display_backend("kali-arm64", "auto", headless=True), "cocoa")
+        self.assertEqual(ctflab.resolve_display_backend(
+            "kali-arm64", "auto", headless=True, spice_supported=True), "cocoa")
 
     def test_default_command_stays_cocoa_without_spice(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -541,10 +546,32 @@ class SpiceDisplayCliTests(unittest.TestCase):
         source = (pathlib.Path(__file__).resolve().parents[2] / "tools" / "spice_client" / "ctflab_spicy.c").read_text(encoding="utf-8")
         self.assertIn('"auto-clipboard", allow_clipboard', source)
         self.assertIn("watch_qemu_process", source)
+        self.assertIn("typedef struct {", source)
+        self.assertIn("QemuWatchContext", source)
+        self.assertIn("SessionContext", source)
+        self.assertIn("context->session", source)
+        self.assertIn("qemu_watch.source_id", source)
+        self.assertNotIn("GINT_TO_POINTER((gint)qemu_pid)", source)
         self.assertIn("spice_main_channel_request_mouse_mode", source)
+        self.assertIn('"notify::mouse-mode"', source)
+        self.assertIn("absolute_mouse_ready", source)
+        self.assertIn("display_ready", source)
         self.assertIn("schedule_guest_resize", source)
         self.assertIn('"configure-event"', source)
         self.assertIn('"resize-guest", FALSE', source)
+        self.assertIn('"scaling", TRUE', source)
+        self.assertIn('"only-downscale", FALSE', source)
+        self.assertNotIn('"resize-guest", FALSE, "scaling", FALSE', source)
+        self.assertIn("apply_guest_resize", source)
+        self.assertIn("gtk_widget_get_scale_factor", source)
+        self.assertIn("spice_main_channel_update_display", source)
+        self.assertIn("resize-target logical=", source)
+        self.assertIn('resize_generation', source)
+        self.assertIn('ResizeTimerContext', source)
+        self.assertIn('resize-enable generation=', source)
+        self.assertIn('CTFLAB_SPICE_STATE', source)
+        self.assertIn('request_client_quit', source)
+        self.assertIn('spice_session_disconnect(session)', source)
 
 
 class DeliveryClaimGuardTests(unittest.TestCase):
@@ -576,13 +603,13 @@ class DeliveryClaimGuardTests(unittest.TestCase):
         return docs
 
     def test_root_readme_carries_scoped_delivery_wording(self) -> None:
-        """根 README 区分旧 UTM 静态交付、默认 Cocoa 与显式 SPICE 路径。"""
+        """根 README 区分旧 UTM 静态交付、默认 SPICE 与 Cocoa 退化路径。"""
         flat = normalized(ROOT_README.read_text(encoding="utf-8"))
         self.assertIn("x86 靶机静态控制台 E2E 已在限定范围内通过", flat)
         self.assertIn("旧 UTM 路径", flat)
-        self.assertIn("默认使用 Cocoa 固定显示", flat)
-        self.assertIn("只有显式 `--display spice`", flat)
-        self.assertIn("缺件时，显式请求会在创建虚拟机前拒绝", flat)
+        self.assertIn("Kali 默认使用 SPICE 真实自动分辨率", flat)
+        self.assertIn("能力缺失时 `auto` 明确退化为 Cocoa 固定显示", flat)
+        self.assertIn("显式 `--display spice` 缺件时会在创建虚拟机前拒绝", flat)
         for stale in ("已实现并完成 UTM E2E", "完成 UTM E2E"):
             self.assertNotIn(stale, flat)
 
