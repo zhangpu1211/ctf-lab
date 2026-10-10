@@ -10,6 +10,7 @@
 
 /docs/*
 !/docs/ctflab-mac-mvp-implementation-plan.md
+!/docs/ctflab-ux-2026-10-08.md
 !/docs/ctflab-phase1-quickstart.md
 !/docs/ctflab-dynamic-resolution-design.md
 !/docs/verification-2026-09-06.md
@@ -28,6 +29,17 @@
 !/docs/verification-display-network-2026-09-16.md
 !/docs/verification-task6-3b-2026-09-15.md
 !/docs/verification-distribution-2026-09-16.md
+!/docs/verification-pending-boundaries-2026-09-25.md
+!/docs/verification-client-lifecycle-2026-10-05.md
+!/docs/verification-blackborder-clipboard-ui-2026-10-07.md
+!/docs/verification-input-resolution-2026-10-05.md
+!/docs/verification-review-fixes-2026-10-08.md
+!/docs/ctflab-kali-sleep-guard.md
+!/docs/ctflab-small-motion-build.md
+!/docs/verification-startup-presets-2026-10-09.md
+!/docs/verification-stability-2026-10-09.md
+!/docs/verification-release-gates-2026-10-09.md
+!/docs/release-v0.1.1-preview.md
 
 /tools/*
 !/tools/ctflab
@@ -38,9 +50,13 @@
 !/tools/ctflab_package.py
 !/tools/ctflab_acceptance.py
 !/tools/ctflab_app.py
+!/tools/ctflab_update.py
+!/tools/ctflab_update_acceptance.py
 !/tools/ctflab_dist.py
 !/tools/ctflab_app_e2e.py
 !/tools/ctflab_app_kali_e2e.py
+!/tools/ctflab_ux_acceptance.py
+!/tools/ctflab_benchmark.py
 !/tools/ctflab_utm_fixture.json
 !/tools/ctflab_profiles/
 /gui/*
@@ -74,6 +90,9 @@
 !/tools/guest_fixes/kali-arm64/configure.sh
 !/tools/guest_fixes/kali-arm64/kali.sources
 !/tools/guest_fixes/kali-arm64/ghidra_help_fix.py
+!/tools/guest_fixes/kali-arm64/power_policy.py
+!/tools/guest_fixes/kali-arm64/screen_wake_patch.py
+!/tools/guest_fixes/kali-arm64/screen_wake_build.py
 /tools/guest_fixes/basic-pentesting-2/*
 !/tools/guest_fixes/basic-pentesting-2/interfaces
 /tools/guest_fixes/smoke/*

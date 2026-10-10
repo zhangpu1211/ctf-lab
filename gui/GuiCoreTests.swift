@@ -44,7 +44,12 @@ func runAll() {
 
     state.report = badReport
     check(!state.canImport, "校验失败时导入禁用")
-    check(!state.canStart, "校验失败时启动禁用")
+    // 启动只看状态目录的导入结果：镜像文件夹未校验不阻塞已导入节点启动。
+    state.importedProfileIDs = [LabNode.kali.rawValue]
+    state.selectedProfileID = LabNode.kali.rawValue
+    check(state.canStart, "校验失败但节点已导入时仍可启动")
+    state.importedProfileIDs = []
+    state.selectedProfileID = nil
     check(state.report?.entries.first?.isOK == false, "失败条目状态可读")
     check(state.report?.entries.first?.statusText == "哈希不符", "失败状态中文文案")
 
@@ -104,7 +109,8 @@ func runAll() {
     check(runArgs == ["run", "kali-arm64", "smoke"], "启动所选节点并保持固定顺序")
     let targetOnlyArgs = CliAction.run(nodes: [.basic]).arguments()
     check(targetOnlyArgs == ["run", "basic-pentesting-2"], "可只启动一个靶机")
-    let appendedArgs = CliAction.runProfiles(profileIDs: ["webserver", "smoke", "kali-arm64"]).arguments()
+    let appendedArgs = CliAction.runProfiles(profileIDs: ["webserver", "smoke", "kali-arm64"],
+                                               clipboard: false).arguments()
     check(appendedArgs == ["run", "kali-arm64", "smoke", "webserver"], "追加节点按稳定顺序启动")
     check(CliAction.stopProfiles(profileIDs: ["webserver"]).arguments() == ["stop", "webserver"],
           "可停止单个扩展节点")
@@ -167,6 +173,183 @@ func runAll() {
     check(status?.profiles.first?.running == true, "运行状态解析")
     check(status?.profiles.first?.logPath == "/tmp/log", "日志路径解析（snake_case 映射）")
     check(status?.profiles.last?.imported == false, "未导入状态解析")
+    check(status?.profiles.first?.boot == nil, "无 boot 字段的旧状态 JSON 仍可解析")
+
+    let bootStatusJSON = """
+    {"schema": 1, "state_dir": "/tmp/state", "profiles": [
+     {"id": "kali-arm64", "name": "Kali", "imported": true, "running": true, "pid": 42,
+      "boot": {"phase": "guest-boot", "phase_label": "系统引导", "overall": "booting",
+               "elapsed_seconds": 12, "readiness_timeout_seconds": 240,
+               "stages": [{"name": "process", "ok": true, "detail": "PID 42"},
+                          {"name": "guest-boot", "ok": true, "detail": "已出现来宾活动信号"},
+                          {"name": "display", "ok": false, "detail": "等待显示通道就绪"},
+                          {"name": "network", "ok": false, "detail": "健康检查未全部通过"}]}},
+     {"id": "smoke", "imported": false, "running": false}]}
+    """
+    let bootStatus = GuiParsing.decodeStatus(bootStatusJSON)
+    let boot = bootStatus?.profiles.first?.boot
+    check(boot?.phase == "guest-boot", "启动阶段 phase 解析")
+    check(boot?.phaseLabel == "系统引导", "启动阶段中文标签解析")
+    check(boot?.overall == "booting", "启动整体状态解析")
+    check(boot?.stages?.count == 4, "四阶段列表解析")
+    check(boot?.stages?.first { $0.name == "display" }?.ok == false, "显示阶段未就绪解析")
+    check(boot?.displayText.contains("系统引导（12s/240s）") == true, "阶段展示文案带计时")
+    check(boot?.isTimedOut == false, "booting 不标记超时")
+
+    let timeoutBootJSON = """
+    {"schema": 1, "state_dir": "/tmp/state", "profiles": [
+     {"id": "kali-arm64", "imported": true, "running": true, "pid": 42,
+      "boot": {"phase": "process", "phase_label": "进程启动", "overall": "timeout",
+               "elapsed_seconds": 300, "readiness_timeout_seconds": 240,
+               "stages": [], "diagnosis": {
+                   "message": "启动后 300s（就绪超时 240s）仍未就绪",
+                   "failed_checks": ["dhcp", "ssh:22"],
+                   "log_path": "/tmp/log", "client_log_path": "/tmp/client-log",
+                   "hint": "查看日志；stop 仅作用于该节点。"}}}]}
+    """
+    let timeoutBoot = GuiParsing.decodeStatus(timeoutBootJSON)?.profiles.first?.boot
+    check(timeoutBoot?.isTimedOut == true, "超时整体状态解析")
+    check(timeoutBoot?.displayText.contains("超时") == true, "超时展示带标记")
+    check(timeoutBoot?.diagnosis?.failedChecks == ["dhcp", "ssh:22"], "超时诊断失败项解析")
+    check(timeoutBoot?.diagnosis?.clientLogPath == "/tmp/client-log", "超时诊断客户端日志路径解析")
+
+    // 第 8 项：统一节点状态推导、搜索匹配与显示客户端列。
+    func statusProfile(id: String, imported: Bool = true, importState: String? = "registered",
+                       running: Bool = false, pid: Int? = nil, stalePid: Int? = nil,
+                       bootOverall: String? = nil, bootPhase: String? = nil) -> StatusProfile {
+        let boot: BootSummary? = bootOverall.map {
+            BootSummary(phase: bootPhase ?? "process", phaseLabel: bootPhase ?? "进程启动",
+                        overall: $0, elapsedSeconds: 5, readinessTimeoutSeconds: 240,
+                        stages: [], diagnosis: nil)
+        }
+        return StatusProfile(id: id, name: nil, builtin: false, imported: imported, importState: importState,
+                             sourcePath: nil, running: running, pid: pid, logPath: nil, baseSHA256: nil,
+                             stalePid: stalePid, boot: boot, spiceClient: nil)
+    }
+    check(NodeOperationalState.state(for: statusProfile(id: "a", imported: false,
+                                                        importState: "not-imported")) == .notImported,
+          "未导入节点状态")
+    check(NodeOperationalState.state(for: statusProfile(id: "a", imported: false,
+                                                        importState: "missing-base")) == .baseMissing,
+          "基盘失效节点状态")
+    check(NodeOperationalState.state(for: statusProfile(id: "a")) == .stopped, "已导入未运行状态")
+    check(NodeOperationalState.state(for: statusProfile(id: "a", running: true, pid: 7,
+                                                        bootOverall: "booting")) == .booting,
+          "启动中节点状态")
+    check(NodeOperationalState.state(for: statusProfile(id: "a", running: true, pid: 7,
+                                                        bootOverall: "ready",
+                                                        bootPhase: "network")) == .running,
+          "运行中节点状态")
+    check(NodeOperationalState.state(for: statusProfile(id: "a", running: true,
+                                                        bootOverall: "timeout")) == .timedOut,
+          "启动超时节点状态")
+    check(NodeOperationalState.state(for: statusProfile(id: "a", stalePid: 9)) == .stale,
+          "状态残留优先于其他判定")
+    check(NodeOperationalState.state(for: statusProfile(id: "a", running: true, pid: 7,
+                                                        bootOverall: "timeout")).isProblem,
+          "超时状态标记为问题")
+    check(NodeOperationalState.detailText(for: statusProfile(id: "a", running: true,
+                                                             bootOverall: "booting",
+                                                             bootPhase: "display")).contains("display"),
+          "启动中详情附带阶段标签")
+
+    check(NodeSearch.matches(statusProfile(id: "kali-arm64", imported: false,
+                                           importState: "not-imported"), query: "  "),
+          "空搜索匹配全部节点")
+    check(NodeSearch.matches(statusProfile(id: "basic-pentesting-2"), query: "BASIC"),
+          "搜索按 ID 大小写不敏感匹配")
+    check(NodeSearch.matches(statusProfile(id: "x"), query: "x"), "按显示名匹配未知节点")
+    check(!NodeSearch.matches(statusProfile(id: "smoke"), query: "kali"), "不匹配的搜索被过滤")
+    check(NodeSearch.filter([statusProfile(id: "kali-arm64"), statusProfile(id: "smoke")],
+                            query: "kali").count == 1, "过滤结果数量正确")
+
+    let clientJSON = """
+    {"schema": 1, "state_dir": "/tmp/state", "profiles": [
+     {"id": "kali-arm64", "imported": true, "running": true, "pid": 42,
+      "boot": {"phase": "display", "phase_label": "显示连接", "overall": "booting",
+               "elapsed_seconds": 6, "readiness_timeout_seconds": 240, "stages": []},
+      "spice_client": {"pid": 99, "alive": true, "display_ready": true}},
+     {"id": "smoke", "imported": false, "running": false, "spice_client": null}]}
+    """
+    let clientStatus = GuiParsing.decodeStatus(clientJSON)
+    check(clientStatus?.profiles.first?.spiceClient?.displayReady == true, "显示客户端 display_ready 解析")
+    check(clientStatus?.profiles.last?.spiceClient == nil, "非 SPICE 节点客户端列为空")
+    check(SpiceClientStatus.columnText(clientStatus?.profiles.first?.spiceClient) == "已连接",
+          "客户端列文案：已连接")
+    check(SpiceClientStatus.columnText(nil) == "—", "客户端列文案：非 SPICE 显示 —")
+    let connecting = SpiceClientStatus(pid: 9, alive: true, displayReady: false)
+    check(SpiceClientStatus.columnText(connecting) == "连接中", "客户端列文案：连接中")
+    let dead = SpiceClientStatus(pid: 9, alive: false, displayReady: false)
+    check(SpiceClientStatus.columnText(dead) == "未连接", "客户端列文案：未连接")
+    check(SpiceClientStatus.columnText(SpiceClientStatus(pid: 9, alive: false,
+                                                       displayReady: true)) == "未连接",
+          "客户端已退出时历史就绪不能覆盖未连接")
+    let closedDisplayJSON = """
+    {"profiles":[{"id":"kali-arm64","imported":true,"running":true,"pid":42,
+      "spice_client":{"pid":99,"alive":false,"display_ready":false}}]}
+    """
+    if let closedProfile = GuiParsing.decodeStatus(closedDisplayJSON)?.profiles.first {
+        check(DisplaySessionGuidance.message(for: closedProfile)?.contains("虚拟机仍在运行") == true,
+              "显示退出提示保留虚拟机运行事实")
+        check(DisplaySessionGuidance.actionTitle(for: closedProfile) == "重新打开显示窗口",
+              "显示退出按钮提供恢复而不是重启")
+        check(DisplaySessionGuidance.canReconnect(closedProfile), "运行中的 SPICE 节点可显式重连")
+        check(DisplaySessionGuidance.loginHelp(for: closedProfile)?.contains("Kali User") == true,
+              "Kali 登录说明区分显示名称")
+        check(DisplaySessionGuidance.sleepHelp(for: closedProfile)?.contains("不能保证唤醒来宾") == true,
+              "重开显示不能被宣称为唤醒来宾")
+        check(DisplaySessionGuidance.sleepHelp(for: statusProfile(id: "smoke")) == nil,
+              "Kali 睡眠边界不套用其他靶机")
+    } else { check(false, "恢复提示测试 JSON 必须成功解码") }
+    if let connectedProfile = clientStatus?.profiles.first {
+        check(DisplaySessionGuidance.message(for: connectedProfile)?.contains("不代表已登录") == true,
+              "已连接不能误报来宾已登录")
+        check(DisplaySessionGuidance.actionTitle(for: connectedProfile) == "打开显示窗口",
+              "已有客户端保持打开窗口动作")
+    }
+    check(DisplaySessionGuidance.message(for: statusProfile(id: "a")) == nil,
+          "已停止节点不显示仍运行提示")
+    check(!DisplaySessionGuidance.canReconnect(statusProfile(id: "a")), "停止或无 SPICE 的节点不提供重连按钮")
+    check(DisplaySessionGuidance.loginHelp(for: statusProfile(id: "smoke")) == nil,
+          "靶机不展示 Kali 登录说明")
+
+    var library = NodeLibraryPreferences()
+    let resourceJSON = """
+    {"memory_mb": 2048, "cpus": 2, "cpu_percent": 130.5, "rss_mb": 600.2, "acceleration": "hvf"}
+    """
+    let resourceStatus = try! JSONDecoder().decode(NodeResourceStatus.self, from: Data(resourceJSON.utf8))
+    check(resourceStatus.memoryMB == 2048 && resourceStatus.cpus == 2 && resourceStatus.cpuPercent == 130.5,
+          "资源状态解析保留实际配置和多核 CPU 口径")
+    let unknownResource = try! JSONDecoder().decode(NodeResourceStatus.self, from: Data("{}".utf8))
+    check(unknownResource.rssMB == nil && unknownResource.cpuPercent == nil,
+          "资源采样未知不转换为零")
+    library.favorites.insert("smoke")
+    library.setGroup("  Web 课程  ", for: "smoke")
+    check(library.groups["smoke"] == "Web 课程", "分组去首尾空格保留内部空格")
+    library.lastUsed["kali-arm64"] = Date(timeIntervalSince1970: 100)
+    let savedCourse = NodeCourse(name: "  教学  ", profileIDs: ["smoke", "smoke", "kali-arm64"])
+    library.courses.append(savedCourse)
+    check(savedCourse.name == "教学" && savedCourse.profileIDs.count == 2, "课程名称与节点去重")
+    let libraryData = try! JSONEncoder().encode(library)
+    check((try! JSONDecoder().decode(NodeLibraryPreferences.self, from: libraryData)) == library,
+          "收藏分组最近记录与课程持久化往返")
+    let libraryNodes = [statusProfile(id: "kali-arm64"), statusProfile(id: "smoke")]
+    check(library.ordered(libraryNodes, recentFirst: true).first?.id == "smoke", "收藏优先于最近使用")
+    library.favorites.removeAll()
+    check(library.ordered(libraryNodes, recentFirst: true).first?.id == "kali-arm64", "最近使用优先")
+    check((try! CourseLaunchRules.pending(savedCourse, profiles: libraryNodes)).count == 2,
+          "课程组合生成已导入待启动节点")
+    check((try! CourseLaunchRules.pending(savedCourse, profiles: [statusProfile(id: "kali-arm64", running: true),
+                                                               statusProfile(id: "smoke")])) == ["smoke"],
+          "课程组合跳过已运行节点")
+    do {
+        _ = try CourseLaunchRules.pending(savedCourse, profiles: [statusProfile(id: "smoke")])
+        check(false, "缺失课程节点必须拒绝")
+    } catch { check(true, "缺失课程节点不部分执行") }
+    do {
+        _ = try CourseLaunchRules.pending(NodeCourse(name: "", profileIDs: ["smoke"]), profiles: libraryNodes)
+        check(false, "空名称组合必须拒绝")
+    } catch { check(true, "拒绝空名称组合") }
 
     let healthJSON = """
     {"schema": 1, "profile": "kali-arm64", "ok": false,
@@ -261,6 +444,101 @@ check(!AppLayout.cliRelativePath.hasPrefix("/"), "CLI 相对路径不得以 / �
 
     try? FileManager.default.removeItem(at: tempDir)
 
+    // MARK: 登记标签去重（同名登记附 ID）与镜像文件夹扫描
+
+    check(LabNode.displayLabel(for: "kali-arm64") == "Kali Linux ARM64（kali-arm64）",
+          "已知课程节点显示名附 ID")
+    check(LabNode.displayLabel(for: "unnamed-node") == "unnamed-node",
+          "登记名与 ID 相同时不加后缀")
+    check(LabNode.displayLabel(for: "kali-arm64", name: "Webserver") == "Webserver（kali-arm64）",
+          "登记名与 ID 不同时附 ID")
+    check(LabNode.displayLabel(for: "webserver-e2e", name: "Webserver") == "Webserver（webserver-e2e）",
+          "历史同名登记通过 ID 后缀区分")
+
+    let scanDir = URL(fileURLWithPath: NSTemporaryDirectory())
+        .appendingPathComponent("ctflab gui scan test")
+    try? FileManager.default.createDirectory(at: scanDir, withIntermediateDirectories: true)
+    for name in ["b.vmdk", "a.QCOW2", "notes.txt", "c.ova"] {
+        FileManager.default.createFile(atPath: scanDir.appendingPathComponent(name).path,
+                                       contents: Data([0x01]))
+    }
+    let scanned = ImageFolderScanner.scan(scanDir.path)
+    check(scanned.map(\.fileName) == ["a.QCOW2", "b.vmdk", "c.ova"],
+          "只扫描支持的镜像扩展名并按名称排序")
+    check(ImageFolderScanner.scan("/definitely/not/exist/ctflab") == [],
+          "不存在的目录返回空（空文件夹为合法状态）")
+    try? FileManager.default.removeItem(at: scanDir)
+
+    check(CliAction.deregisterProfile(profileID: "webserver-e2e").arguments()
+          == ["deregister", "webserver-e2e"], "移除登记命令拼接")
+
+    check(CliAction.runProfiles(profileIDs: ["kali-arm64"], clipboard: true).arguments()
+          == ["run", "kali-arm64", "--clipboard"], "剪贴板共享打开时附加 --clipboard")
+    check(CliAction.runProfiles(profileIDs: ["kali-arm64"], clipboard: false,
+                                displayQuality: "smooth").arguments()
+          == ["run", "kali-arm64", "--display-quality", "smooth"], "清晰度参数透传")
+    check(CliAction.onboardAuto(sourcePath: "/tmp/a/kali-base.qcow2", profileID: "kali-base")
+          .arguments() == ["onboard", "/tmp/a/kali-base.qcow2", "--id", "kali-base"],
+          "自动导入不带架构参数（由 inspect 推断）")
+    check(ImageOnboardingRules.availableProfileID(sourcePath: "/tmp/smoke.qcow2",
+          existingIDs: ["smoke"]) == "smoke-2", "仅登记同名节点不隐藏新来源")
+    check(ImageOnboardingRules.availableProfileID(sourcePath: "/tmp/smoke.vmdk",
+          existingIDs: ["smoke", "smoke-2"]) == "smoke-3", "同批导入 ID 不重复")
+    check(ImageOnboardingRules.validProfileID(ImageOnboardingRules.availableProfileID(
+          sourcePath: "/tmp/" + String(repeating: "a", count: 49) + ".qcow2",
+          existingIDs: [String(repeating: "a", count: 49)])), "碰撞后 ID 仍在长度边界内")
+    check(CliAction.runProfiles(profileIDs: ["kali-arm64"], clipboard: false,
+          fileTransfer: true).arguments() == ["run", "kali-arm64", "--file-transfer"],
+          "文件传输不隐式开启剪贴板")
+    let pendingNodes = try! JSONDecoder().decode(StatusReport.self, from: Data("""
+      {"profiles":[{"id":"smoke","imported":false,"running":false},
+        {"id":"old","imported":true,"running":false,"source_path":"/tmp/old.qcow2"}],
+        "state_dir":"/tmp/state"}
+      """.utf8)).profiles
+    let pendingFiles = [ImageLibraryEntry(fileName: "smoke.qcow2", path: "/tmp/smoke.qcow2", sizeBytes: 1),
+                        ImageLibraryEntry(fileName: "old.qcow2", path: "/tmp/old.qcow2", sizeBytes: 1)]
+    check(ImageOnboardingRules.pendingImages(pendingFiles, nodes: pendingNodes).map(\.fileName)
+          == ["smoke.qcow2"], "仅过滤已导入来源，不过滤未导入的登记 ID")
+    check(CliAction.removeImage(profileID: "smoke").arguments() == ["remove", "smoke"],
+          "删除镜像命令拼接")
+
+    let builtinStatusJSON = """
+    {"profiles": [{"id": "webserver", "name": "Webserver", "builtin": true,
+                   "imported": false, "running": false},
+                  {"id": "webserver-e2e", "name": "Webserver", "builtin": false,
+                   "imported": false, "running": false}], "state_dir": "/tmp/x"}
+    """
+    if let data = builtinStatusJSON.data(using: .utf8),
+       let report = try? JSONDecoder().decode(StatusReport.self, from: data) {
+        check(report.profiles.count == 2, "状态报告解析两个登记")
+        check(report.profiles.first { $0.id == "webserver" }?.builtin == true,
+              "内置课程包 builtin 标记可解析")
+        check(report.profiles.first { $0.id == "webserver-e2e" }?.builtin == false,
+              "用户登记 builtin=false 可解析")
+    } else {
+        check(false, "状态报告 builtin 字段解析失败")
+    }
+
+    check(RecoveryRules.validName("before-1") && !RecoveryRules.validName("../bad"), "恢复点名称拒绝路径")
+    check(RecoveryRules.validName(RecoveryRules.checkpointName()), "自动保护点名称合法")
+    check(CliAction.snapshot(profileID: "smoke", operation: "list").arguments()
+          == ["snapshot", "list", "smoke", "--json"], "恢复点列表使用 JSON")
+    let backupArgs = CliAction.backupReset(profileID: "smoke").arguments()
+    check(backupArgs.count == 4 && RecoveryRules.validName(backupArgs[3]), "备份重置附安全名称")
+    let stableBackup = CliAction.backupReset(profileID: "smoke")
+    check(stableBackup.arguments() == stableBackup.arguments(), "备份命令与日志使用同一名称")
+    check(CliAction.showDisplay(profileID: "smoke").arguments() == ["show", "smoke"], "打开显示不会拼接 run")
+    check(CliAction.reconnectDisplay(profileID: "kali-arm64").arguments() == ["show", "kali-arm64", "--reconnect"], "卡住恢复仅重连显示")
+    check(CliAction.runProfiles(profileIDs: ["kali-arm64"], clipboard: false, resourcePreset: "light")
+          .arguments().suffix(2) == ["--resource-preset", "light"], "资源档位与显示权限独立")
+    check(NodeStatusFilter.active.matches(statusProfile(id: "smoke", running: true)), "运行状态筛选")
+    check(!NodeStatusFilter.active.matches(statusProfile(id: "smoke")), "不运行的节点不混入运行筛选")
+    check(NodeStatusFilter.problems.matches(statusProfile(id: "smoke", imported: false, importState: "missing-base")), "基盘失效仍可被问题筛选找到")
+    check(CliAction.preflight(profileID: "kali-arm64", resourcePreset: "light").arguments() == ["preflight", "kali-arm64", "--resource-preset", "light"], "预检保留选中节点资源档位")
+    check(CliAction.displayDiagnose(profileID: "smoke").arguments() == ["display-diagnose", "smoke"], "诊断只针对选中节点")
+    check(CliAction.updateRollback.arguments() == ["update", "rollback"], "回退不混入停止或重置命令")
+    let failedPreflight = PreflightReport.decode("启动失败\n{\"ok\":false,\"checks\":[{\"name\":\"disk\",\"ok\":false,\"detail\":\"旧基盘\",\"hint\":\"先备份\"}]}")
+    check(failedPreflight?.guidance.contains("先备份") == true, "错误包装后的预检提示可读")
     print("---")
     print("共 \(checkCount) 项检查，失败 \(failureCount) 项")
     exit(failureCount == 0 ? 0 : 1)

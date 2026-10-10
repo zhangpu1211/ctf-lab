@@ -62,8 +62,52 @@ ctflab run kali-arm64                           # 3) 启动 Kali（默认联网�
 ./tools/ctflab reset smoke
 ```
 
+### 快照、重置备份与存储清单
+
+2026-10-08 复核修正：重置前备份保留整个实例（包括快照配对 NVRAM）。
+恢复备份时，原实例自动另存为 `before-restore-*` 备份，不静默丢弃。
+有整盘备份依赖时禁止删除基础镜像；确认不再需要的备份可用
+`./tools/ctflab snapshot delete-backup smoke 备份名` 明确删除（不可恢复）。
+缺少配对 NVRAM 的快照会在恢复磁盘前拒绝，而不是返回半恢复成功。
+
+文本共享与文件写入独立授权：`run kali-arm64 --clipboard` 只共享文本；
+`run kali-arm64 --file-transfer` 只允许从 Mac 拖入文件到 Kali 的 SPICE 窗口。
+两个选项默认关闭，GUI 也提供分开的开关。文件传输不能在 Cocoa 中静默启用，
+且当前没有来宾→宿主文件传输功能。完整文件拖放与已登录桌面剪贴板仍需交互验收。
+
+节点停止后可对运行 overlay 建命名快照（基础镜像只读、不受影响；快照连同 NVRAM
+副本存放在节点运行目录内，普通 `reset` 会一并丢弃）：
+
+```bash
+./tools/ctflab snapshot create smoke lab-1     # 建快照（含 NVRAM 副本）
+./tools/ctflab snapshot list smoke             # 列出（NVRAM✓ 表示配对完整）
+./tools/ctflab snapshot revert smoke lab-1     # 回到快照（当前实例改动丢弃）
+./tools/ctflab snapshot delete smoke lab-1
+
+./tools/ctflab reset smoke --backup before-class   # 重置前整盘备份（overlay+NVRAM 移入备份区）
+./tools/ctflab snapshot list-backups smoke
+./tools/ctflab snapshot restore-backup smoke before-class
+```
+
+`./tools/ctflab storage`（或 `--json`）只读列出各节点基础镜像/overlay 占用、
+backing chain 完整性、快照与整盘备份清单，以及运行中节点对基础镜像的引用，
+供清理决策；当前版本不做自动清理。快照与备份操作只作用于已停止的节点，
+运行中会明确拒绝。
+
 自动探测输出的是候选，不是启动保证。磁盘文件通常无法可靠提供客体 CPU 架构、来宾网卡名、登录状态和服务清单；低置信度字段必须核对来源，probe 截图也必须排除 UEFI Shell 或错误画面。`onboard` 生成的候选配置写入用户状态目录
 `~/Library/Application Support/CTFLab/profiles/`，不会改写内置课程 profile 或 `.app` 本体；回退矩阵的命中只对本次探测有效，需人工复核后才可固化。
+VMDK/OVA 导入链路：`inspect` 与 `import` 支持 VMDK/QCOW2/VDI/VHD/VHDX 与 OVA 安全解包（拒绝越界成员路径）；OVA 含多磁盘时 inspect 默认取第一个并警告，
+`import`/`onboard` 必须用 `--disk <文件名>` 显式选择系统盘（不猜测），导入登记记录选盘与磁盘总数；导入输出含基盘实际/虚拟占用。
+
+### 实验网只读视图
+
+```bash
+./tools/ctflab network            # 或 --json：各节点策略/端口映射/实验网交换机与流量计数
+```
+
+并排展示 profile 声明策略与运行实际：segment、实验 IP、网卡、Kali 默认 user-mode NAT
+（实验网仍经回环交换机隔离）、端口映射、交换机客户端/MAC/收发计数与残留实例。
+靶机运行时联网与声明不一致会明确标记；本视图只读，不做任何变更。
 
 ## 图形入口
 
@@ -134,3 +178,21 @@ python3 -m py_compile tools/ctflab.py tools/ctflab_inspect.py tools/ctflab_netwo
 - 在线元数据不能传入任意 QEMU 参数；
 - 虚拟磁盘、默认凭据和运行日志不得提交到本仓库；
 - 只有完成冷启动、显示/登录、网络、重启与目标服务验证的镜像，才能标记为已验证交付。
+# 日常操作补充（2026-10-08）
+
+2026-10-09 新增[六项稳定性与本地更新实施记录](docs/verification-stability-2026-10-09.md)：
+显示诊断、输入释放、启动预检、状态筛选与本地更新槽位已实现；人工闲置
+恢复与界面点击验收不因代码完成而标为通过。本地更新不覆盖系统安装或镜像。
+
+- 节点状态自动刷新：运行时约 3 秒，全部停止时约 15 秒；启动阶段依据运行器信号，不使用虚构百分比。
+- 运行中节点的“打开显示窗口”复用现有窗口或重连 SPICE，不重启虚拟机、不重置实验。Cocoa 窗口关闭若已导致节点退出，需要重新启动；不能恢复已停止进程的内存状态。
+- SPICE 画面卡住但节点仍运行时，使用“重连显示”，或 `./tools/ctflab show kali-arm64 --reconnect`：只重建显示连接，保留来宾会话和共享授权。Cocoa 不显示该按钮，也不会以重启冒充恢复。
+- 停止后的节点可进入“快照与备份”：快照恢复前自动保存保护快照；整盘恢复保留当前实例；删除操作须确认且不能撤销。
+- Kali 资源档位在“更多”中选择，只影响下一次启动：沿用原配置、轻量（2GiB/2核）、均衡（4GiB/4核）、性能（8GiB/4核）。没有跨软件性能提升保证；内存预检仍会拒绝超配。
+- [资源档位启动基准与候选交付复核（2026-10-09）](docs/verification-startup-presets-2026-10-09.md)：每档两轮 DHCP/SSH 就绪基线已记录，不作为桌面流畅度或闲置恢复通过结论。
+- 节点支持收藏、分组与最近使用排序；“课程组合”保存已导入节点的组合，确认后逐台启动未运行节点，中途失败保留已启动节点，不自动回滚。默认启动/停止仍只操作选中节点。
+- 导入过程中可“停止后续导入”：当前镜像安全处理完后停止，已完成节点保留；不是立即中断当前转换。
+- 详情显示本次配置与宿主 QEMU 进程的 CPU/RSS；停止后显示下次默认配置。CPU 可超过 100%，RSS 不是来宾内存压力，采样失败显示未知。
+- 文本剪贴板与拖入文件各自授权，默认关闭；清晰/流畅偏好不影响输入坐标策略。
+- “更多 → 导出脱敏诊断”保存状态与少量日志；路径可能包含个人信息，请检查后再分享，不覆盖已有文件。
+- Kali 睡眠恢复尚未通过验收，暂用锁定屏幕或正常关机。提供可撤销的[睡眠避险工具与验证步骤](docs/ctflab-kali-sleep-guard.md)，需在派生来宾内显式应用，默认不会安装；不关闭锁屏，也不把防护称为唤醒支持。

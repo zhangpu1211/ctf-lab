@@ -233,6 +233,10 @@ class AppTestCase(unittest.TestCase):
         cls._class_temp.cleanup()
 
     def setUp(self) -> None:
+        # 模拟 App 使用固定版本；真实发布版本由 CLI 与实际构建验收。
+        version_patch = mock.patch.object(ctflab_app, "ctflab_version", return_value="0.1.0")
+        version_patch.start()
+        self.addCleanup(version_patch.stop)
         self.temp = tempfile.TemporaryDirectory()
         self.out = pathlib.Path(self.temp.name) / "out"
 
@@ -257,6 +261,26 @@ class AppTestCase(unittest.TestCase):
 
 
 class StructureTests(AppTestCase):
+    def test_native_display_bundle_and_runtime_references(self) -> None:
+        result = self.build(spice_client=self.fake_runtime / "bin" / "qemu-img")
+        app = pathlib.Path(result["app"])
+        binary = app / ctflab_app.DISPLAY_EXECUTABLE_REL
+        self.assertTrue(binary.is_file())
+        info = plistlib.loads((app / ctflab_app.DISPLAY_BUNDLE_REL / "Contents/Info.plist").read_bytes())
+        self.assertEqual(info["CFBundleIdentifier"], "local.ctflab.display")
+        self.assertEqual(info["CFBundleExecutable"], "spicy")
+        self.assertEqual(result["manifest"]["runtime"]["spice_client"], ctflab_app.DISPLAY_EXECUTABLE_REL)
+        self.assertEqual(ctflab_app.verify_runtime_references(app), [])
+        component = next(item for item in result["sbom"]["components"] if item.get("name") == "spicy")
+        self.assertIn(ctflab_app.DISPLAY_EXECUTABLE_REL, [entry["file"] for entry in component["binaries"]])
+        ctflab_app.verify_app(app)
+
+    def test_native_display_bundle_signature(self) -> None:
+        result = self.build(spice_client=self.fake_runtime / "bin" / "qemu-img", unsigned=False)
+        app = pathlib.Path(result["app"])
+        self.assertEqual(ctflab_app.codesign_verify(app / ctflab_app.DISPLAY_BUNDLE_REL)["verify_returncode"], 0)
+        ctflab_app.verify_app(app)
+
     def test_required_structure_and_info_plist(self) -> None:
         result = self.build()
         app = pathlib.Path(result["app"])
@@ -312,6 +336,22 @@ class StructureTests(AppTestCase):
 
 
 class RuntimeClosureTests(AppTestCase):
+    def test_loader_relative_source_runtime_can_be_rebundled(self) -> None:
+        source = pathlib.Path(self.temp.name) / "relocated-runtime"
+        shutil.copytree(self.fake_runtime, source)
+        libraries = {path.name: path for path in (source / "lib").iterdir()}
+        binaries = [source / "bin" / name for name in ctflab_app.QEMU_BINARIES]
+        ctflab_app._rewrite_install_names(binaries, libraries)
+        # install_name_tool 修改了来源签名，先重签才能运行版本探测。
+        for path in [*libraries.values(), *binaries]:
+            ctflab_app.codesign_path(path, "-")
+        result = self.build(qemu_root=source)
+        app = pathlib.Path(result["app"])
+        ctflab_app.verify_app(app, check_signature=False)
+        binary = app / ctflab_app.RUNTIME_REL / "bin/qemu-img"
+        output = subprocess.run([str(binary)], check=True, capture_output=True, text=True)
+        self.assertEqual(output.stdout.strip(), "42")
+
     def test_dylib_closure_copied_inside_app(self) -> None:
         result = self.build()
         app = pathlib.Path(result["app"])

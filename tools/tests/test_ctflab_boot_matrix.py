@@ -140,6 +140,30 @@ class BootMatrixTests(unittest.TestCase):
         self.assertFalse(result["succeeded"])
         self.assertEqual(len(result["attempts"]), 1)
 
+    def test_pxe_screen_never_counts_as_bootable(self) -> None:
+        """2026-09-25 WebServer 回归：PXE 启动画面不得被矩阵选为磁盘启动成功。
+
+        真实样本里 QEMU 在运行、画面非黑且 DHCP 正常；旧逻辑下该候选曾被
+        network_and_display_candidate 语义接受。现在 PXE 属失败类，应立即
+        换下一个候选且不产生 selected。
+        """
+        result = self.run_matrix([("pxe_network_boot", "pxe_network_boot")],
+                                 max_candidates=1)
+        self.assertFalse(result["succeeded"])
+        self.assertIsNone(result["selected"])
+        attempt = result["attempts"][0]
+        self.assertEqual(attempt["verdict"], "pxe_network_boot")
+        self.assertEqual(attempt["screen"], "pxe_network_boot")
+        self.assertEqual(attempt["early_failure"], "pxe_network_boot")
+
+    def test_unknown_display_with_dhcp_continues_matrix(self) -> None:
+        result = self.run_matrix([
+            ("network_and_display_candidate", "unknown"),
+            ("display_activity_only", "login_ready"),
+        ])
+        self.assertEqual(len(result["attempts"]), 2)
+        self.assertEqual(result["selected"]["label"], "bios/ide")
+
 
 class X86UefiCommandTests(unittest.TestCase):
     def test_x86_uefi_uses_ovmf_pflash(self) -> None:

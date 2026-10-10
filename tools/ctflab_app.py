@@ -44,7 +44,7 @@ GUI_SOURCES = ("GuiCore.swift", "GuiApp.swift")
 GUI_MIRROR_EXTRA = ("GuiCoreTests.swift",)
 # 产品与随包运行时统一以 macOS 26.0 为最低目标，避免 GUI 与 Info.plist/运行时出现相互矛盾的门槛。
 GUI_TARGET = "arm64-apple-macos26.0"
-CTFLAB_VERSION_FALLBACK = "0.1.0"
+CTFLAB_VERSION_FALLBACK = "0.1.1"
 BUNDLE_IDENTIFIER = "local.ctflab.app"
 RUNTIME_REL = "Contents/Resources/runtime"
 CTFLAB_REL = "Contents/Resources/ctflab"
@@ -112,6 +112,9 @@ MIN_BUNDLED_MACOS = "26.0"
 MIN_BUNDLED_MACOS_VERSION = (26, 0)
 # 外置 SPICE 客户端是可选运行时；未提供时保留默认 Cocoa App，显式请求 SPICE 会被 CLI 拒绝。
 SPICE_CLIENT_NAME = "spicy"
+DISPLAY_BUNDLE_REL = f"{RUNTIME_REL}/CTFLabDisplay.app"
+DISPLAY_EXECUTABLE_REL = f"{DISPLAY_BUNDLE_REL}/Contents/MacOS/{SPICE_CLIENT_NAME}"
+DISPLAY_BUNDLE_IDENTIFIER = "local.ctflab.display"
 # 只随包实际需要的固件/ROM/keymaps（aarch64 virt UEFI + x86_64 pc BIOS/UEFI 与三种网卡）。
 QEMU_SHARE_FILES = (
     "edk2-aarch64-code.fd",   # aarch64 virt 的 UEFI 固件代码
@@ -984,6 +987,39 @@ def _rewrite_install_names(binaries: Iterable[Path], libs: dict[str, Path]) -> N
                 _run_tool(["install_name_tool", "-delete_rpath", rpath, str(path)], check=False)
 
 
+def build_display_bundle(app: Path, version: str, identity: str | None,
+                         entitlements: dict[str, Any] | None) -> Path:
+    """把同一客户端置于原生应用包；闭包继续复用 app 内 runtime/lib，不引入宿主依赖。"""
+    bundle = app / DISPLAY_BUNDLE_REL
+    binary = app / DISPLAY_EXECUTABLE_REL
+    binary.parent.mkdir(parents=True)
+    shutil.copy2(app / RUNTIME_REL / "bin" / SPICE_CLIENT_NAME, binary)
+    for dep in otool_deps(binary):
+        if dep.startswith("@loader_path/../lib/"):
+            _run_tool(["install_name_tool", "-change", dep,
+                       "@loader_path/../../../lib/" + Path(dep).name, str(binary)])
+        else:
+            _expect(is_system_library(dep), f"显示应用存在未知依赖：{dep}")
+    (bundle / "Contents/Info.plist").write_bytes(plistlib.dumps({
+        "CFBundleExecutable": SPICE_CLIENT_NAME,
+        "CFBundleIdentifier": DISPLAY_BUNDLE_IDENTIFIER,
+        "CFBundleName": "CTFLab 显示",
+        "CFBundleDisplayName": "CTFLab 显示",
+        "CFBundleInfoDictionaryVersion": "6.0",
+        "CFBundlePackageType": "APPL",
+        "CFBundleShortVersionString": version,
+        "CFBundleVersion": version,
+        "LSMinimumSystemVersion": MIN_BUNDLED_MACOS,
+        "NSHighResolutionCapable": True,
+    }))
+    if identity is not None:
+        sign_with_entitlements(binary, identity, entitlements)
+        codesign_path(bundle, identity)
+        _expect((read_entitlements(binary) or {}) == (entitlements or {}),
+                "显示应用重签名后 entitlements 不一致。")
+    return binary
+
+
 def _iter_manifest_files(app_root: Path) -> list[Path]:
     """清单覆盖除代码签名自身产物之外的所有文件。
 
@@ -1296,7 +1332,8 @@ def build_app(
         copied_share = copy_qemu_share(qemu_root, runtime_share, share_files)
 
         # 4) 动态库闭包与 install_name 改写
-        libs_sources = collect_dylib_closure([runtime_bin / name for name in runtime_binary_sources])
+        # 必须从来源位置解析相对依赖；副本旁的 lib 此时仍为空。
+        libs_sources = collect_dylib_closure(runtime_binary_sources.values())
         for name, source in sorted(libs_sources.items()):
             shutil.copy2(source, runtime_lib / name)
             (runtime_lib / name).chmod(0o755)
@@ -1329,7 +1366,7 @@ def build_app(
             # 断言：源二进制的能力（例如 com.apple.security.hypervisor）必须在副本上保留，
             # 否则 HVF 会在启动时拒绝创建 VGIC（HV_NO_DEVICE）。
             for name, expected in source_entitlements.items():
-                directory = runtime_bin if name in QEMU_BINARIES else runtime_lib
+                directory = runtime_bin if name in runtime_binary_sources else runtime_lib
                 actual = read_entitlements(directory / name) or {}
                 _expect(actual == expected,
                         f"{name} 重签名后的 entitlements 与源二进制不一致"
@@ -1341,6 +1378,12 @@ def build_app(
             actual = read_entitlements(directory / name)
             if actual:
                 bundled_entitlements[name] = actual
+
+        display_binary = None
+        if spice_client is not None:
+            display_binary = build_display_bundle(temp_app, version,
+                                                   None if unsigned else sign_identity or "-",
+                                                   source_entitlements.get(SPICE_CLIENT_NAME))
 
         # 6) 许可证文本与合规文件（licenses/ 已在 4.5 创建：PyYAML 许可证已就位）
         import ctflab_package  # noqa: PLC0415  函数内导入，避免循环依赖
@@ -1410,6 +1453,15 @@ def build_app(
                           vendored_index=vendored_index, source_offer=offer_meta,
                           python_meta=python_meta, pyyaml_meta=pyyaml_meta,
                           spice_client=spice_client)
+        if display_binary is not None:
+            client_component = next(item for item in sbom["components"] if item.get("name") == "spicy")
+            client_component["binaries"].append({
+                "file": DISPLAY_EXECUTABLE_REL,
+                "sha256": sha256_file(display_binary),
+                "source_sha256": sha256_file(spice_client),
+                "bundled": True,
+                "license": KNOWN_LICENSES["spice-gtk"],
+            })
         (resources / "SBOM.json").write_text(json.dumps(sbom, ensure_ascii=False, indent=2) + "\n",
                                              encoding="utf-8")
         (resources / "THIRD_PARTY_LICENSES.md").write_text(third_party_markdown(sbom), encoding="utf-8")
@@ -1442,8 +1494,9 @@ def build_app(
                 "minimum_macos": MIN_BUNDLED_MACOS,
                 "dylibs": sorted(libs_sources),
                 "binaries": list(runtime_binary_sources),
-                "spice_client": (f"{RUNTIME_REL}/bin/{SPICE_CLIENT_NAME}"
+                "spice_client": (DISPLAY_EXECUTABLE_REL
                                   if spice_client is not None else None),
+                "display_bundle": DISPLAY_BUNDLE_REL if spice_client is not None else None,
                 "share_files": copied_share,
                 "qemu_version": _qemu_version(qemu_root / "bin" / "qemu-system-aarch64"),
                 "source": qemu_source_description(qemu_root),
@@ -1560,9 +1613,10 @@ def verify_runtime_references(app: Path) -> list[str]:
     macho_files += [p for p in (runtime / "lib").iterdir() if p.is_file()]
     # 内置 Python 运行时：解释器与扩展模块同样纳入引用检查（递归、按 Mach-O 魔数筛选）。
     macho_files += iter_macho_files(runtime / "python")
+    macho_files += iter_macho_files(app / DISPLAY_BUNDLE_REL)
     allowed_roots = [(runtime / "lib").resolve(), (runtime / "python").resolve()]
     for path in macho_files:
-        if path.parent == runtime / "bin":
+        if path.parent == runtime / "bin" or path == app / DISPLAY_EXECUTABLE_REL:
             minimum = macho_minimum_os(path)
             if minimum is None:
                 problems.append(f"{path.name}: 无法读取 Mach-O 最低 macOS 版本")
@@ -1703,13 +1757,21 @@ def verify_app(app_path: Path, *, check_signature: bool = True) -> dict[str, Any
             "MANIFEST.runtime.binaries 必须是字符串数组。")
     spice_client_rel = runtime_section.get("spice_client")
     if spice_client_rel is not None:
-        _expect(spice_client_rel == f"{RUNTIME_REL}/bin/{SPICE_CLIENT_NAME}",
+        _expect(spice_client_rel in {f"{RUNTIME_REL}/bin/{SPICE_CLIENT_NAME}", DISPLAY_EXECUTABLE_REL},
                 "MANIFEST.runtime.spice_client 必须指向内置 spicy。")
         spice_client_path = app_path / spice_client_rel
         _expect(spice_client_path.is_file() and os.access(spice_client_path, os.X_OK),
                 "MANIFEST.runtime.spice_client 缺失或不可执行。")
         _expect(SPICE_CLIENT_NAME in runtime_binaries,
                 "MANIFEST.runtime.binaries 必须登记内置 spicy。")
+        if spice_client_rel == DISPLAY_EXECUTABLE_REL:
+            _expect(runtime_section.get("display_bundle") == DISPLAY_BUNDLE_REL,
+                    "显示应用包必须登记固定路径。")
+            info = plistlib.loads((app_path / DISPLAY_BUNDLE_REL / "Contents/Info.plist").read_bytes())
+            _expect(info.get("CFBundleIdentifier") == DISPLAY_BUNDLE_IDENTIFIER
+                    and info.get("CFBundleExecutable") == SPICE_CLIENT_NAME
+                    and info.get("LSMinimumSystemVersion") == MIN_BUNDLED_MACOS,
+                    "显示应用标识、入口或最低系统版本不一致。")
     runtime_entitlements = runtime_section.get("entitlements", {})
     _expect(isinstance(runtime_entitlements, dict),
             "MANIFEST.runtime.entitlements 必须是字典。")

@@ -15,18 +15,21 @@ import gzip
 import hashlib
 import ipaddress
 import json
+import math
 import os
 from pathlib import Path
 import platform
 import re
 import shutil
 import signal
+import secrets
 import socket
 import subprocess
 import sys
 import tarfile
 import tempfile
 import time
+import uuid
 from datetime import datetime, timezone
 from typing import Any, Iterable, Iterator, TextIO
 import urllib.error
@@ -49,7 +52,7 @@ BUILTIN_PROFILE_DIR = PROJECT_ROOT / "tools" / "ctflab_profiles"
 PROFILE_DIR = BUILTIN_PROFILE_DIR
 DEFAULT_STATE_DIR = Path.home() / "Library" / "Application Support" / "CTFLab"
 # 版本是打包（Task 6.1）、内容包版本门禁与 SBOM 的单一来源。
-CTFLAB_VERSION = "0.1.0"
+CTFLAB_VERSION = "0.1.1"
 # 最低 Python 版本（与 tools/ctflab_package.py 的 MIN_PYTHON 一致；doctor 实际校验）。
 MIN_PYTHON = (3, 10)
 QEMU_X86_NAMES = ("qemu-system-x86_64",)
@@ -144,6 +147,9 @@ def spice_client_path() -> str | None:
             return str(candidate)
     root = runtime_root()
     if root is not None:
+        candidate = root / "CTFLabDisplay.app/Contents/MacOS/spicy"
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
         for name in SPICE_CLIENT_NAMES:
             candidate = root / "bin" / name
             if candidate.is_file() and os.access(candidate, os.X_OK):
@@ -152,14 +158,28 @@ def spice_client_path() -> str | None:
     return shutil.which(SPICE_CLIENT_NAMES[0]) or shutil.which(SPICE_CLIENT_NAMES[1])
 
 
-def spice_client_command(client: str, endpoint: Path, clipboard: bool = False,
-                         qemu_pid: int | None = None) -> list[str]:
+def spice_client_command(client: str, endpoint: Path | str, clipboard: bool = False,
+                         qemu_pid: int | None = None,
+                         password_file: Path | None = None,
+                         geometry: str | None = None,
+                         state_file: Path | None = None,
+                         display_quality: str | None = None,
+                         file_transfer: bool = False) -> list[str]:
     """构造受控客户端命令；只有显式 ``--clipboard`` 才打开剪贴板。
 
     ``qemu_pid`` 不是用户可控参数。传入后，内置 ``spicy`` 会在 QEMU 异常退出时自行
     结束，覆盖 SPICE 断开事件没有及时送达的孤儿窗口场景。
+    ``endpoint`` 可以是 UNIX socket 路径（构造 ``spice+unix://`` URI），或已经以
+    ``spice://`` 开头的 TCP URI。``password_file`` 只用于 TCP 回退模式的每次运行
+    ticket：路径进入客户端参数，ticket 内容本身不进入任何命令行或状态文件。
+    ``geometry``（``WxH``）显式覆盖初始窗口尺寸；``state_file`` 让客户端跨次启动
+    记忆窗口尺寸与全屏状态。两者只对受控 spicy 生效，不透传其它参数。
     """
-    client_uri = f"spice+unix://{endpoint}"
+    endpoint_text = str(endpoint)
+    if endpoint_text.startswith("spice://"):
+        client_uri = endpoint_text
+    else:
+        client_uri = f"spice+unix://{endpoint}"
     # 正式 App 固定命名为 spicy；本机 E2E 会把同一受控客户端编译成
     # ctflab-spicy-<build-id>，仍使用 --uri 协议。其它客户端保留 remote-viewer 的 URI 参数约定。
     client_name = Path(client).name.lower()
@@ -167,12 +187,63 @@ def spice_client_command(client: str, endpoint: Path, clipboard: bool = False,
         command = [client, "--uri", client_uri]
         if clipboard:
             command.append("--clipboard")
+        if file_transfer:
+            command.append("--file-transfer")
+        if password_file is not None:
+            command += ["--password-file", str(password_file)]
         if qemu_pid is not None:
             if qemu_pid <= 0:
                 raise CTFLabError("SPICE 客户端监控需要有效的 QEMU PID。")
             command += ["--qemu-pid", str(qemu_pid)]
+        if geometry is not None:
+            geometry_match = re.fullmatch(r"([0-9]{3,5})x([0-9]{3,5})", geometry)
+            if (geometry_match is None
+                    or not 400 <= int(geometry_match.group(1)) <= 16384
+                    or not 300 <= int(geometry_match.group(2)) <= 16384):
+                raise CTFLabError(f"非法的客户端窗口几何：{geometry}（应为 WxH，"
+                                  "宽 400-16384、高 300-16384）。")
+            command += ["--geometry", geometry]
+        if state_file is not None:
+            command += ["--state-file", str(state_file)]
+        if display_quality is not None:
+            if display_quality not in {"sharp", "smooth"}:
+                raise CTFLabError(f"不支持的显示质量偏好：{display_quality}（可选 sharp、smooth）。")
+            command += ["--display-quality", display_quality]
         return command
+    if file_transfer:
+        raise CTFLabError("文件传输需要受控客户端支持，不能透传到未知客户端。")
+    if password_file is not None:
+        raise CTFLabError("TCP 回退模式的 ticket 需要受控客户端（spicy/ctflab-spicy）支持。")
     return [client, client_uri]
+
+
+# 绝对鼠标走 usb-tablet（内核 evdev，按当前屏幕实时映射）而不是 vdagent 的
+# uinput 路径（QEMU 选项 agent-mouse=off）。实测 vdagent 路径在客户端驱动的
+# 分辨率切换后，指针按旧屏幕比例换算（如 1512x917 下 (400,500)→(472,573)）。
+
+def terminate_spice_client(client_pid: int) -> None:
+    """有界结束显示客户端：先 SIGTERM 等待 6 秒，仍在才 SIGKILL。
+
+    QEMU 干净退出（ACPI 关机或 QMP quit）时，spice-server 在 RedClient 销毁路径
+    存在崩溃缺陷（InputsChannel::release_keys 段错误，见 2026-10-05 验证记录的
+    崩溃报告汇总）。停止流程先让客户端断开连接再结束 QEMU，绕开该路径。
+    客户端（GtkApplication 外壳）的优雅退出含会话断开、窗口状态保存与应用
+    关闭迭代，实测可超过 1 秒；且主循环偶发被过渡轮询阻塞数秒，客户端自带 alarm(4) 兜底，这里给 6 秒。
+    """
+    if client_pid <= 0 or not bool_pid_alive(client_pid):
+        return
+    try:
+        os.kill(client_pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    deadline = time.monotonic() + 6.0
+    while bool_pid_alive(client_pid) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    if bool_pid_alive(client_pid):
+        try:
+            os.kill(client_pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
 
 
 def resolve_display_backend(profile_id: str, requested: str, *, headless: bool = False,
@@ -535,6 +606,18 @@ def bool_pid_alive(pid: int | None) -> bool:
         return False
     except PermissionError:
         return True
+    # kill(pid, 0) 对等待父进程回收的僵尸也成功；不能将其当作仍在运行。
+    # 只查询状态，不回收他人管理的子进程，也不读取进程参数或凭据。
+    if sys.platform == "darwin":
+        try:
+            status = subprocess.run(
+                ["/bin/ps", "-p", str(pid), "-o", "stat="],
+                capture_output=True, text=True, timeout=1,
+            )
+            if status.returncode == 0 and status.stdout.strip().startswith("Z"):
+                return False
+        except (OSError, subprocess.TimeoutExpired):
+            pass  # 无法查询时保守保留存活判断，避免误操作运行中实例。
     return True
 
 
@@ -647,7 +730,7 @@ def ppm_display_activity(path: Path) -> dict[str, Any]:
 
 # 受控启动回退矩阵：只使用白名单里的固件、磁盘总线与控制器组合，按顺序尝试。
 # x86 先试传统 BIOS + LSI SCSI（多数老靶机），再依次尝试 IDE/SATA/VirtIO，最后才是 UEFI。
-BOOT_MATRIX_SUCCESS_VERDICTS = {"service_ready", "network_and_display_candidate"}
+BOOT_MATRIX_SUCCESS_VERDICTS = {"service_ready"}
 BOOT_MATRIX_SUCCESS_SCREENS = {"login_ready"}
 X86_BOOT_MATRIX: tuple[dict[str, str], ...] = (
     {"firmware": "bios", "bus": "scsi", "controller": "lsi53c895a"},
@@ -676,6 +759,40 @@ def candidate_label(candidate: dict[str, str]) -> str:
     return label
 
 
+def probe_recommendations(screen_classification: str | None) -> list[str]:
+    """按画面分类生成 probe 报告的人工处置建议。"""
+    recommendations: list[str] = []
+    if screen_classification == "pxe_network_boot":
+        recommendations.append(
+            "来宾进入 PXE 网络启动，说明当前固件/总线组合没有从磁盘引导；"
+            "请检查固件（BIOS/UEFI）、磁盘总线与控制器以及启动顺序，"
+            "必要时用 probe --matrix 受控回退。"
+        )
+    return recommendations
+
+
+def probe_verdict(*, protocol_ready: bool, network_ready: bool, display_active: bool,
+                  process_running: bool, screen_classification: str | None = None) -> str:
+    """probe 结论判定。
+
+    画面分类属于失败类（含 PXE 网络启动）且没有协议级就绪时，结论必须是该
+    分类本身：即使 QEMU 在运行、画面非黑且 DHCP 正常（那是宿主侧 DHCP 服务
+    的健康检查，不代表来宾从磁盘引导），也不得返回可被启动矩阵接受的
+    ``network_and_display_candidate`` 磁盘启动候选。
+    """
+    if protocol_ready:
+        return "service_ready"
+    if screen_classification in SCREEN_FAILURE_CLASSES:
+        return str(screen_classification)
+    if network_ready and display_active:
+        return "network_and_display_candidate"
+    if display_active:
+        return "display_activity_only"
+    if process_running:
+        return "process_running_no_readiness"
+    return "qemu_exited"
+
+
 SCREEN_PATTERNS: dict[str, tuple[tuple[str, str], ...]] = {
     "uefi_shell": (
         ("UEFI Interactive Shell", r"uefi\s+interactive\s+shell"),
@@ -690,6 +807,13 @@ SCREEN_PATTERNS: dict[str, tuple[tuple[str, str], ...]] = {
         ("Not a bootable disk", r"not\s+a\s+bootable\s+disk"),
         ("Operating system not found", r"operating\s+system\s+not\s+found"),
         ("Select proper boot device", r"select\s+proper\s+boot\s+device"),
+    ),
+    "pxe_network_boot": (
+        # SeaBIOS/UEFI 的 PXE 网络引导横幅；OCR 常把 "IPv4" 误读（如 "[Pu4"），
+        # 因此锚定 "start pxe over" 而不是完整句子。
+        ("Start PXE", r"start\s+pxe\b"),
+        ("PXE over IPv4", r"pxe\s+over\s+ipv4"),
+        ("Exiting PXE ROM", r"exiting\s+pxe|pxe-m0f"),
     ),
     "kernel_error": (
         ("Kernel panic", r"kernel\s+panic"),
@@ -714,10 +838,13 @@ SCREEN_PATTERNS: dict[str, tuple[tuple[str, str], ...]] = {
     ),
 }
 
-SCREEN_FAILURE_CLASSES = {"uefi_shell", "no_boot_device", "kernel_error"}
+# pxe_network_boot：磁盘没有引导、固件落到网络启动，也不得成为可被启动矩阵
+# 接受的磁盘启动候选（即使 QEMU 在运行、画面非黑且 DHCP 正常）。
+SCREEN_FAILURE_CLASSES = {"uefi_shell", "no_boot_device", "pxe_network_boot", "kernel_error"}
 SCREEN_CLASS_LABELS = {
     "uefi_shell": "UEFI Shell",
     "no_boot_device": "未找到可启动设备",
+    "pxe_network_boot": "PXE 网络启动（磁盘未引导）",
     "kernel_error": "内核/根文件系统错误",
     "login_ready": "登录界面已就绪",
     "boot_progress": "系统仍在启动",
@@ -739,7 +866,8 @@ def classify_screen_text(text: str) -> dict[str, Any]:
         warnings.append("检测到服务启动失败文字")
 
     classification = "unknown"
-    for candidate in ("uefi_shell", "no_boot_device", "kernel_error", "login_ready", "boot_progress"):
+    for candidate in ("uefi_shell", "no_boot_device", "pxe_network_boot", "kernel_error",
+                      "login_ready", "boot_progress"):
         if candidate in matched:
             classification = candidate
             break
@@ -930,10 +1058,12 @@ class LabManager:
 
     def import_image(self, profile_id: str, source_arg: str, *, expect_sha256: str | None = None,
                      manifest: str | Path | None = None,
-                     nvram: str | Path | None = None) -> dict[str, Any]:
+                     nvram: str | Path | None = None,
+                     ova_disk: str | None = None) -> dict[str, Any]:
         with self.operation_lock(f"导入 {profile_id}"):
             return self._import_image_unlocked(profile_id, source_arg, expect_sha256=expect_sha256,
-                                               manifest=manifest, nvram=nvram)
+                                               manifest=manifest, nvram=nvram,
+                                               ova_disk=ova_disk)
 
     def distribution_expectations(self, profile_id: str, expect_sha256: str | None,
                                   manifest: str | Path | None,
@@ -986,26 +1116,30 @@ class LabManager:
     def _import_image_unlocked(self, profile_id: str, source_arg: str, *,
                                expect_sha256: str | None = None,
                                manifest: str | Path | None = None,
-                               nvram: str | Path | None = None) -> dict[str, Any]:
+                               nvram: str | Path | None = None,
+                               ova_disk: str | None = None) -> dict[str, Any]:
         profile_id = PROFILE_ALIASES.get(profile_id, profile_id)
         profile = load_profile(profile_id)
         plan = self.distribution_expectations(profile_id, expect_sha256, manifest, nvram)
         source = self.discover_source(Path(source_arg))
         source_for_convert = source
+        ova_disk_names: list[str] = []
         temporary_dir: tempfile.TemporaryDirectory[str] | None = None
         try:
             if source.suffix.lower() == ".ova":
+                from ctflab_inspect import find_disk_and_ovf  # noqa: PLC0415
                 temporary_dir = tempfile.TemporaryDirectory(prefix="ctflab-ova-")
-                with tarfile.open(source, "r:*") as archive:
-                    members = [member for member in archive.getmembers() if member.isfile() and member.name.lower().endswith((".vmdk", ".qcow2", ".vdi", ".vhd", ".vhdx"))]
-                    if not members:
-                        raise CTFLabError(f"OVA 内没有找到可用磁盘：{source}")
-                    member = members[0]
-                    member_path = Path(member.name)
-                    if member_path.is_absolute() or ".." in member_path.parts:
-                        raise CTFLabError(f"OVA 内含有不安全的磁盘路径：{member.name}")
-                    archive.extract(member, temporary_dir.name)
-                    source_for_convert = Path(temporary_dir.name) / member.name
+                try:
+                    source_for_convert, _ovf_path, _warnings, ova_disk_names = find_disk_and_ovf(
+                        source, Path(temporary_dir.name), preferred_disk=ova_disk)
+                except InspectionError as exc:
+                    raise CTFLabError(str(exc)) from exc
+                if len(ova_disk_names) > 1 and ova_disk is None:
+                    # 导入是写操作：多磁盘必须显式选系统盘，不取“第一个”猜测。
+                    raise CTFLabError(
+                        f"OVA 内有 {len(ova_disk_names)} 个磁盘：{', '.join(ova_disk_names)}。"
+                        f"请先用 inspect 查看后用 --disk 选择系统盘重试；"
+                        "数据盘暂不支持（多磁盘场景逐步补齐）。")
             source_hash = sha256_file(source)
             updates: dict[str, Any] = {}
             if plan["expect_sha256"]:
@@ -1080,6 +1214,8 @@ class LabManager:
                 "virtual_size": destination_info.get("virtual-size"),
                 "imported_at": now_iso(),
                 "guest": profile.get("guest", {}),
+                **({"ova_disk": Path(str(source_for_convert)).name,
+                    "ova_disk_count": len(ova_disk_names)} if ova_disk_names else {}),
                 **updates,
             }
             write_json(self.image_state_path(profile_id), state)
@@ -1787,13 +1923,43 @@ class LabManager:
             socket_path.unlink()
         return socket_path
 
+    def _spice_ticket(self, profile_id: str) -> Path:
+        """写入本次运行的 SPICE ticket 并返回 0600 ticket 文件路径。
+
+        ticket 只落在 0700 runtime 目录内的文件里，通过 QEMU ``password-secret``
+        读取；命令行参数与运行状态中只出现文件路径，不出现 ticket 明文。
+        """
+        directory = self.runtime_dir / profile_id / "spice"
+        directory.mkdir(parents=True, exist_ok=True)
+        os.chmod(directory, 0o700)
+        ticket_path = directory / "ticket"
+        # QEMU 以 format=raw 整文件读取 ticket；不得带换行，否则与客户端裁剪后的值不一致
+        ticket_path.write_text(secrets.token_urlsafe(32), encoding="utf-8")
+        os.chmod(ticket_path, 0o600)
+        return ticket_path
+
+    @staticmethod
+    def _reserve_loopback_port() -> int:
+        """预留一个 127.0.0.1 回环端口供本次 SPICE TCP 监听使用。"""
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(("127.0.0.1", 0))
+            return int(sock.getsockname()[1])
+
     def qemu_command(self, profile_id: str, profile: dict[str, Any], overlay: Path, lab_port: int,
                      headless: bool, allow_internet: bool = False, clipboard: bool = False,
-                     display: str = "cocoa") -> tuple[list[str], dict[str, int]]:
+                     display: str = "cocoa", spice_listen: str = "unix",
+                     spice_port: int | None = None,
+                     file_transfer: bool = False) -> tuple[list[str], dict[str, int]]:
         if display not in {"cocoa", "spice"}:
             raise CTFLabError(f"不支持的显示后端：{display}（可选 cocoa 或 spice）。")
+        if spice_listen not in {"unix", "tcp"}:
+            raise CTFLabError(f"不支持的 SPICE 监听方式：{spice_listen}（可选 unix 或 tcp）。")
+        if spice_listen == "tcp" and display != "spice":
+            raise CTFLabError("--spice-listen tcp 只能与 --display spice 同时使用。")
         if display == "spice" and (profile_id != "kali-arm64" or headless):
             raise CTFLabError("SPICE 动态分辨率仅支持 Kali 图形模式。")
+        if file_transfer and (profile_id != "kali-arm64" or headless or display != "spice"):
+            raise CTFLabError("文件传输仅支持 Kali 的 SPICE 图形窗口。")
         if clipboard and (profile_id != "kali-arm64" or headless):
             raise CTFLabError("剪贴板仅支持 Kali 图形模式。")
         guest = profile.get("guest", {})
@@ -1867,11 +2033,15 @@ class LabManager:
             primary_adapter = str(network.get("adapter", "e1000"))
 
         spice_socket: Path | None = None
+        spice_ticket: Path | None = None
         if display == "spice":
             capabilities = self.probe_spice(qemu)
             if not capabilities.get("supported"):
                 raise self.spice_capability_error(capabilities)
-            spice_socket = self._spice_socket(profile_id)
+            if spice_listen == "tcp":
+                spice_ticket = self._spice_ticket(profile_id)
+            else:
+                spice_socket = self._spice_socket(profile_id)
 
         command += ["-net", "none"]
         host_forwards: dict[str, int] = {}
@@ -1899,13 +2069,25 @@ class LabManager:
             "-no-reboot",
         ]
         if display == "spice":
-            # UNIX socket + 0700 runtime 目录是本机鉴权边界；不开放 TCP，也不把 ticket
-            # 写入命令行或状态文件。SPICE agent transport 始终存在，剪贴板只由显式开关控制。
+            # UNIX socket + 0700 runtime 目录是本机鉴权边界；TCP 回退模式只绑定
+            # 127.0.0.1 的受控端口，并用每次运行重新生成的 ticket 文件鉴权
+            # （QEMU password-secret 从 0600 文件读取，ticket 不进命令行与状态）。
+            # SPICE agent transport 始终存在，剪贴板只由显式开关控制。
             copy_paste = "off" if clipboard else "on"
-            command += [
-                "-display", "none",
+            # 文件传输独立授权；文本剪贴板不会隐式开启文件写入。
+            file_xfer = "off" if file_transfer else "on"
+            command += ["-display", "none"]
+            if spice_listen == "tcp":
+                command += [
+                    "-spice", f"addr=127.0.0.1,port={spice_port},disable-ticketing=off,disable-copy-paste={copy_paste},disable-agent-file-xfer={file_xfer},agent-mouse=off,password-secret=ctflab_spice_ticket",
+                    "-object", f"secret,id=ctflab_spice_ticket,file={spice_ticket},format=raw",
+                ]
+            else:
                 # 与最小能力探测保持同一套 QEMU 11.x 参数格式。
-                "-spice", f"unix=on,addr={spice_socket},disable-ticketing=on,disable-copy-paste={copy_paste},disable-agent-file-xfer=on",
+                command += [
+                    "-spice", f"unix=on,addr={spice_socket},disable-ticketing=on,disable-copy-paste={copy_paste},disable-agent-file-xfer={file_xfer},agent-mouse=off",
+                ]
+            command += [
                 "-device", "virtio-serial-pci",
                 "-chardev", "spicevmc,id=ctflab_spice_agent,name=vdagent",
                 "-device", "virtserialport,chardev=ctflab_spice_agent,name=com.redhat.spice.0",
@@ -1928,27 +2110,48 @@ class LabManager:
 
     def run(self, profile_ids: list[str], headless: bool = False, pcap: bool = False,
             allow_internet: bool = False, clipboard: bool = False,
-            display: str = "auto",
-            profile_overrides: dict[str, dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+            display: str = "auto", spice_listen: str = "unix",
+            profile_overrides: dict[str, dict[str, Any]] | None = None,
+            display_quality: str | None = None,
+            file_transfer: bool = False) -> list[dict[str, Any]]:
         with self.operation_lock("启动 " + ",".join(profile_ids)):
             return self._run_unlocked(profile_ids, headless=headless, pcap=pcap,
                                       allow_internet=allow_internet, clipboard=clipboard,
-                                      display=display, profile_overrides=profile_overrides)
+                                      display=display, spice_listen=spice_listen,
+                                      profile_overrides=profile_overrides,
+                                      display_quality=display_quality, file_transfer=file_transfer)
 
     def _run_unlocked(self, profile_ids: list[str], headless: bool = False, pcap: bool = False,
                       allow_internet: bool = False, clipboard: bool = False,
-                      display: str = "auto",
-                      profile_overrides: dict[str, dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+                      display: str = "auto", spice_listen: str = "unix",
+                      profile_overrides: dict[str, dict[str, Any]] | None = None,
+                      display_quality: str | None = None,
+                      file_transfer: bool = False) -> list[dict[str, Any]]:
+        # 启动前资源预检（第 7 项）：内存超配拒绝；顺序启动即启动队列。
+        running_for_preflight = self.running_states()
+        for warning in check_host_resources(
+                profile_ids,
+                [state["profile_id"] for state in running_for_preflight],
+                self.state_dir, profile_overrides=profile_overrides,
+                running_memory={state["profile_id"]: state.get("memory_mb")
+                                for state in running_for_preflight}):
+            print(f"资源预检警告：{warning}")
         profile_overrides = profile_overrides or {}
         profile_ids = list(dict.fromkeys(PROFILE_ALIASES.get(profile_id, profile_id) for profile_id in profile_ids))
         if display not in {"auto", "cocoa", "spice"}:
             raise CTFLabError(f"不支持的显示后端：{display}（可选 auto、cocoa 或 spice）。")
+        if spice_listen not in {"unix", "tcp"}:
+            raise CTFLabError(f"不支持的 SPICE 监听方式：{spice_listen}（可选 unix 或 tcp）。")
+        if spice_listen == "tcp" and display != "spice":
+            raise CTFLabError("--spice-listen tcp 只能与 --display spice 同时使用。")
         if display == "spice" and profile_ids != ["kali-arm64"]:
             raise CTFLabError("--display spice 只能单独启动 kali-arm64。")
         if display == "spice" and headless:
             raise CTFLabError("--display spice 不能与 --headless 同时使用。")
         if clipboard and (headless or "kali-arm64" not in profile_ids):
             raise CTFLabError("--clipboard 需要启动 Kali 图形窗口。")
+        if file_transfer and (headless or profile_ids != ["kali-arm64"] or display == "cocoa"):
+            raise CTFLabError("--file-transfer 仅支持单独启动 Kali 的 SPICE 图形窗口。")
         if allow_internet and "kali-arm64" not in profile_ids:
             raise CTFLabError("只有 Kali 可以联网；Smoke 和 Basic Pentesting 2 始终保持隔离。")
         auto_capabilities: dict[str, Any] | None = None
@@ -1976,7 +2179,11 @@ class LabManager:
             if not capabilities.get("supported"):
                 raise self.spice_capability_error(capabilities)
         running = self.running_states()
+        if file_transfer and displays.get("kali-arm64") != "spice":
+            raise CTFLabError("文件传输需要完整 SPICE 能力；不会在 Cocoa 后端静默忽略。")
         for state in running:
+            if state["profile_id"] in profile_ids and bool(state.get("file_transfer_enabled")) != file_transfer:
+                raise CTFLabError("切换文件传输模式需要先 stop，再 run。")
             if state["profile_id"] == "kali-arm64" and "kali-arm64" in profile_ids and bool(state.get("clipboard_enabled")) != clipboard:
                 raise CTFLabError("切换剪贴板模式需要先 stop，再 run。")
             expected_display = displays.get(state["profile_id"])
@@ -2005,6 +2212,8 @@ class LabManager:
                 continue
             profile = profile_overrides.get(profile_id) or load_profile(profile_id)
             overlay = self.ensure_overlay(profile_id)
+            spice_tcp = displays[profile_id] == "spice" and spice_listen == "tcp"
+            spice_tcp_port = self._reserve_loopback_port() if spice_tcp else None
             command, host_forwards = self.qemu_command(
                 profile_id, profile, overlay, lab_port, headless,
                 # Kali 的管理网默认使用 user-mode NAT；脆弱靶机的管理网仍为
@@ -2012,6 +2221,9 @@ class LabManager:
                 allow_internet=profile_id == "kali-arm64",
                 clipboard=clipboard and profile_id == "kali-arm64",
                 display=displays[profile_id],
+                spice_listen=spice_listen,
+                spice_port=spice_tcp_port,
+                file_transfer=file_transfer,
             )
             log_path = self.logs_dir / f"{profile_id}.log"
             log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2038,6 +2250,8 @@ class LabManager:
                 "schema": 1,
                 "profile_id": profile_id,
                 "pid": process.pid,
+                "memory_mb": profile.get("guest", {}).get("memory_mb"),
+                "cpus": profile.get("guest", {}).get("cpus"),
                 "command": command,
                 "overlay_path": str(overlay),
                 "qmp_path": str(self.runtime_dir / profile_id / "qmp.sock"),
@@ -2054,29 +2268,59 @@ class LabManager:
                 "headless": headless,
                 "internet_enabled": profile_id == "kali-arm64",
                 "clipboard_enabled": clipboard and profile_id == "kali-arm64",
+                "file_transfer_enabled": file_transfer and profile_id == "kali-arm64",
                 "display_backend": displays[profile_id],
                 "display_requested": display,
+                "display_quality": display_quality,
                 "display_auto_fallback": (
                     display == "auto" and profile_id == "kali-arm64"
                     and not headless and displays[profile_id] == "cocoa"
                 ),
-                "spice_endpoint": str(self.runtime_dir / profile_id / "spice" / "display.sock") if displays[profile_id] == "spice" else None,
+                "spice_endpoint": (
+                    f"spice://127.0.0.1:{spice_tcp_port}" if spice_tcp
+                    else str(self.runtime_dir / profile_id / "spice" / "display.sock")
+                ) if displays[profile_id] == "spice" else None,
+                "spice_listen": spice_listen if displays[profile_id] == "spice" else None,
             }
             write_json(self.runtime_state_path(profile_id), state)
             if displays[profile_id] == "spice":
-                # QEMU 先创建服务端 socket，再启动受控客户端；客户端只接收固定的
-                # spice+unix URI，不接受用户拼接的 QEMU/网络参数。
-                endpoint = Path(str(state["spice_endpoint"]))
+                # QEMU 先建立监听端点，再启动受控客户端；客户端只接收运行器生成的
+                # URI，不接受用户拼接的 QEMU/网络参数。TCP 回退模式轮询 127.0.0.1
+                # 受控端口可连接为止，ticket 通过 0600 文件交给客户端。
+                endpoint_text = str(state["spice_endpoint"])
+                spice_tcp = endpoint_text.startswith("spice://")
+                endpoint = Path(self.runtime_dir / profile_id / "spice" / "display.sock") if not spice_tcp else None
+                ticket_path = Path(self.runtime_dir / profile_id / "spice" / "ticket") if spice_tcp else None
                 deadline = time.monotonic() + 5.0
-                while not endpoint.exists() and bool_pid_alive(process.pid) and time.monotonic() < deadline:
-                    time.sleep(0.05)
+                if spice_tcp:
+                    port = int(endpoint_text.rsplit(":", 1)[1])
+                    endpoint_ready = False
+                    while time.monotonic() < deadline and bool_pid_alive(process.pid):
+                        try:
+                            with socket.create_connection(("127.0.0.1", port), timeout=0.2):
+                                endpoint_ready = True
+                                break
+                        except OSError:
+                            time.sleep(0.05)
+                else:
+                    while not endpoint.exists() and bool_pid_alive(process.pid) and time.monotonic() < deadline:
+                        time.sleep(0.05)
+                    endpoint_ready = endpoint.exists()
                 client = spice_client_path()
-                if not endpoint.exists() or not client:
+                if not endpoint_ready or not client:
                     self._stop_unlocked([profile_id])
-                    reason = "SPICE socket 未建立" if not endpoint.exists() else "本地 SPICE 客户端不可用"
+                    reason = "SPICE 端点未建立" if not endpoint_ready else "本地 SPICE 客户端不可用"
                     raise CTFLabError(f"{reason}；已清理本次 QEMU 启动，不会自动回退 Cocoa。")
-                client_command = spice_client_command(client, endpoint, clipboard,
-                                                      qemu_pid=process.pid)
+                # 客户端把窗口尺寸/全屏状态记忆在节点自己的运行目录，下次启动恢复。
+                client_window_state = Path(self.runtime_dir / profile_id / "spice" /
+                                           "client-window.txt")
+                client_window_state.parent.mkdir(parents=True, exist_ok=True)
+                client_command = spice_client_command(client, endpoint_text, clipboard,
+                                                      qemu_pid=process.pid,
+                                                      password_file=ticket_path,
+                                                      state_file=client_window_state,
+                                                      display_quality=display_quality,
+                                                      file_transfer=file_transfer)
                 client_log = self.logs_dir / f"{profile_id}-spice-client.log"
                 with client_log.open("a", encoding="utf-8") as client_handle:
                     try:
@@ -2097,6 +2341,61 @@ class LabManager:
             started.append(state)
         return started
 
+    def show_display(self, profile_id: str, reconnect: bool = False) -> dict[str, Any]:
+        """复用运行中节点或重连 SPICE，只恢复显示，不重启 QEMU。"""
+        with self.operation_lock(f"恢复显示 {profile_id}"):
+            profile_id = PROFILE_ALIASES.get(profile_id, profile_id)
+            state = self.runtime_state(profile_id)
+            if not state or not bool_pid_alive(int(state.get("pid", 0))):
+                raise CTFLabError("该节点已停止，请从面板启动；关闭 Cocoa 窗口可能同时停止虚拟机。")
+            if state.get("headless"):
+                raise CTFLabError("该节点以无界面模式启动；请停止后以图形模式启动。")
+            if state.get("display_backend", "cocoa") != "spice":
+                if reconnect:
+                    raise CTFLabError("Cocoa 显示不支持独立重连；虚拟机保持运行，不会通过重启代替恢复。")
+                return {"profile": profile_id, "pid": state["pid"], "reconnected": False}
+            client_pid = int(state.get("spice_client_pid", 0) or 0)
+            if bool_pid_alive(client_pid) and not reconnect:
+                return {"profile": profile_id, "pid": client_pid, "reconnected": False}
+            client = spice_client_path()
+            if not client:
+                raise CTFLabError("缺少受控 SPICE 客户端，不能恢复显示。")
+            directory = self.runtime_dir / profile_id / "spice"
+            if state.get("spice_listen") == "tcp":
+                ticket = directory / "ticket"
+                if not ticket.is_file():
+                    raise CTFLabError("缺少本次运行 ticket，不能恢复显示。")
+                endpoint = str(state["spice_endpoint"])
+            else:
+                ticket = None
+                endpoint = str(directory / "display.sock")
+                if not Path(endpoint).is_socket():
+                    raise CTFLabError("运行中节点的 SPICE socket 不存在；请查看诊断，不会重启节点。")
+            # 显式恢复用于进程仍存活但窗口不绘制；先核验恢复前提，再只断开客户端。
+            # 不自动用黑屏判定卡死，避免把锁屏/息屏误判为故障。
+            if reconnect and bool_pid_alive(client_pid):
+                terminate_spice_client(client_pid)
+            command = spice_client_command(client, endpoint,
+                                           clipboard=bool(state.get("clipboard_enabled")),
+                                           qemu_pid=int(state["pid"]), password_file=ticket,
+                                           state_file=directory / "client-window.txt",
+                                           display_quality=state.get("display_quality"),
+                                           file_transfer=bool(state.get("file_transfer_enabled")))
+            # 重连使用新日志，避免前一会话 display-ready 标记被误读为本次就绪。
+            log = self.logs_dir / f"{profile_id}-spice-client-{uuid.uuid4().hex[:12]}.log"
+            log.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                with log.open("a", encoding="utf-8") as handle:
+                    process = subprocess.Popen(command, stdin=subprocess.DEVNULL,
+                                               stdout=handle, stderr=subprocess.STDOUT,
+                                               start_new_session=True, text=True)
+            except OSError as exc:
+                raise CTFLabError(f"恢复显示失败，虚拟机保持运行：{exc}") from exc
+            state["spice_client_pid"] = process.pid
+            state["spice_client_log_path"] = str(log)
+            write_json(self.runtime_state_path(profile_id), state)
+            return {"profile": profile_id, "pid": process.pid, "reconnected": True}
+
     def stop(self, profile_ids: list[str], stop_all: bool = False, graceful: bool = False) -> list[str]:
         description = "停止全部实例" if stop_all else "停止 " + ",".join(profile_ids)
         with self.operation_lock(description):
@@ -2115,7 +2414,15 @@ class LabManager:
                 stopped_ports.add(int(state["lab_port"]))
             pid = int(state.get("pid", 0))
             qmp_path = Path(state.get("qmp_path", ""))
+            client_pid = int(state.get("spice_client_pid", 0) or 0)
             if bool_pid_alive(pid):
+                if client_pid:
+                    # 先断开显示客户端再请求任何关机：来宾响应 ACPI 的干净退出
+                    # 与 QMP quit 一样会触发 spice-server 的 RedClient 销毁段错误
+                    # （2026-10-05 崩溃报告实证优雅/强制两条路径都命中）。来宾
+                    # 关机可快于任何固定等待，不能靠延时规避；窗口随停止关闭。
+                    terminate_spice_client(client_pid)
+                    client_pid = 0
                 try:
                     if qmp_path.exists():
                         qmp_command(qmp_path, "system_powerdown")
@@ -2148,20 +2455,10 @@ class LabManager:
                         os.kill(pid, signal.SIGKILL)
                     except ProcessLookupError:
                         pass
-            client_pid = int(state.get("spice_client_pid", 0) or 0)
             if client_pid and bool_pid_alive(client_pid):
-                try:
-                    os.kill(client_pid, signal.SIGTERM)
-                except ProcessLookupError:
-                    pass
-                client_deadline = time.monotonic() + 1.0
-                while bool_pid_alive(client_pid) and time.monotonic() < client_deadline:
-                    time.sleep(0.05)
-                if bool_pid_alive(client_pid):
-                    try:
-                        os.kill(client_pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
+                # 优雅停止路径：QEMU 退出后客户端通常经 qemu-pid 监控自行退出，
+                # 残留时在此有界回收。
+                terminate_spice_client(client_pid)
             if qmp_path.exists():
                 qmp_path.unlink()
             spice_endpoint = Path(str(state.get("spice_endpoint", "")))
@@ -2205,7 +2502,7 @@ class LabManager:
                 stale.append((profile_id, int(state.get("pid", 0))))
         return stale
 
-    def reset(self, profile_id: str, force: bool = False) -> None:
+    def reset(self, profile_id: str, force: bool = False, backup_name: str | None = None) -> None:
         with self.operation_lock(f"重置 {profile_id}"):
             profile_id = PROFILE_ALIASES.get(profile_id, profile_id)
             state = self.runtime_state(profile_id)
@@ -2214,8 +2511,265 @@ class LabManager:
                     raise CTFLabError(f"{profile_id} 正在运行，请先 stop，或使用 reset --force。")
                 self.stop([profile_id])
             instance_dir = self.runtime_dir / profile_id
+            if backup_name is not None:
+                # 重置前备份：把整个 overlay 与 NVRAM 移入 state 目录下的备份区，
+                # 重置的 rmtree 不会触及；恢复用 snapshot restore-backup。
+                self._backup_instance(profile_id, instance_dir, backup_name)
             if instance_dir.exists():
                 shutil.rmtree(instance_dir)
+
+    def remove_image(self, profile_id: str) -> None:
+        """删除已导入的镜像数据：基盘副本、导入登记与 NVRAM 模板一并移除。
+
+        原始来源镜像（用户的下载/分发目录）与整盘备份区不受影响；内置课程
+        profile 保留登记（回到“未导入”），用户登记的 yaml 由调用方按需移除。
+        """
+        with self.operation_lock(f"删除镜像 {profile_id}"):
+            profile_id = PROFILE_ALIASES.get(profile_id, profile_id)
+            state = self.runtime_state(profile_id)
+            if state and bool_pid_alive(int(state.get("pid", 0))):
+                raise CTFLabError(f"{profile_id} 正在运行，请先 stop 再删除镜像。")
+            image_dir = self.images_dir / profile_id
+            if not (image_dir / "image.json").exists():
+                raise CTFLabError(f"{profile_id} 没有已导入的镜像数据（images 目录为空）。")
+            backup_root = self._backup_root(profile_id)
+            if backup_root.exists() and any(backup_root.iterdir()):
+                raise CTFLabError(f"{profile_id} 仍有整盘备份依赖基础镜像；请先恢复并处理备份，不能删除基础盘。")
+            instance_dir = self.runtime_dir / profile_id
+            if instance_dir.exists():
+                shutil.rmtree(instance_dir)
+            shutil.rmtree(image_dir)
+
+    SNAPSHOT_NAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,31}$")
+    BACKUP_DIR_NAME = "backups"
+
+    def _require_stopped(self, profile_id: str, action: str) -> None:
+        state = self.runtime_state(profile_id)
+        if state and bool_pid_alive(int(state.get("pid", 0))):
+            raise CTFLabError(f"{profile_id} 正在运行；{action} 只作用于已停止的节点，"
+                              f"请先执行 stop。")
+
+    def _instance_files(self, profile_id: str) -> tuple[Path, Path | None]:
+        overlay = self.runtime_dir / profile_id / "overlay.qcow2"
+        if not overlay.exists():
+            raise CTFLabError(f"{profile_id} 没有可操作的 overlay（尚未导入或从未运行）。")
+        nvram = self.runtime_dir / profile_id / "uefi-vars.fd"
+        return overlay, (nvram if nvram.exists() else None)
+
+    def _backup_root(self, profile_id: str) -> Path:
+        return self.state_dir / self.BACKUP_DIR_NAME / profile_id
+
+    def _backup_instance(self, profile_id: str, instance_dir: Path, backup_name: str) -> Path:
+        """把当前实例盘整份移入备份区（rename，不复制大文件）。"""
+        self._validate_snapshot_name(backup_name, "备份名")
+        destination = self._backup_root(profile_id) / backup_name
+        if destination.exists():
+            raise CTFLabError(f"备份 {backup_name} 已存在：{destination}")
+        if not instance_dir.exists():
+            raise CTFLabError(f"{profile_id} 没有可备份的实例目录。")
+        self._instance_files(profile_id)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        # 整个目录一次移动，保留内部快照对应的 NVRAM、overlay 登记和显示偏好。
+        # 同卷 rename 失败时原目录不变，不会留下只移动了一半的备份。
+        os.rename(instance_dir, destination)
+        return destination
+
+    def _validate_snapshot_name(self, name: str, label: str) -> str:
+        if not self.SNAPSHOT_NAME_PATTERN.fullmatch(name):
+            raise CTFLabError(
+                f"{label}不合法：{name!r}（小写字母/数字开头，仅含小写字母、数字、"
+                "._-，长度 1-32；空格与中文会破坏 qemu-img 列表解析）。")
+        return name
+
+    def snapshot_create(self, profile_id: str, name: str) -> dict[str, Any]:
+        """对节点 overlay 建命名内部快照；基础镜像只读不受影响。
+
+        快照成对保存 NVRAM 副本（存在时），revert 一并恢复；两者都存放在
+        runtime/<node>/ 内，reset 会连同丢弃（重置前要保留请用 --backup）。
+        """
+        with self.operation_lock(f"创建快照 {profile_id}:{name}"):
+            profile_id = PROFILE_ALIASES.get(profile_id, profile_id)
+            name = self._validate_snapshot_name(name, "快照名")
+            self._require_stopped(profile_id, "创建快照")
+            overlay, nvram = self._instance_files(profile_id)
+            existing = {item["tag"] for item in self._qemu_snapshots(overlay)}
+            if name in existing:
+                raise CTFLabError(f"快照 {name} 已存在。")
+            nvram_pair = None
+            if nvram:
+                nvram_pair = nvram.with_name(f"uefi-vars.fd.snapshot-{name}")
+                if nvram_pair.exists():
+                    raise CTFLabError(f"快照 {name} 已有固件副本；请先检查残留文件。")
+                shutil.copy2(nvram, nvram_pair)
+            try:
+                run_command([qemu_img_path(), "snapshot", "-c", name, str(overlay)])
+            except Exception:
+                if nvram_pair is not None:
+                    nvram_pair.unlink(missing_ok=True)
+                raise
+            return {"profile": profile_id, "tag": name,
+                    "nvram_paired": nvram_pair is not None}
+
+    def _qemu_snapshots(self, overlay: Path) -> list[dict[str, Any]]:
+        result = run_command([qemu_img_path(), "snapshot", "-l", str(overlay)],
+                             capture=True)
+        snapshots: list[dict[str, Any]] = []
+        for line in result.stdout.splitlines():
+            fields = line.split()
+            # 固定表头两行与本方命名规则（无空格）下按列解析即足够；无法解析的
+            # 行（外来空格名快照）跳过而不是崩溃，list 会如实少列。
+            if len(fields) < 3 or not fields[0].isdigit():
+                continue
+            date_index = next((index for index, field in enumerate(fields[2:], 2)
+                               if re.fullmatch(r"\d{4}-\d{2}-\d{2}", field)), None)
+            if date_index is None:
+                continue
+            snapshots.append({"id": fields[0], "tag": fields[1],
+                              "vm_size": " ".join(fields[2:date_index]),
+                              "date": " ".join(fields[date_index:date_index + 2])})
+        return snapshots
+
+    def snapshot_list(self, profile_id: str) -> list[dict[str, Any]]:
+        profile_id = PROFILE_ALIASES.get(profile_id, profile_id)
+        overlay, _ = self._instance_files(profile_id)
+        return self._qemu_snapshots(overlay)
+
+    def snapshot_revert(self, profile_id: str, name: str) -> dict[str, Any]:
+        with self.operation_lock(f"恢复快照 {profile_id}:{name}"):
+            profile_id = PROFILE_ALIASES.get(profile_id, profile_id)
+            name = self._validate_snapshot_name(name, "快照名")
+            self._require_stopped(profile_id, "恢复快照")
+            overlay, nvram = self._instance_files(profile_id)
+            if name not in {item["tag"] for item in self._qemu_snapshots(overlay)}:
+                raise CTFLabError(f"快照 {name} 不存在。")
+            pair = overlay.parent / f"uefi-vars.fd.snapshot-{name}"
+            if nvram is not None and not pair.is_file():
+                raise CTFLabError(f"快照 {name} 缺少配对 NVRAM；磁盘未恢复。请使用完整备份。")
+            run_command([qemu_img_path(), "snapshot", "-a", name, str(overlay)])
+            nvram_restored = False
+            if pair.is_file():
+                shutil.copy2(pair, overlay.parent / "uefi-vars.fd")
+                nvram_restored = True
+            return {"profile": profile_id, "reverted": name,
+                    "nvram_restored": nvram_restored}
+
+    def snapshot_delete(self, profile_id: str, name: str) -> dict[str, Any]:
+        with self.operation_lock(f"删除快照 {profile_id}:{name}"):
+            profile_id = PROFILE_ALIASES.get(profile_id, profile_id)
+            name = self._validate_snapshot_name(name, "快照名")
+            self._require_stopped(profile_id, "删除快照")
+            overlay, nvram = self._instance_files(profile_id)
+            if name not in {item["tag"] for item in self._qemu_snapshots(overlay)}:
+                raise CTFLabError(f"快照 {name} 不存在。")
+            run_command([qemu_img_path(), "snapshot", "-d", name, str(overlay)])
+            if nvram:
+                nvram.with_name(f"uefi-vars.fd.snapshot-{name}").unlink(missing_ok=True)
+            return {"profile": profile_id, "deleted": name}
+
+    def backups_list(self, profile_id: str) -> list[dict[str, Any]]:
+        root = self._backup_root(PROFILE_ALIASES.get(profile_id, profile_id))
+        if not root.is_dir():
+            return []
+        result = []
+        for entry in sorted(root.iterdir()):
+            if not entry.is_dir():
+                continue
+            overlay = entry / "overlay.qcow2"
+            size = overlay.stat().st_size if overlay.exists() else None
+            result.append({"name": entry.name, "overlay_bytes": size,
+                           "complete": overlay.exists()})
+        return result
+
+    def backup_restore(self, profile_id: str, name: str) -> dict[str, Any]:
+        """把整盘备份恢复为当前实例（当前实例盘被覆盖，操作前应已另有备份）。"""
+        with self.operation_lock(f"恢复备份 {profile_id}:{name}"):
+            profile_id = PROFILE_ALIASES.get(profile_id, profile_id)
+            self._validate_snapshot_name(name, "备份名")
+            self._require_stopped(profile_id, "恢复备份")
+            source = self._backup_root(profile_id) / name
+            overlay_source = source / "overlay.qcow2"
+            if not overlay_source.exists():
+                raise CTFLabError(f"备份 {name} 不完整：{source}")
+            info = qemu_info(overlay_source)
+            backing = info.get("full-backing-filename") or info.get("backing-filename")
+            if backing and not Path(str(backing)).is_file():
+                raise CTFLabError("备份依赖的基础盘不存在；未修改当前实例或备份。")
+            instance_dir = self.runtime_dir / profile_id
+            previous = None
+            if instance_dir.exists():
+                previous = self._backup_root(profile_id) / ("before-restore-" + uuid.uuid4().hex[:12])
+                os.rename(instance_dir, previous)
+            try:
+                # 备份不继承历史 PID/socket，避免恢复后误操作其它进程。
+                (source / "run.json").unlink(missing_ok=True)
+                (source / "qmp.sock").unlink(missing_ok=True)
+                os.rename(source, instance_dir)
+            except OSError:
+                if previous is not None:
+                    os.rename(previous, instance_dir)
+                raise
+            return {"profile": profile_id, "restored_backup": name,
+                    "previous_backup": previous.name if previous else None}
+
+    def backup_delete(self, profile_id: str, name: str) -> None:
+        """明确删除指定备份，不隐式删除当前实例或基础盘。"""
+        with self.operation_lock(f"删除备份 {profile_id}:{name}"):
+            profile_id = PROFILE_ALIASES.get(profile_id, profile_id)
+            self._validate_snapshot_name(name, "备份名")
+            self._require_stopped(profile_id, "删除备份")
+            source = self._backup_root(profile_id) / name
+            if not source.is_dir() or source.is_symlink():
+                raise CTFLabError(f"备份 {name} 不存在或不是受控目录。")
+            shutil.rmtree(source)
+
+    def storage_report(self) -> dict[str, Any]:
+        """各节点磁盘占用、backing chain 与引用关系；只读，不做任何清理。
+
+        对应路线图第 10 项的“清理前建立磁盘引用关系”：运行中的节点 base
+        标记 referenced，缺失 backing 的 overlay 标记 broken，供人工决策。
+        """
+        running = {state["profile_id"] for state in self.running_states()}
+        profiles: list[dict[str, Any]] = []
+        for profile_id in available_profiles():
+            image = self.image_state(profile_id) or {}
+            base_path = Path(str(image.get("base_path") or ""))
+            entry: dict[str, Any] = {
+                "id": profile_id,
+                "imported": bool(image) and base_path.is_file(),
+                "running": profile_id in running,
+            }
+            if image:
+                if base_path.is_file():
+                    info = qemu_info(base_path, force_share=True)
+                    entry["base"] = {
+                        "path": str(base_path),
+                        "actual_bytes": base_path.stat().st_size,
+                        "virtual_bytes": info.get("virtual-size"),
+                    }
+                    entry["base_referenced"] = profile_id in running
+                else:
+                    entry["base"] = None
+                    entry["base_referenced"] = False
+            overlay = self.runtime_dir / profile_id / "overlay.qcow2"
+            if overlay.exists():
+                info = qemu_info(overlay, force_share=True)
+                backing = info.get("full-backing-filename") or info.get("backing-filename")
+                backing_ok = bool(backing) and Path(str(backing)).is_file()
+                entry["overlay"] = {
+                    "path": str(overlay),
+                    "actual_bytes": overlay.stat().st_size,
+                    "virtual_bytes": info.get("virtual-size"),
+                    "backing_path": backing,
+                    "backing_ok": backing_ok,
+                }
+                entry["snapshots"] = self._qemu_snapshots(overlay) \
+                    if profile_id not in running else self.snapshot_list(profile_id)
+            else:
+                entry["overlay"] = None
+                entry["snapshots"] = []
+            entry["backups"] = self.backups_list(profile_id)
+            profiles.append(entry)
+        return {"schema": 1, "state_dir": str(self.state_dir), "profiles": profiles}
 
     def health(self, profile_id: str) -> list[dict[str, Any]]:
         profile_id = PROFILE_ALIASES.get(profile_id, profile_id)
@@ -2253,7 +2807,14 @@ class LabManager:
             host_port = None
             for forward in profile.get("network", {}).get("host_forwards", []) or []:
                 if int(forward.get("guest_port")) == guest_port:
-                    host_port = int(forward.get("host_port"))
+                    # 实例运行时可能使用临时/自选端口，不能检查配置中的旧端口。
+                    # 有运行映射但缺少该项时不回退，避免误探测另一台实例。
+                    label = str(forward.get("name", guest_port))
+                    if "host_forwards" in state:
+                        actual = state["host_forwards"].get(label)
+                        host_port = int(actual) if actual is not None else None
+                    else:
+                        host_port = int(forward.get("host_port"))
                     break
             if host_port is None:
                 results.append({"name": f"{check.get('type')}:{guest_port}", "ok": None, "detail": "没有主机端口映射"})
@@ -2363,13 +2924,17 @@ class LabManager:
                     item["ok"] is True and item["name"].split(":", 1)[0] in expected_protocols
                     for item in health
                 )
-                if (expected_protocols and protocol_ready) or (not expected_protocols and network_ready and display.get("active")):
+                if expected_protocols and protocol_ready:
                     break
-                if abort_on_failure_screen and display.get("active") and ppm_path.exists():
-                    # 矩阵探测：识别到 UEFI Shell/无启动盘/内核错误就提前结束，尝试下一个候选。
+                if display.get("active") and ppm_path.exists():
+                    # 矩阵探测：识别到 UEFI Shell/无启动盘/PXE 网络启动/内核错误就提前结束，
+                    # 尝试下一个候选。
                     screen = classify_screenshot(ppm_path)
-                    if screen.get("classification") in SCREEN_FAILURE_CLASSES:
+                    if abort_on_failure_screen and screen.get("classification") in SCREEN_FAILURE_CLASSES:
                         early_failure = str(screen.get("classification"))
+                        break
+                    # DHCP 可能来自固件 PXE；非黑画面或 unknown OCR 不能让矩阵提前命中。
+                    if not expected_protocols and network_ready and screen.get("classification") == "login_ready":
                         break
                 time.sleep(2)
 
@@ -2379,16 +2944,12 @@ class LabManager:
                 item["ok"] is True and item["name"].split(":", 1)[0] in expected_protocols
                 for item in health
             )
-            if protocol_ready:
-                verdict = "service_ready"
-            elif network_ready and display.get("active"):
-                verdict = "network_and_display_candidate"
-            elif display.get("active"):
-                verdict = "display_activity_only"
-            elif process_running:
-                verdict = "process_running_no_readiness"
-            else:
-                verdict = "qemu_exited"
+            verdict = probe_verdict(
+                protocol_ready=protocol_ready,
+                network_ready=network_ready,
+                display_active=bool(display.get("active")),
+                process_running=process_running,
+            )
 
             screenshot_path: str | None = str(ppm_path) if ppm_path.exists() else None
             sips = shutil.which("sips")
@@ -2418,9 +2979,16 @@ class LabManager:
                 }
             screen_failure = screen.get("classification") in SCREEN_FAILURE_CLASSES
             if screen_failure and not protocol_ready:
-                verdict = str(screen["classification"])
+                verdict = probe_verdict(
+                    protocol_ready=protocol_ready,
+                    network_ready=network_ready,
+                    display_active=bool(display.get("active")),
+                    process_running=process_running,
+                    screen_classification=str(screen["classification"]),
+                )
 
             candidate_profile = profile.get("detection", {}).get("status") == "candidate"
+            recommendations = probe_recommendations(str(screen.get("classification")))
             report = {
                 "schema": 1,
                 "profile_id": profile_id,
@@ -2439,6 +3007,7 @@ class LabManager:
                 "verdict": verdict,
                 "requires_human_review": candidate_profile or verdict != "service_ready" or screen_failure,
                 "errors": list(dict.fromkeys(errors))[-20:],
+                "recommendations": recommendations,
                 "verification": {
                     "boot_process": process_running,
                     "display_activity": bool(display.get("active")),
@@ -2460,8 +3029,8 @@ class LabManager:
                     max_candidates: int | None = None, start_at: int = 1) -> dict[str, Any]:
         """受控启动回退矩阵：按白名单顺序尝试固件/磁盘组合，用画面分类决定是否继续。
 
-        候选只作用于本次启动（不写入 profile）；识别到 UEFI Shell、无启动盘或内核错误
-        就立即换下一个候选，命中协议级就绪或登录界面即停止。
+        候选只作用于本次启动（不写入 profile）；识别到 UEFI Shell、无启动盘、PXE
+        网络启动或内核错误就立即换下一个候选，命中协议级就绪或登录界面即停止。
         """
         profile_id = PROFILE_ALIASES.get(profile_id, profile_id)
         base = load_profile(profile_id)
@@ -2533,8 +3102,12 @@ class LabManager:
         return result
 
 
-def cmd_doctor(manager: LabManager, _args: argparse.Namespace) -> int:
+def cmd_doctor(manager: LabManager, args: argparse.Namespace) -> int:
     """检查运行依赖；每项缺失都给出可操作的安装提示，必选项缺失时返回 1。"""
+    diagnostics_path = getattr(args, "diagnostics", None)
+    if diagnostics_path:
+        exported = write_diagnostics(manager, Path(diagnostics_path))
+        print(f"诊断包已导出：{exported}（0600；不含口令/ticket/剪贴板正文）")
     checks = [
         (
             "宿主系统",
@@ -2610,7 +3183,8 @@ def cmd_list(manager: LabManager, _args: argparse.Namespace) -> int:
 
 def cmd_inspect(_manager: LabManager, args: argparse.Namespace) -> int:
     try:
-        report = inspect_image(args.source, calculate_hash=not args.no_hash)
+        report = inspect_image(args.source, calculate_hash=not args.no_hash,
+                               preferred_disk=getattr(args, "disk", None))
     except InspectionError as exc:
         raise CTFLabError(str(exc)) from exc
     if args.json:
@@ -2627,7 +3201,8 @@ def cmd_onboard(manager: LabManager, args: argparse.Namespace) -> int:
     if profile_id in PROFILE_ALIASES or profile_exists(profile_id):
         raise CTFLabError(f"配置 {profile_id} 已存在；为避免覆盖已验证参数，请换一个 id。")
     try:
-        report = inspect_image(args.source, calculate_hash=True)
+        report = inspect_image(args.source, calculate_hash=True,
+                               preferred_disk=getattr(args, "disk", None))
     except InspectionError as exc:
         raise CTFLabError(str(exc)) from exc
     architecture = args.architecture if args.architecture != "auto" else report["candidate"]["architecture"]
@@ -2693,7 +3268,8 @@ def cmd_onboard(manager: LabManager, args: argparse.Namespace) -> int:
     if args.no_import:
         print("已按 --no-import 跳过磁盘导入；候选配置尚未启动验证。")
         return 0
-    state = manager.import_image(profile_id, args.source)
+    state = manager.import_image(profile_id, args.source,
+                                 ova_disk=getattr(args, "disk", None))
     print(f"导入完成：{profile_id}")
     print(f"基础镜像：{state['base_path']}")
     print(f"下一步：./tools/ctflab probe {profile_id}")
@@ -2704,9 +3280,16 @@ def cmd_import(manager: LabManager, args: argparse.Namespace) -> int:
     state = manager.import_image(args.profile, args.source,
                                  expect_sha256=args.expect_sha256,
                                  manifest=args.manifest,
-                                 nvram=args.nvram)
+                                 nvram=args.nvram,
+                                 ova_disk=getattr(args, "disk", None))
     print(f"导入完成：{args.profile}")
     print(f"基础镜像：{state['base_path']}")
+    virtual = int(state.get("virtual_size") or 0)
+    base_file = Path(str(state["base_path"]))
+    actual = base_file.stat().st_size if base_file.exists() else 0
+    print(f"占用空间：基盘 {actual / (1024 ** 2):.1f} MiB（虚拟 {virtual / (1024 ** 3):.1f} GiB）；来源格式 {state.get('source_format', '?')}")
+    if state.get("ova_disk"):
+        print(f"OVA 选盘：{state['ova_disk']}（共 {state.get('ova_disk_count', 1)} 块）")
     print(f"SHA-256：{state['source_sha256']}")
     verification = state.get("source_verification")
     if verification:
@@ -2948,6 +3531,26 @@ def cmd_app_verify(_manager: LabManager, args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_update(_manager: LabManager, args: argparse.Namespace) -> int:
+    import ctflab_update
+    root = args.root or args.state_dir / "updates"
+    try:
+        if args.update_command == "stage":
+            result = ctflab_update.stage(root, args.source, args.sha256, args.allow_local_candidate)
+        elif args.update_command == "select":
+            result = ctflab_update.select(root, args.slot)
+        elif args.update_command == "rollback":
+            result = ctflab_update.select(root, rollback=True)
+        elif args.update_command == "launch":
+            result = ctflab_update.launch(root, args.state_dir)
+        else:
+            result = ctflab_update.status(root)
+    except (ctflab_update.UpdateError, ctflab_update.AppBuildError, OSError, ValueError, subprocess.CalledProcessError) as error:
+        raise CTFLabError(str(error)) from error
+    print(json.dumps(result, ensure_ascii=False))
+    return 0
+
+
 def cmd_install(manager: LabManager, args: argparse.Namespace) -> int:
     state = manager.start_install(
         args.profile,
@@ -3005,9 +3608,15 @@ def cmd_finalize_install(manager: LabManager, args: argparse.Namespace) -> int:
 
 
 def cmd_run(manager: LabManager, args: argparse.Namespace) -> int:
+    overrides = resource_preset_overrides(args.profiles, getattr(args, "resource_preset", None))
+    if overrides and any(state["profile_id"] == "kali-arm64" for state in manager.running_states()):
+        raise CTFLabError("调整 Kali 资源档位需要先停止 Kali，再启动；不会修改正在运行的实例。")
     states = manager.run(args.profiles, headless=args.headless, pcap=args.pcap,
                          allow_internet=args.internet, clipboard=args.clipboard,
-                         display=args.display)
+                         display=args.display,
+                         display_quality=getattr(args, "display_quality", None), spice_listen=args.spice_listen,
+                         file_transfer=getattr(args, "file_transfer", False),
+                         profile_overrides=overrides)
     for state in states:
         forwards = ", ".join(f"{name}=127.0.0.1:{port}" for name, port in state.get("host_forwards", {}).items()) or "无主机端口映射"
         print(f"已启动 {state['profile_id']}（PID {state['pid']}，实验网 TCP {state['lab_port']}；{forwards}）")
@@ -3021,9 +3630,385 @@ def cmd_run(manager: LabManager, args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_show_display(manager: LabManager, args: argparse.Namespace) -> int:
+    print(json.dumps(manager.show_display(args.profile, reconnect=args.reconnect), ensure_ascii=False))
+    return 0
+
+
+BOOT_STAGE_LABELS = {
+    "process": "进程启动",
+    "guest-boot": "系统引导",
+    "display": "显示连接",
+    "network": "网络就绪",
+}
+
+DIAGNOSTICS_SECRET_PATTERN = re.compile(r"ticket|password|passwd|secret|token", re.IGNORECASE)
+DIAGNOSTICS_LOG_TAIL_LINES = 6
+
+
+def sanitize_log_line(line: str) -> str:
+    """诊断包只保留定位所需内容；疑似凭据行整行替换，不做部分截取。"""
+    return "[已脱敏：疑似凭据行]" if DIAGNOSTICS_SECRET_PATTERN.search(line) else line
+
+
+def diagnostics_report(manager: "LabManager") -> dict[str, Any]:
+    """一键脱敏诊断包：版本、能力、各节点启动阶段与日志尾行。
+
+    对应路线图第 12 项：常见故障应能从诊断包定位到具体阶段。不收集口令、
+    ticket、剪贴板正文或无关用户数据；日志只保留末尾几行并过滤疑似凭据行，
+    状态摘要复用 ``_status_report``（GUI 与 CLI 同源，不引入第二套判断）。
+    """
+    def qemu_version(binary: str | None) -> str | None:
+        if not binary:
+            return None
+        try:
+            output = subprocess.run([binary, "--version"], capture_output=True,
+                                    text=True, timeout=5)
+            return output.stdout.splitlines()[0].strip() if output.stdout else None
+        except (OSError, subprocess.SubprocessError, IndexError):
+            return None
+
+    qemu_arm = which_any(QEMU_ARM_NAMES)
+    diagnostics: dict[str, Any] = {
+        "schema": 1,
+        "generated_at": now_iso(),
+        "ctflab_version": CTFLAB_VERSION,
+        "host": {
+            "system": f"{platform.system()} {platform.release()}",
+            "machine": platform.machine(),
+            "python": platform.python_version(),
+        },
+        "capabilities": {
+            "qemu_img": resolve_tool("qemu-img"),
+            "qemu_system_aarch64": qemu_arm,
+            "qemu_system_aarch64_version": qemu_version(qemu_arm),
+            "spice_client": spice_client_path(),
+            "firmware_edk2_aarch64": str(find_firmware("edk2-aarch64-code.fd") or ""),
+        },
+        "stale_profiles": [
+            {"id": profile_id, "pid": pid}
+            for profile_id, pid in manager.stale_runtime_states()
+        ],
+        "profiles": [],
+    }
+    for node in _status_report(manager)["profiles"]:
+        entry = dict(node)
+        state = manager.runtime_state(str(node["id"])) or {}
+        log_tail: dict[str, list[str]] = {}
+        for label, key in (("qemu", "log_path"), ("spice_client", "spice_client_log_path")):
+            path = Path(str(state.get(key) or ""))
+            if not path.is_file():
+                continue
+            try:
+                lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+            except OSError:
+                continue
+            log_tail[label] = [sanitize_log_line(item)
+                               for item in lines[-DIAGNOSTICS_LOG_TAIL_LINES:]]
+        if log_tail:
+            entry["log_tail"] = log_tail
+        diagnostics["profiles"].append(entry)
+    return diagnostics
+
+
+def write_diagnostics(manager: "LabManager", path: Path) -> Path:
+    """写诊断包；0600 权限（含状态目录路径与日志尾行，不做公开分发）。"""
+    payload = diagnostics_report(manager)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError as exc:
+        raise CTFLabError("诊断文件已存在，请选择新文件名；不会覆盖已有文件。") from exc
+    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2)
+    return path
+
+
+def boot_stage_summary(manager: "LabManager", profile_id: str,
+                       state: dict[str, Any]) -> dict[str, Any] | None:
+    """把运行中节点的启动进度归纳为固定四阶段；不引入新的重型探测。
+
+    阶段只依据既有信号推导：QEMU 进程存活（进程启动）、任一健康检查通过
+    （系统引导出现来宾活动）、SPICE 客户端日志出现 display-ready=1（显示连接）、
+    宿主侧健康检查全部通过（网络就绪）。非 SPICE 后端的显示阶段与没有任何
+    宿主侧检查的网络阶段标记为不适用（ok=null），不伪造进度。超过就绪超时
+    仍未就绪时给出诊断：卡住的检查、日志路径与单节点恢复说明。
+    """
+    pid = int(state.get("pid", 0) or 0)
+    if not bool_pid_alive(pid):
+        return None
+    profile = load_profile(profile_id)
+    try:
+        started_at = datetime.fromisoformat(str(state.get("started_at")))
+        elapsed = int(max(0, (datetime.now(timezone.utc) - started_at).total_seconds()))
+    except (TypeError, ValueError):
+        elapsed = 0
+    readiness_timeout = int(profile.get("readiness", {}).get("timeout_seconds", 180))
+    health = manager.health(profile_id)
+    concrete = [item for item in health
+                if item["name"] != "process" and item.get("ok") is not None]
+    guest_boot_ok = any(item.get("ok") is True for item in health if item["name"] != "process")
+    network_ok = bool(concrete) and all(item.get("ok") is True for item in concrete)
+    if str(state.get("display_backend") or "cocoa") == "spice":
+        client_pid = int(state.get("spice_client_pid", 0) or 0)
+        client_log = state.get("spice_client_log_path")
+        display_ok = False
+        if bool_pid_alive(client_pid) and client_log:
+            try:
+                display_ok = "display-ready=1" in Path(client_log).read_text(
+                    encoding="utf-8", errors="replace")
+            except OSError:
+                display_ok = False
+        display_stage = {"name": "display", "ok": display_ok,
+                         "detail": "启动时已建立显示通道；当前状态见显示客户端" if display_ok else "等待显示通道就绪"}
+    else:
+        display_stage = {"name": "display", "ok": None, "detail": "非 SPICE 显示，不适用"}
+    stages = [
+        {"name": "process", "ok": True, "detail": f"PID {pid}"},
+        {"name": "guest-boot", "ok": guest_boot_ok,
+         "detail": "已出现来宾活动信号" if guest_boot_ok else "等待来宾引导信号"},
+        display_stage,
+        {"name": "network",
+         "ok": network_ok if concrete else None,
+         "detail": "健康检查全部通过" if network_ok else
+                   ("没有宿主侧检查，不适用" if not concrete else "健康检查未全部通过")},
+    ]
+    phase = "process"
+    for stage in stages:
+        if stage["ok"] is True:
+            phase = str(stage["name"])
+    summary: dict[str, Any] = {
+        "phase": phase,
+        "phase_label": BOOT_STAGE_LABELS[phase],
+        "overall": "ready" if network_ok else "booting",
+        "elapsed_seconds": elapsed,
+        "readiness_timeout_seconds": readiness_timeout,
+        "stages": stages,
+        "health": health,
+    }
+    if network_ok is not True and elapsed >= readiness_timeout:
+        summary["overall"] = "timeout"
+        summary["diagnosis"] = {
+            "message": f"启动后 {elapsed}s（就绪超时 {readiness_timeout}s）仍未就绪",
+            "failed_checks": [item["name"] for item in concrete if item.get("ok") is False],
+            "log_path": state.get("log_path"),
+            "client_log_path": state.get("spice_client_log_path"),
+            "hint": "查看上述日志定位卡住的阶段；stop 仅作用于该节点，不影响其他节点；"
+                    "reset 需显式确认，不会自动重置磁盘。",
+        }
+    return summary
+
+
+MEMORY_COMMIT_LIMIT_RATIO = 0.9
+DISK_WARNING_BYTES = 5 * 1024 ** 3
+
+
+RESOURCE_PRESETS = {"light": (2048, 2), "balanced": (4096, 4), "performance": (8192, 4)}
+
+
+def resource_preset_overrides(profile_ids: list[str], preset: str | None) -> dict[str, dict[str, Any]]:
+    """只改变本次 Kali 的内存与 CPU，不写入用户 profile 或镜像。"""
+    if preset is None:
+        return {}
+    if preset not in RESOURCE_PRESETS or [PROFILE_ALIASES.get(p, p) for p in profile_ids] != ["kali-arm64"]:
+        raise CTFLabError("资源档位仅用于单独启动 Kali，可选 light、balanced、performance。")
+    profile = copy.deepcopy(load_profile("kali-arm64"))
+    memory, cpus = RESOURCE_PRESETS[preset]
+    profile["guest"].update(memory_mb=memory, cpus=cpus)
+    return {"kali-arm64": profile}
+
+
+def check_host_resources(pending_profile_ids: list[str],
+                         running_profile_ids: list[str],
+                         state_dir: Path | None = None,
+                         profile_overrides: dict[str, dict[str, Any]] | None = None,
+                         running_memory: dict[str, int | None] | None = None) -> list[str]:
+    """启动前资源预检（第 7 项）：内存超配直接拒绝，磁盘偏低告警。
+
+    保守启发式：宿主物理内存 × 0.9 作为承诺上限，比较运行中与待启动节点的
+    配置内存总和；这不是内存压力的精确测量，拒绝信息附带全部数字供人工
+    判断。顺序启动（run 按列表逐个启动）本身就是启动队列；本检查防的是把
+    宿主一次性压满导致整个实验环境失去响应。磁盘检查按状态目录所在卷的
+    可用空间给出告警，不阻止启动。
+    """
+    warnings: list[str] = []
+    try:
+        output = subprocess.run(["sysctl", "-n", "hw.memsize"], capture_output=True,
+                                text=True, timeout=5)
+        total_bytes = int(output.stdout.strip())
+    except Exception:  # noqa: BLE001 预检探针绝不能阻塞启动；读不到就跳过，
+        # 不假装预检通过（返回空警告表，内存项按未检处理）。
+        return warnings
+
+    def configured_memory(profile_id: str) -> int:
+        profile_id = PROFILE_ALIASES.get(profile_id, profile_id)
+        if profile_id in running_profile_ids and (running_memory or {}).get(profile_id):
+            return int(running_memory[profile_id]) * 1024 * 1024
+        profile = (profile_overrides or {}).get(profile_id) or load_profile(profile_id)
+        return int((profile.get("guest") or {}).get("memory_mb") or 0) * 1024 * 1024
+
+    counted = list(dict.fromkeys([*running_profile_ids, *pending_profile_ids]))
+    committed = sum(configured_memory(item) for item in counted)
+    limit = int(total_bytes * MEMORY_COMMIT_LIMIT_RATIO)
+    if committed > limit:
+        detail = "、".join(
+            f"{item}={configured_memory(item) // (1024 ** 2)}MiB"
+            for item in counted)
+        raise CTFLabError(
+            f"内存预检未通过：本批与运行中节点合计 {committed // (1024 ** 3):.1f} GiB"
+            f"（{detail}），超过宿主 {total_bytes // (1024 ** 3)} GiB × "
+            f"{int(MEMORY_COMMIT_LIMIT_RATIO * 100)}% 上限。请先 stop 部分节点或减少"
+            "本批数量；x86 靶机为 TCG 模拟，超配会使整机失去响应。")
+    try:
+        usage = os.statvfs(state_dir or DEFAULT_STATE_DIR)
+    except OSError:
+        usage = None
+    if usage is not None:
+        free = usage.f_bavail * usage.f_frsize
+        if free < DISK_WARNING_BYTES:
+            warnings.append(
+                f"状态目录所在卷仅剩 {free / (1024 ** 3):.1f} GiB 可用（阈值 "
+                f"{DISK_WARNING_BYTES // (1024 ** 3)} GiB）；overlay 增长或导入转换"
+                "可能失败，请清理或迁移后重试。")
+    return warnings
+
+
+def spice_client_summary(state: dict[str, Any]) -> dict[str, Any] | None:
+    """显示客户端与虚拟机状态分列展示的数据源：仅 SPICE 后端节点有值。
+
+    使用最新 display-ready 事件，不把启动阶段曾经就绪的历史当作当前状态。
+    alive 仅表示客户端进程存活；就绪不证明来宾已登录、未锁屏或画面非黑。
+    """
+    if str(state.get("display_backend") or "cocoa") != "spice":
+        return None
+    client_pid = int(state.get("spice_client_pid", 0) or 0)
+    alive = bool_pid_alive(client_pid)
+    display_ready = False
+    transition_reason = None
+    client_log = state.get("spice_client_log_path")
+    if alive and client_log:
+        try:
+            log_text = Path(client_log).read_text(encoding="utf-8", errors="replace")
+            events = re.findall(r"^CTFLAB_SPICE_STATE display-ready=([01])\s*$", log_text, re.MULTILINE)
+            display_ready = bool(events and events[-1] == "1")
+            transitions = re.findall(r"display-transition end reason=([^\s]+)", log_text)
+            transition_reason = transitions[-1] if transitions else None
+        except OSError:
+            display_ready = False
+    result = {"pid": client_pid or None, "alive": alive, "display_ready": display_ready}
+    if transition_reason is not None:
+        result["last_transition_reason"] = transition_reason
+    return result
+
+
+def network_report(manager: "LabManager") -> dict[str, Any]:
+    """实验网只读拓扑（第 11 项展示切片）：profile 声明策略与运行实际并排。
+
+    不做任何变更。联网一致性：非 Kali 节点运行时联网必须与声明一致；Kali 的
+    user-mode NAT 是运行器默认策略（实验网仍经回环交换机隔离），单独注明。
+    靶机应用级回连与组合间隔离验证仍未完成，不得据此宣称安全边界已验证。
+    """
+    running = {state["profile_id"]: state for state in manager.running_states()}
+    nodes: list[dict[str, Any]] = []
+    for profile_id in available_profiles():
+        profile = load_profile(profile_id)
+        declared = profile.get("network", {}) or {}
+        state = running.get(profile_id) or {}
+        runtime_internet = bool(state.get("internet_enabled"))
+        declared_internet = bool(declared.get("internet"))
+        is_kali = profile_id == "kali-arm64"
+        entry: dict[str, Any] = {
+            "id": profile_id,
+            "declared": {
+                "segment": declared.get("segment"),
+                "lab_ip": declared.get("lab_ip"),
+                "internet": declared_internet,
+                "adapter": declared.get("adapter"),
+                "host_forwards": {str(item.get("name")): int(item.get("host_port", 0))
+                                  for item in declared.get("host_forwards", []) or []},
+            },
+            "running": bool(state),
+            "internet_policy": {
+                "declared": declared_internet,
+                "runtime": runtime_internet,
+                "note": ("运行器默认为 Kali 启用 user-mode NAT；实验网仍经回环交换机隔离"
+                         if is_kali and runtime_internet else
+                         "公网隔离" if not runtime_internet else ""),
+                "consistent": True if is_kali else declared_internet == runtime_internet,
+            },
+            "actual": None,
+        }
+        if state:
+            entry["actual"] = {
+                "lab_port": state.get("lab_port"),
+                "dhcp_lease": manager.dhcp_lease(profile_id),
+                "host_forwards": state.get("host_forwards") or {},
+                "spice_endpoint": state.get("spice_endpoint"),
+                "spice_listen": state.get("spice_listen"),
+            }
+        nodes.append(entry)
+    switches: list[dict[str, Any]] = []
+    for port in manager.network_ports():
+        net = manager.network_state(port) or {}
+        counters = net.get("counters", {}) or {}
+        switches.append({
+            "lab_port": port,
+            "pid": net.get("pid"),
+            "alive": bool_pid_alive(int(net.get("pid", 0) or 0)),
+            "clients": net.get("client_count"),
+            "learned_macs": len(net.get("learned_macs", []) or []),
+            "counters": {key: counters.get(key)
+                         for key in ("received", "forwarded", "dropped_rate_limit")},
+            "pcap_path": net.get("pcap_path"),
+        })
+    return {"schema": 1, "state_dir": str(manager.state_dir),
+            "nodes": nodes, "switches": switches}
+
+
+def sample_process_usage(pids: list[int]) -> dict[int, dict[str, float]]:
+    """一次只读采样已有 QEMU PID；CPU 为 ps 口径，RSS 为宿主驻留内存，不是来宾内存。"""
+    valid = sorted({pid for pid in pids if isinstance(pid, int) and pid > 0})
+    if not valid:
+        return {}
+    try:
+        output = subprocess.run(["/bin/ps", "-p", ",".join(map(str, valid)),
+                                 "-o", "pid=,%cpu=,rss="], capture_output=True, text=True,
+                                timeout=1, env={**os.environ, "LC_ALL": "C"})
+        result: dict[int, dict[str, float]] = {}
+        for line in output.stdout.splitlines():
+            fields = line.split()
+            if len(fields) != 3:
+                continue
+            try:
+                pid, cpu, rss_kb = int(fields[0]), float(fields[1]), float(fields[2])
+                if pid in valid and math.isfinite(cpu) and math.isfinite(rss_kb) and cpu >= 0 and rss_kb >= 0:
+                    result[pid] = {"cpu_percent": cpu, "rss_mb": round(rss_kb / 1024, 1)}
+            except ValueError:
+                continue
+        return result
+    except (OSError, subprocess.TimeoutExpired):
+        return {}
+
+
+def node_resource_summary(profile: dict[str, Any], state: dict[str, Any],
+                          usage: dict[int, dict[str, float]]) -> dict[str, Any]:
+    command = state.get("command")
+    acceleration = None
+    if isinstance(command, list) and "-accel" in command:
+        index = command.index("-accel") + 1
+        if index < len(command):
+            acceleration = command[index]
+    sampled = usage.get(int(state.get("pid", 0) or 0), {})
+    configured = state if state else profile.get("guest", {})
+    return {"memory_mb": configured.get("memory_mb"), "cpus": configured.get("cpus"),
+            "cpu_percent": sampled.get("cpu_percent"), "rss_mb": sampled.get("rss_mb"),
+            "acceleration": acceleration}
+
+
 def _status_report(manager: LabManager) -> dict[str, Any]:
     """状态快照（GUI 与文本模式共用同一数据源，避免两套判断）。"""
     running = {state["profile_id"]: state for state in manager.running_states()}
+    usage = sample_process_usage([int(state.get("pid", 0) or 0) for state in running.values()])
     stale = {profile_id: pid for profile_id, pid in manager.stale_runtime_states()}
     profiles: list[dict[str, Any]] = []
     for profile_id in available_profiles():
@@ -3039,14 +4024,19 @@ def _status_report(manager: LabManager) -> dict[str, Any]:
         state = running.get(profile_id) or {}
         lab_port = int(state.get("lab_port", 0) or 0)
         network = (manager.network_state(lab_port) or {}) if lab_port else {}
+        boot = boot_stage_summary(manager, profile_id, state) if state else None
         profiles.append({
             "id": profile_id,
             "name": str(profile.get("name", profile_id)),
+            # 内置课程包（随包分发）不可被 deregister 移除；GUI 据此隐藏“移除登记”。
+            "builtin": (BUILTIN_PROFILE_DIR / f"{profile_id}.yaml").is_file(),
             "architecture": str((profile.get("guest") or {}).get("architecture", "")),
             "firmware": str((profile.get("guest") or {}).get("firmware", "")),
             "imported": imported,
             "import_state": import_state,
             "source_format": image.get("source_format"),
+            # GUI 的“扫描并导入新增”用它做幂等：同一路径不重复 onboard。
+            "source_path": image.get("source_path"),
             "base_path": image.get("base_path"),
             "base_sha256": image.get("base_sha256"),
             "uefi_vars_path": image.get("uefi_vars_path"),
@@ -3058,6 +4048,9 @@ def _status_report(manager: LabManager) -> dict[str, Any]:
             "internet_enabled": bool(state.get("internet_enabled")),
             "display_backend": state.get("display_backend", "cocoa"),
             "stale_pid": stale.get(profile_id),
+            "boot": boot,
+            "spice_client": spice_client_summary(state) if state else None,
+            "resources": node_resource_summary(profile, state, usage),
             "network": {
                 "client_count": network.get("client_count"),
                 "learned_macs": len(network.get("learned_macs", []) or []),
@@ -3066,6 +4059,106 @@ def _status_report(manager: LabManager) -> dict[str, Any]:
         })
     return {"schema": 1, "state_dir": str(manager.state_dir), "profiles": profiles,
             "running_count": len(running)}
+
+
+def startup_preflight(manager: LabManager, profile_id: str, preset: str | None = None) -> dict[str, Any]:
+    """只读启动检查；不创建 overlay、交换机或重置磁盘，run 仍保留最终检查。"""
+    profile_id = PROFILE_ALIASES.get(profile_id, profile_id)
+    profile = resource_preset_overrides([profile_id], preset).get(profile_id) or load_profile(profile_id)
+    checks: list[dict[str, Any]] = []
+    def check(name: str, operation: Any, hint: str) -> None:
+        try:
+            operation()
+            checks.append({"name": name, "ok": True, "detail": "通过"})
+        except (CTFLabError, OSError, ValueError) as error:
+            checks.append({"name": name, "ok": False, "detail": str(error), "hint": hint})
+    image = manager.image_state(profile_id) or {}
+    def disk_check() -> None:
+        base = Path(str(image.get("base_path") or ""))
+        if not image or not base.is_file():
+            raise CTFLabError("基础镜像未导入或已被移动")
+        overlay = manager.runtime_dir / profile_id / "overlay.qcow2"
+        if overlay.exists():
+            backing = qemu_info(overlay).get("full-backing-filename")
+            if not backing or Path(str(backing)).resolve() != base.resolve():
+                raise CTFLabError("运行盘指向旧基盘；请先备份，再在“快照与备份”中重置")
+        if profile["guest"].get("firmware") == "uefi":
+            architecture = profile["guest"]["architecture"]
+            _, vars_name = manager.UEFI_FIRMWARE[architecture]
+            template = (Path(image["uefi_vars_path"]) if architecture == "aarch64" and image.get("uefi_vars_path")
+                        else find_firmware(vars_name))
+            if not template or not template.is_file():
+                raise CTFLabError("UEFI NVRAM 模板缺失，请校验分发目录后重新导入")
+    check("disk", disk_check, "使用校验导入；旧运行盘先备份再重置，检查本身不修改磁盘。")
+    running = manager.running_states()
+    check("resources", lambda: check_host_resources([profile_id], [item["profile_id"] for item in running],
+          manager.state_dir, profile_overrides={profile_id: profile},
+          running_memory={item["profile_id"]: item.get("memory_mb") for item in running}),
+          "在更多菜单选择轻量档，或停止不需要的节点后重试。")
+    def runtime_check() -> None:
+        qemu = which_any(QEMU_ARM_NAMES if profile["guest"]["architecture"] == "aarch64" else QEMU_X86_NAMES)
+        if not qemu:
+            raise CTFLabError("缺少对应架构的 QEMU，请使用完整候选 App")
+        qemu_img_path()
+        if profile["guest"].get("firmware") == "uefi":
+            code_name, _ = manager.UEFI_FIRMWARE[profile["guest"]["architecture"]]
+            if not find_firmware(code_name):
+                raise CTFLabError("UEFI 固件代码缺失，请使用完整 App")
+        if profile_id == "kali-arm64":
+            capabilities = manager.probe_spice(qemu)
+            if not capabilities.get("supported"):
+                raise manager.spice_capability_error(capabilities)
+    check("runtime", runtime_check, "使用含 SPICE 客户端与运行时的完整 App；不会静默回退。")
+    def ports_check() -> None:
+        if any(item["profile_id"] == profile_id for item in running):
+            raise CTFLabError("节点已经运行，请打开显示窗口，不要重复启动")
+        for forward in profile.get("network", {}).get("host_forwards", []):
+            with socket.socket() as endpoint:
+                endpoint.bind(("127.0.0.1", int(forward["host_port"])))
+    check("ports", ports_check, "停止占用端口的已知节点，或调整该配置；不会结束其他程序。")
+    return {"profile": profile_id, "ok": all(item["ok"] for item in checks), "checks": checks,
+            "scope": "read-only-preflight-run-rechecks"}
+
+
+def display_diagnosis(manager: LabManager, profile_id: str) -> dict[str, Any]:
+    """按需查询 QMP/画面，临时截图即清理；黑色或静止不能证明卡死。"""
+    profile_id = PROFILE_ALIASES.get(profile_id, profile_id)
+    state = manager.runtime_state(profile_id) or {}
+    report: dict[str, Any] = {"profile": profile_id, "state": "stopped", "hint": "节点已停止，请启动节点。"}
+    if not bool_pid_alive(int(state.get("pid", 0) or 0)):
+        return report
+    report.update(state="unknown", client=spice_client_summary(state), hint="状态不明；可以只重连显示，不要重置磁盘。")
+    try:
+        report["qmp"] = qmp_execute(Path(state["qmp_path"]), "query-status")
+        if not report["qmp"].get("running"):
+            report.update(state="paused", hint="来宾未在执行；显示重连不能替代恢复来宾执行。")
+            return report
+        client = report["client"]
+        if client and not client["alive"]:
+            report.update(state="disconnected", hint="来宾仍运行，显示客户端已退出；点重新打开显示窗口。")
+            return report
+        with tempfile.TemporaryDirectory(prefix="ctflab-display-diagnosis-") as temporary:
+            frame = Path(temporary) / "frame.ppm"
+            qmp_execute(Path(state["qmp_path"]), "screendump", {"filename": str(frame)})
+            report["frame"] = ppm_display_activity(frame)
+        if report["frame"].get("nonblack_ratio", 0) >= .002:
+            report.update(state="frame-present", hint="来宾原始画面非黑；不证明可点击。若窗口不更新，可只重连显示。")
+        elif "width" in report["frame"]:
+            report.update(state="black-frame", hint="来宾原始画面接近全黑，可能息屏或锁屏；先移动鼠标或按普通键，不能据此判定死机。")
+    except (CTFLabError, OSError, KeyError) as error:
+        report["error"] = str(error)
+    return report
+
+
+def cmd_preflight(manager: LabManager, args: argparse.Namespace) -> int:
+    report = startup_preflight(manager, args.profile, args.resource_preset)
+    print(json.dumps(report, ensure_ascii=False))
+    return 0 if report["ok"] else 2
+
+
+def cmd_display_diagnose(manager: LabManager, args: argparse.Namespace) -> int:
+    print(json.dumps(display_diagnosis(manager, args.profile), ensure_ascii=False))
+    return 0
 
 
 def cmd_status(manager: LabManager, args: argparse.Namespace) -> int:
@@ -3081,6 +4174,16 @@ def cmd_status(manager: LabManager, args: argparse.Namespace) -> int:
             continue
         printed = True
         print(f"{profile_id}: running PID={state['pid']} lab=tcp://127.0.0.1:{state['lab_port']} log={state['log_path']}")
+        boot = boot_stage_summary(manager, profile_id, state)
+        if boot:
+            elapsed = boot["elapsed_seconds"]
+            limit = boot["readiness_timeout_seconds"]
+            print(f"  阶段：{boot['phase_label']}（{elapsed}s/{limit}s）")
+            if boot["overall"] == "timeout":
+                diagnosis = boot["diagnosis"]
+                print(f"  诊断：{diagnosis['message']}；卡住检查："
+                      f"{', '.join(diagnosis['failed_checks']) or '无明确失败项'}")
+                print(f"  {diagnosis['hint']}")
         if state.get("internet_enabled"):
             print("  网络：Kali 默认 user-mode NAT（实验网仍经回环交换机隔离）")
         if state.get("host_forwards"):
@@ -3124,8 +4227,160 @@ def cmd_stop(manager: LabManager, args: argparse.Namespace) -> int:
 
 
 def cmd_reset(manager: LabManager, args: argparse.Namespace) -> int:
-    manager.reset(args.profile, force=args.force)
-    print(f"已重置 {args.profile}：下次启动会从基础镜像创建全新 overlay。")
+    backup_name = getattr(args, "backup", None)
+    manager.reset(args.profile, force=args.force, backup_name=backup_name)
+    if backup_name:
+        print(f"已备份为 {backup_name} 并重置 {args.profile}："
+              f"可用 snapshot restore-backup {args.profile} {backup_name} 恢复。")
+    else:
+        print(f"已重置 {args.profile}：下次启动会从基础镜像创建全新 overlay。")
+    return 0
+
+
+def cmd_deregister(manager: LabManager, args: argparse.Namespace) -> int:
+    profile_id = PROFILE_ALIASES.get(args.profile, args.profile)
+    if (BUILTIN_PROFILE_DIR / f"{profile_id}.yaml").is_file():
+        raise CTFLabError(f"{profile_id} 是内置配置，不能移除；内置节点始终可用。")
+    user_yaml = user_profile_dir() / f"{profile_id}.yaml"
+    if not user_yaml.is_file() or user_yaml.is_symlink():
+        raise CTFLabError(f"用户目录中没有 {profile_id} 的登记（可用：{', '.join(available_profiles())}）。")
+    if manager.image_state(profile_id):
+        raise CTFLabError(f"{profile_id} 已导入镜像数据；先执行 ctflab reset {profile_id} 删除导入数据，再移除登记。")
+    runtime = manager.runtime_state(profile_id)
+    if runtime and bool_pid_alive(int(runtime.get("pid", 0) or 0)):
+        raise CTFLabError(f"{profile_id} 正在运行；先停止再移除登记。")
+    user_yaml.unlink()
+    print(f"已移除登记：{profile_id}（未导入镜像数据，未删除任何文件之外的内容）。")
+    return 0
+
+
+def cmd_remove_image(manager: LabManager, args: argparse.Namespace) -> int:
+    profile_id = PROFILE_ALIASES.get(args.profile, args.profile)
+    manager.remove_image(profile_id)
+    user_yaml = user_profile_dir() / f"{profile_id}.yaml"
+    builtin = (BUILTIN_PROFILE_DIR / f"{profile_id}.yaml").is_file()
+    if not builtin and user_yaml.is_file() and not user_yaml.is_symlink():
+        user_yaml.unlink()
+        print(f"已删除镜像数据并移除登记：{profile_id}（原始来源镜像不受影响）。")
+    else:
+        print(f"已删除镜像数据：{profile_id}（内置课程配置保留，重新显示为“未导入”）。")
+    return 0
+
+
+def cmd_snapshot(manager: LabManager, args: argparse.Namespace) -> int:
+    action = args.snapshot_command
+    if action == "create":
+        result = manager.snapshot_create(args.profile, args.name)
+        suffix = "（含 NVRAM 副本）" if result["nvram_paired"] else "（无 NVRAM，未配对）"
+        print(f"已创建快照 {args.profile}:{args.name} {suffix}")
+    elif action == "list":
+        manager._require_stopped(args.profile, "列出快照")
+        snapshots = (manager.snapshot_list(args.profile)
+                     if (manager.runtime_dir / args.profile / "overlay.qcow2").is_file() else [])
+        if getattr(args, "json", False):
+            print(json.dumps({"snapshots": snapshots}, ensure_ascii=False))
+            return 0
+        if not snapshots:
+            print(f"{args.profile} 没有快照。")
+        for item in snapshots:
+            nvram_mark = "NVRAM✓" if (manager.runtime_dir / args.profile /
+                                       f"uefi-vars.fd.snapshot-{item['tag']}").exists() else "—"
+            print(f"{item['id']:>3}  {item['tag']:<32} {item['vm_size']:>10}  "
+                  f"{item['date']}  {nvram_mark}")
+    elif action == "revert":
+        result = manager.snapshot_revert(args.profile, args.name)
+        suffix = "，NVRAM 已恢复" if result["nvram_restored"] else ""
+        print(f"已恢复快照 {args.profile}:{args.name}{suffix}")
+    elif action == "delete":
+        manager.snapshot_delete(args.profile, args.name)
+        print(f"已删除快照 {args.profile}:{args.name}")
+    elif action == "restore-backup":
+        result = manager.backup_restore(args.profile, args.name)
+        print(f"已恢复整盘备份 {result['restored_backup']} 为 {args.profile} 当前实例。")
+        if result.get("previous_backup"):
+            print(f"恢复前的实例另存为备份：{result['previous_backup']}。")
+    elif action == "delete-backup":
+        manager.backup_delete(args.profile, args.name)
+        print(f"已删除指定整盘备份 {args.profile}:{args.name}（不能恢复；当前实例与基础盘不变）。")
+    elif action == "list-backups":
+        backups = manager.backups_list(args.profile)
+        if getattr(args, "json", False):
+            print(json.dumps({"backups": backups}, ensure_ascii=False))
+            return 0
+        if not backups:
+            print(f"{args.profile} 没有整盘备份（reset --backup 产生）。")
+        for item in backups:
+            size_mb = (item["overlay_bytes"] or 0) / (1024 * 1024)
+            mark = "" if item["complete"] else "（不完整）"
+            print(f"{item['name']:<32} {size_mb:>10.1f} MB{mark}")
+    return 0
+
+
+def cmd_network(manager: LabManager, args: argparse.Namespace) -> int:
+    report = network_report(manager)
+    if getattr(args, "json", False):
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return 0
+    switch_by_port = {item["lab_port"]: item for item in report["switches"]}
+    for node in report["nodes"]:
+        state_text = "运行中" if node["running"] else "已停止"
+        print(f"{node['id']}（{state_text}）")
+        declared = node["declared"]
+        policy = node["internet_policy"]
+        internet_text = policy["note"] or ("声明联网" if policy["declared"] else "公网隔离")
+        if not policy["consistent"]:
+            internet_text += "；⚠ 与 profile 声明不一致"
+        print(f"  策略：segment={declared['segment']} ip={declared['lab_ip']} "
+              f"adapter={declared['adapter']}；联网：{internet_text}")
+        forwards = declared["host_forwards"]
+        if forwards:
+            print("  端口映射：" + ", ".join(f"{name}=127.0.0.1:{port}"
+                                            for name, port in forwards.items()))
+        if node["actual"]:
+            actual = node["actual"]
+            switch = switch_by_port.get(int(actual["lab_port"] or 0))
+            if switch:
+                switch_text = (f"交换机 {'存活' if switch['alive'] else '已退出'}，"
+                               f"{switch['clients']} 客户端，{switch['learned_macs']} MAC")
+                print(f"  实验网：tcp://127.0.0.1:{actual['lab_port']}（{switch_text}）")
+                counters = switch["counters"]
+                print(f"  流量：rx={counters['received']} forwarded={counters['forwarded']} "
+                      f"dropped={counters['dropped_rate_limit']}")
+            if actual["dhcp_lease"]:
+                print(f"  DHCP 租约：{actual['dhcp_lease']}")
+            if actual["spice_endpoint"]:
+                listen = "TCP+ticket" if actual["spice_listen"] == "tcp" else "UNIX socket"
+                print(f"  显示：SPICE {listen}（仅本机）")
+    for switch in report["switches"]:
+        if not any((node["actual"] or {}).get("lab_port") == switch["lab_port"]
+                   for node in report["nodes"]):
+            alive_text = "存活" if switch["alive"] else "已退出"
+            print(f"残留实验网：tcp://127.0.0.1:{switch['lab_port']}（{alive_text}，无运行实例），可执行 stop --all。")
+    return 0
+
+
+def cmd_storage(manager: LabManager, args: argparse.Namespace) -> int:
+    report = manager.storage_report()
+    if getattr(args, "json", False):
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return 0
+    for entry in report["profiles"]:
+        state = "运行中" if entry["running"] else ("已导入" if entry["imported"] else "未导入")
+        print(f"{entry['id']}: {state}")
+        if entry.get("base"):
+            base = entry["base"]
+            referenced = "；运行中节点引用" if entry["base_referenced"] else ""
+            print(f"  基础镜像 {base['actual_bytes'] / (1024 ** 3):.2f} GiB"
+                  f"（虚拟 {base['virtual_bytes'] / (1024 ** 3):.1f} GiB）{referenced}")
+        if entry.get("overlay"):
+            overlay = entry["overlay"]
+            chain = "backing 完整" if overlay["backing_ok"] else "backing 缺失！"
+            print(f"  overlay {overlay['actual_bytes'] / (1024 ** 2):.1f} MiB（{chain}）")
+        for snapshot in entry.get("snapshots", []):
+            print(f"    快照 {snapshot['tag']}（{snapshot['vm_size']}，{snapshot['date']}）")
+        for backup in entry.get("backups", []):
+            print(f"    整盘备份 {backup['name']}"
+                  f"（{(backup['overlay_bytes'] or 0) / (1024 ** 2):.1f} MiB）")
     return 0
 
 
@@ -3183,6 +4438,8 @@ def cmd_probe(manager: LabManager, args: argparse.Namespace) -> int:
     )
     for warning in screen.get("warnings", []):
         print(f"画面警告：{warning}")
+    for recommendation in report.get("recommendations", []):
+        print(f"建议：{recommendation}")
     for result in report.get("health", []):
         status = "OK" if result["ok"] is True else "WAIT" if result["ok"] is None else "FAIL"
         print(f"{status:4} {result['name']}: {result['detail']}")
@@ -3201,18 +4458,40 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
     profile_choices = available_profiles() + sorted(PROFILE_ALIASES)
 
-    subparsers.add_parser("doctor", help="检查本机 QEMU/UTM/PyYAML 依赖")
+    update_parser = subparsers.add_parser("update", help="本地校验更新槽位与回退；不下载或覆盖现用 App")
+    update_sub = update_parser.add_subparsers(dest="update_command", required=True)
+    for operation in ("stage", "select", "rollback", "status", "launch"):
+        item = update_sub.add_parser(operation)
+        item.add_argument("--root", type=Path, help="更新槽位目录；默认当前 state-dir 下的 updates")
+        if operation == "stage":
+            item.add_argument("source", type=Path)
+            item.add_argument("--sha256", required=True)
+            item.add_argument("--allow-local-candidate", action="store_true")
+        if operation == "select":
+            item.add_argument("slot")
+
+    preflight_parser = subparsers.add_parser("preflight", help="只读启动检查，不修改磁盘或网络")
+    preflight_parser.add_argument("profile", choices=profile_choices)
+    preflight_parser.add_argument("--resource-preset", choices=list(RESOURCE_PRESETS))
+    diagnosis_parser = subparsers.add_parser("display-diagnose", help="按需诊断显示；黑屏不等同死机")
+    diagnosis_parser.add_argument("profile", choices=profile_choices)
+
+    doctor_parser = subparsers.add_parser("doctor", help="检查本机 QEMU/UTM/PyYAML 依赖")
+    doctor_parser.add_argument("--diagnostics", type=Path,
+                               help="导出脱敏诊断包 JSON（版本/能力/启动阶段/日志尾行）")
     subparsers.add_parser("list", help="列出内置配置及导入状态")
 
     inspect_parser = subparsers.add_parser("inspect", help="只读探测镜像并生成带置信度的硬件候选")
     inspect_parser.add_argument("source", help="磁盘、OVA 或虚拟机目录")
     inspect_parser.add_argument("--json", action="store_true", help="输出完整 JSON 报告")
     inspect_parser.add_argument("--no-hash", action="store_true", help="跳过耗时的 SHA-256（正式导入仍会计算）")
+    inspect_parser.add_argument("--disk", help="OVA/目录含多磁盘时显式选择成员（按文件名）")
 
     onboard_parser = subparsers.add_parser("onboard", help="探测新镜像、生成候选配置并安全导入")
     onboard_parser.add_argument("source", help="磁盘、OVA 或虚拟机目录")
     onboard_parser.add_argument("--id", required=True, help="新配置 id，例如 vulnbox-1")
     onboard_parser.add_argument("--name", help="显示名称；默认由文件名生成")
+    onboard_parser.add_argument("--disk", help="OVA/目录含多磁盘时显式选择系统盘（按文件名）")
     onboard_parser.add_argument("--architecture", choices=["auto", "x86_64", "aarch64"], default="auto")
     onboard_parser.add_argument("--firmware", choices=["auto", "bios", "uefi"], default="auto")
     onboard_parser.add_argument("--disk-bus", choices=["auto", "ide", "sata", "scsi", "virtio"], default="auto")
@@ -3226,6 +4505,7 @@ def build_parser() -> argparse.ArgumentParser:
     import_parser = subparsers.add_parser("import", help="导入 VMDK/QCOW2/OVA 等镜像")
     import_parser.add_argument("profile", choices=profile_choices)
     import_parser.add_argument("source", help="磁盘文件或包含单个磁盘的目录")
+    import_parser.add_argument("--disk", help="OVA 含多磁盘时显式选择系统盘（按文件名；多磁盘不指定会拒绝导入）")
     import_parser.add_argument("--expect-sha256",
                                help="期望的来源镜像 SHA-256（下载后校验；不一致拒绝导入）")
     import_parser.add_argument("--manifest", type=Path,
@@ -3275,13 +4555,25 @@ def build_parser() -> argparse.ArgumentParser:
 
     run_parser = subparsers.add_parser("run", help="启动一个或多个实验节点")
     run_parser.add_argument("profiles", nargs="+", choices=profile_choices)
+    run_parser.add_argument("--resource-preset", choices=list(RESOURCE_PRESETS),
+                            help="Kali 本次启动资源：light=2GiB/2核、balanced=4GiB/4核、performance=8GiB/4核；不改基础配置")
+    show_parser = subparsers.add_parser("show", help="恢复运行中节点的显示；不重启虚拟机")
+    show_parser.add_argument("--reconnect", action="store_true", help="只重建显示连接，不重启来宾或改变共享授权")
+    show_parser.add_argument("profile", choices=profile_choices)
+    run_parser.add_argument("--display-quality", choices=["sharp", "smooth"],
+                            help="SPICE 显示偏好：smooth=流畅优先（逻辑分辨率，UI 大小正常，默认），"
+                                 "sharp=清晰优先（Retina 设备像素，UI 更小更精细）；均真实跟随分辨率，"
+                                 "并记忆到节点状态，下次启动默认沿用")
     run_parser.add_argument("--headless", action="store_true", help="不打开图形窗口，日志写入 logs/")
-    run_parser.add_argument("--clipboard", action="store_true", help="显式允许 Mac 与 Kali 图形桌面双向共享文本剪贴板")
+    run_parser.add_argument("--clipboard", action="store_true", help="显式允许 Mac 与 Kali 图形桌面双向共享文本剪贴板；不启用文件传输")
+    run_parser.add_argument("--file-transfer", action="store_true", help="独立允许从 Mac 拖入文件到 Kali（仅 SPICE；不启用文本剪贴板）")
     run_parser.add_argument("--pcap", action="store_true", help="记录隔离实验网的 Ethernet PCAP")
     run_parser.add_argument("--internet", action="store_true",
                             help="兼容旧命令的显式确认；Kali 图形启动默认联网，其他节点仍隔离")
     run_parser.add_argument("--display", choices=("auto", "cocoa", "spice"), default="auto",
                             help="显示后端；默认 auto 在 Kali 的 SPICE 能力完整时使用真实自动分辨率，缺件时退化为 Cocoa；显式 spice 缺件会失败")
+    run_parser.add_argument("--spice-listen", choices=("unix", "tcp"), default="unix",
+                            help="SPICE 监听方式；默认 unix socket（0700 目录鉴权），tcp 为仅绑定 127.0.0.1 受控端口并使用每次运行 ticket 的回退路径")
 
     status_parser = subparsers.add_parser("status", help="查看运行状态")
     status_parser.add_argument("--json", action="store_true",
@@ -3297,6 +4589,51 @@ def build_parser() -> argparse.ArgumentParser:
     reset_parser = subparsers.add_parser("reset", help="删除运行 overlay，恢复到基础镜像")
     reset_parser.add_argument("profile", choices=profile_choices)
     reset_parser.add_argument("--force", action="store_true", help="运行中也先停止再重置")
+
+    reset_parser.add_argument("--backup", metavar="NAME",
+                              help="重置前把整个实例盘（overlay+NVRAM）移入备份区保存")
+
+    deregister_parser = subparsers.add_parser(
+        "deregister", help="移除用户目录中未导入的 profile 登记（不动内置配置与镜像数据）")
+    deregister_parser.add_argument("profile", metavar="PROFILE",
+                                   help="要移除登记的 profile ID（仅用户目录登记）")
+
+    remove_parser = subparsers.add_parser(
+        "remove", help="删除已导入的镜像数据（基盘副本与登记；原始来源镜像不受影响）")
+    remove_parser.add_argument("profile", metavar="PROFILE", help="要删除镜像的 profile ID")
+
+    snapshot_parser = subparsers.add_parser(
+        "snapshot", help="节点 overlay 快照与整盘备份（只作用于已停止节点；基础镜像只读）")
+    snapshot_sub = snapshot_parser.add_subparsers(dest="snapshot_command", required=True)
+    snapshot_create = snapshot_sub.add_parser("create", help="创建命名快照（含 NVRAM 副本）")
+    snapshot_create.add_argument("profile", choices=profile_choices)
+    snapshot_create.add_argument("name", help="小写字母/数字开头，仅含 a-z0-9._-，长度 1-32")
+    snapshot_list = snapshot_sub.add_parser("list", help="列出快照")
+    snapshot_list.add_argument("profile", choices=profile_choices)
+    snapshot_list.add_argument("--json", action="store_true")
+    snapshot_revert = snapshot_sub.add_parser("revert", help="恢复到指定快照（当前实例改动丢弃）")
+    snapshot_revert.add_argument("profile", choices=profile_choices)
+    snapshot_revert.add_argument("name")
+    snapshot_delete = snapshot_sub.add_parser("delete", help="删除快照")
+    snapshot_delete.add_argument("profile", choices=profile_choices)
+    snapshot_delete.add_argument("name")
+    snapshot_backup_list = snapshot_sub.add_parser("list-backups", help="列出 reset --backup 的整盘备份")
+    snapshot_backup_list.add_argument("profile", choices=profile_choices)
+    snapshot_backup_list.add_argument("--json", action="store_true")
+    snapshot_restore = snapshot_sub.add_parser(
+        "restore-backup", help="把整盘备份恢复为当前实例（覆盖现有 overlay）")
+    snapshot_restore.add_argument("profile", choices=profile_choices)
+    snapshot_restore.add_argument("name")
+    snapshot_delete_backup = snapshot_sub.add_parser("delete-backup", help="删除指定整盘备份（不可恢复；基础盘与当前实例不变）")
+    snapshot_delete_backup.add_argument("profile", choices=profile_choices)
+    snapshot_delete_backup.add_argument("name")
+
+    storage_parser = subparsers.add_parser(
+        "storage", help="各节点磁盘占用、backing chain、快照与备份清单（只读，不清理）")
+    network_parser = subparsers.add_parser(
+        "network", help="实验网拓扑、联网策略与端口映射的只读视图（不做变更）")
+    network_parser.add_argument("--json", action="store_true", help="输出机器可读 JSON")
+    storage_parser.add_argument("--json", action="store_true", help="输出机器可读 JSON")
 
     health_parser = subparsers.add_parser("health", help="检查进程和已配置的端口")
     health_parser.add_argument("profile", choices=profile_choices)
@@ -3394,10 +4731,18 @@ def main(argv: list[str] | None = None) -> int:
         "stop-install": cmd_stop_install,
         "finalize-install": cmd_finalize_install,
         "run": cmd_run,
+        "show": cmd_show_display,
         "status": cmd_status,
+        "preflight": cmd_preflight,
+        "display-diagnose": cmd_display_diagnose,
         "stop": cmd_stop,
         "reset": cmd_reset,
+        "deregister": cmd_deregister,
+        "remove": cmd_remove_image,
         "health": cmd_health,
+        "snapshot": cmd_snapshot,
+        "storage": cmd_storage,
+        "network": cmd_network,
         "probe": cmd_probe,
         "utm-export": cmd_utm_export,
     }
@@ -3415,6 +4760,8 @@ def main(argv: list[str] | None = None) -> int:
             return content_handlers[args.content_command](None, args)  # type: ignore[arg-type]
         if args.command == "app":
             return app_handlers[args.app_command](None, args)  # type: ignore[arg-type]
+        if args.command == "update":
+            return cmd_update(None, args)  # type: ignore[arg-type]
         if args.command == "dist" and args.dist_command == "verify":
             # verify 只读分发目录，不需要运行状态；不要在默认状态目录创建 locks/。
             return dist_handlers[args.dist_command](None, args)  # type: ignore[arg-type]

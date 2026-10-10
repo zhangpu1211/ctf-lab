@@ -154,9 +154,14 @@ class CliJsonContractTests(unittest.TestCase):
         ids = {profile["id"] for profile in report["profiles"]}
         self.assertLessEqual({"kali-arm64", "smoke", "basic-pentesting-2"}, ids)
         for profile in report["profiles"]:
-            for key in ("imported", "import_state", "running", "log_path", "base_sha256"):
+            for key in ("imported", "import_state", "running", "log_path", "base_sha256",
+                        "builtin", "source_path"):
                 self.assertIn(key, profile)
             self.assertIsInstance(profile["imported"], bool)
+            self.assertIsInstance(profile["builtin"], bool)
+        for builtin_id in ("kali-arm64", "smoke", "basic-pentesting-2", "webserver"):
+            entry = next(p for p in report["profiles"] if p["id"] == builtin_id)
+            self.assertTrue(entry["builtin"], f"{builtin_id} 应标记为内置课程配置")
 
     def test_status_marks_missing_registered_base_as_not_imported(self) -> None:
         """历史 image.json 的盘被清理后，GUI 不得仍展示为“已导入”。"""
@@ -210,21 +215,43 @@ class ResetSemanticsTests(unittest.TestCase):
         source = (GUI_DIR / "GuiCore.swift").read_text(encoding="utf-8")
         app = (GUI_DIR / "GuiApp.swift").read_text(encoding="utf-8")
         self.assertIn("case run(nodes: [LabNode])", source)
-        self.assertIn("case runProfiles(profileIDs: [String])", source)
+        self.assertIn("case runProfiles(profileIDs: [String], clipboard: Bool, displayQuality: String? = nil,", source)
+        self.assertIn("fileTransfer: Bool = false", source)
         self.assertIn("case stopProfiles(profileIDs: [String])", source)
         start_gate = source.split("public var canStartSelected: Bool", 1)[1].split("public var canStart:", 1)[0]
         self.assertIn("selectedProfileID", start_gate)
         self.assertNotIn("!anyRunning", start_gate, "其它节点运行时不得阻塞当前节点操作")
         self.assertIn("canStartSelected", source)
-        self.assertIn("启动所选节点", app)
-        self.assertIn("停止所选节点", app)
+        # 两栏主区：左侧统一镜像列表（节点+文件夹候选），右侧当前状态与操作；
+        # “当前节点”下拉选择器已移除。
+        self.assertIn("imageListColumn", app)
+        self.assertIn("detailColumn", app)
+        self.assertIn('Button("启动")', app)
+        self.assertIn('Button("停止")', app)
+        self.assertIn('Button("重启")', app)
+        self.assertIn('Button("重置此节点…", role: .destructive)', app)
+        self.assertIn('Button("识别并导入…")', app)
+        self.assertIn("文件夹新增（待导入）", app)
+        self.assertIn("func pendingImageEntries", app)
+        self.assertIn('Menu("导入…")', app)
+        self.assertIn('Menu("更多")', app)
+        self.assertIn('Button("添加 x86 镜像…") { model.chooseX86Image() }', app)
         self.assertIn("selectedProfileID", app)
+        self.assertIn("selectedFilePath", app)
         self.assertIn("func stopSelected", app)
         self.assertNotIn('Button("停止全部")', app)
         self.assertIn("func startProfile", app)
         self.assertIn("func stopProfile", app)
-        self.assertIn("Picker(\"当前节点\"", app)
-        self.assertIn("ForEach(LabNode.orderedProfileIDs(model.state.configuredProfileIDs)", app)
+        self.assertNotIn("Picker(\"当前节点\"", app)
+        self.assertIn("func requestNodeReset", app)
+        self.assertIn('Button("删除镜像…", role: .destructive)', app)
+        self.assertIn("func confirmImageRemove", app)
+        self.assertIn('Button("扫描并导入新增")', app)
+        self.assertIn("func scanAndImport", app)
+        self.assertIn("DisclosureGroup(isExpanded: $model.cliLogExpanded)", app)
+        self.assertIn("clipboardSharingEnabled", app)
+        self.assertIn("model.nodes.filter(\\.imported)", app)
+        self.assertIn("func confirmNodeReset", app)
         self.assertIn('Button("添加 x86 镜像…")', app)
         self.assertIn("ImageOnboardingSheet", app)
         self.assertIn("只读识别", app)
@@ -269,6 +296,36 @@ class SwiftCoreTests(unittest.TestCase):
 
 
 class GuiSourceGuardTests(unittest.TestCase):
+    def test_kali_sleep_warning_is_visible_without_expanding_help(self) -> None:
+        source = (GUI_DIR / "GuiApp.swift").read_text(encoding="utf-8")
+        self.assertIn('if let sleepHelp = DisplaySessionGuidance.sleepHelp(for: node)', source)
+        self.assertIn('Text(sleepHelp).font(.caption).foregroundStyle(.orange)', source)
+        core = (GUI_DIR / "GuiCore.swift").read_text(encoding="utf-8")
+        self.assertIn('睡眠恢复尚未通过验收', core)
+        self.assertIn('不要把睡眠黑屏当作已关机', core)
+
+    def test_group_draft_and_course_confirmation_are_scoped(self) -> None:
+        source = (GUI_DIR / "GuiApp.swift").read_text(encoding="utf-8")
+        group = source.split('TextField("分组（回车保存）"', 1)[1].split('.textFieldStyle', 1)[0]
+        self.assertIn('set: { model.groupDrafts[node.id]', group)
+        self.assertNotIn('set: { model.libraryPreferences.groups', group)
+        self.assertIn('.onSubmit', group)
+        self.assertIn('model.groupDrafts.removeValue', group)
+        sheet = source.split('struct CourseManagerSheet:', 1)[1].split('struct ContentView:', 1)[0]
+        self.assertIn('.alert("确认启动课程组合？"', sheet)
+        self.assertIn('Button("启动…") { model.requestCourseStart(course) }', sheet)
+        self.assertNotIn('dismiss(); model.requestCourseStart', sheet)
+        self.assertEqual(source.count('.alert("确认启动课程组合？"'), 1)
+
+    def test_course_error_is_visible_inside_sheet(self) -> None:
+        source = (GUI_DIR / "GuiApp.swift").read_text(encoding="utf-8")
+        sheet = source.split('struct CourseManagerSheet:', 1)[1].split('struct ContentView:', 1)[0]
+        self.assertIn('if let error = model.state.lastError', sheet)
+        self.assertIn('Text(error).foregroundStyle(.red)', sheet)
+        request = source.split('func requestCourseStart(', 1)[1].split('func confirmCourseStart()', 1)[0]
+        self.assertLess(request.index('state.lastError = nil'), request.index('CourseLaunchRules.pending'))
+        self.assertIn('pendingCourse = nil', request)
+
     def test_gui_uses_existing_cli_entrypoints_only(self) -> None:
         """GUI 只能调用既有 CLI 子命令，不得自带导入/QEMU 参数逻辑。"""
         source = (GUI_DIR / "GuiCore.swift").read_text(encoding="utf-8")

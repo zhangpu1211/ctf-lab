@@ -85,20 +85,41 @@ def copy_tar_member(archive: tarfile.TarFile, member: tarfile.TarInfo, destinati
         shutil.copyfileobj(source, output, length=8 * 1024 * 1024)
 
 
-def find_disk_and_ovf(source: Path, temporary_dir: Path) -> tuple[Path, Path | None, list[str]]:
+def find_disk_and_ovf(source: Path, temporary_dir: Path, *,
+                      preferred_disk: str | None = None,
+                      ) -> tuple[Path, Path | None, list[str], list[str]]:
+    """定位镜像/OVA 中的系统盘与 OVF 描述，返回（磁盘、OVF、警告、全部磁盘名）。
+
+    多磁盘时默认取排序后的第一个并给出警告（识别是只读的，警告足够）；
+    ``preferred_disk`` 显式选择指定成员（按成员 basename 匹配），用于
+    导入等写操作——写路径必须由用户明确选盘，不猜测。
+    """
     warnings: list[str] = []
+
+    def choose(disks: list[tarfile.TarInfo] | list[Path]):
+        names = [Path(disk.name if hasattr(disk, "name") else str(disk)).name
+                 for disk in disks]
+        if preferred_disk is not None:
+            for index, name in enumerate(names):
+                if name == preferred_disk:
+                    return disks[index], names
+            raise InspectionError(
+                f"指定的磁盘不存在：{preferred_disk}；可用磁盘：{', '.join(names)}")
+        if len(disks) > 1:
+            warnings.append(f"发现 {len(disks)} 个磁盘，候选配置当前只使用第一个：{names[0]}")
+        return disks[0], names
+
     if source.is_dir():
         disks = sorted(path for path in source.iterdir() if path.is_file() and path.suffix.lower() in SUPPORTED_SUFFIXES)
         ovfs = sorted(source.glob("*.ovf"))
         if not disks:
             raise InspectionError(f"目录中没有支持的虚拟磁盘：{source}")
-        if len(disks) > 1:
-            warnings.append(f"目录中发现 {len(disks)} 个磁盘，候选配置当前只使用第一个：{disks[0].name}")
-        return disks[0], ovfs[0] if ovfs else None, warnings
+        disk, _ = choose(disks)
+        return disk, ovfs[0] if ovfs else None, warnings, [d.name for d in disks]
 
     if source.suffix.lower() != ".ova":
         sibling_ovfs = sorted(source.parent.glob("*.ovf"))
-        return source, sibling_ovfs[0] if len(sibling_ovfs) == 1 else None, warnings
+        return source, sibling_ovfs[0] if len(sibling_ovfs) == 1 else None, warnings, [source.name]
 
     with tarfile.open(source, "r:*") as archive:
         unsafe = [member.name for member in archive.getmembers() if member.isfile() and not safe_tar_member(member)]
@@ -108,15 +129,14 @@ def find_disk_and_ovf(source: Path, temporary_dir: Path) -> tuple[Path, Path | N
         ovfs = [member for member in archive.getmembers() if safe_tar_member(member) and Path(member.name).suffix.lower() == ".ovf"]
         if not disks:
             raise InspectionError(f"OVA 内没有支持的虚拟磁盘：{source}")
-        if len(disks) > 1:
-            warnings.append(f"OVA 内发现 {len(disks)} 个磁盘，候选配置当前只使用第一个：{disks[0].name}")
-        disk_path = temporary_dir / Path(disks[0].name).name
-        copy_tar_member(archive, disks[0], disk_path)
+        member, names = choose(disks)
+        disk_path = temporary_dir / Path(member.name).name
+        copy_tar_member(archive, member, disk_path)
         ovf_path = None
         if ovfs:
             ovf_path = temporary_dir / Path(ovfs[0].name).name
             copy_tar_member(archive, ovfs[0], ovf_path)
-        return disk_path, ovf_path, warnings
+        return disk_path, ovf_path, warnings, names
 
 
 def parse_memory_mb(quantity: str | None, units: str | None) -> int | None:
@@ -310,14 +330,16 @@ def infer_network(architecture: str, ovf: dict[str, Any]) -> tuple[str, str, str
     return "e1000", "low", "没有网卡元数据，x86 候选使用兼容性较好的 E1000"
 
 
-def inspect_image(source_arg: str | Path, *, calculate_hash: bool = True) -> dict[str, Any]:
+def inspect_image(source_arg: str | Path, *, calculate_hash: bool = True,
+                  preferred_disk: str | None = None) -> dict[str, Any]:
     source = Path(source_arg).expanduser().resolve()
     if not source.exists():
         raise InspectionError(f"镜像不存在：{source}")
     hash_target = source if source.is_file() else None
     temporary = tempfile.TemporaryDirectory(prefix="ctflab-inspect-")
     try:
-        disk, ovf_path, warnings = find_disk_and_ovf(source, Path(temporary.name))
+        disk, ovf_path, warnings, disk_names = find_disk_and_ovf(
+            source, Path(temporary.name), preferred_disk=preferred_disk)
         info = qemu_info(disk)
         ovf = parse_ovf(ovf_path)
         descriptor = read_descriptor_hints(disk)
@@ -341,6 +363,8 @@ def inspect_image(source_arg: str | Path, *, calculate_hash: bool = True) -> dic
             "schema": 1,
             "source_path": str(source),
             "disk_path": str(disk if source.suffix.lower() != ".ova" else Path(disk.name)),
+            "disks": disk_names,
+            "selected_disk": Path(str(disk.name)).name if source.suffix.lower() == ".ova" or source.is_dir() else None,
             "source_sha256": sha256_file(hash_target) if calculate_hash and hash_target else None,
             "format": info.get("format"),
             "virtual_size": info.get("virtual-size"),

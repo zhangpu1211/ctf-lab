@@ -133,6 +133,112 @@ class GracefulStopTests(unittest.TestCase):
             self.assertFalse(manager.runtime_state_path("kali-arm64").exists())
 
 
+class SpiceClientStopOrderTests(unittest.TestCase):
+    """停止顺序回归：QEMU 干净退出前必须先断开显示客户端。
+
+    依据 2026-10-05 的九份 QEMU 崩溃报告：QEMU 在 SPICE 客户端仍连接时干净退出
+    （ACPI 关机或 QMP quit），spice-server 的 RedClient 销毁路径稳定段错误
+    （InputsChannel::release_keys）。runner 的责任是保证客户端先断开。
+    """
+
+    def _write_runtime(self, manager: LabManager, pid: int, client_pid: int,
+                       log_path: Path) -> None:
+        qmp_path = manager.runtime_dir / "kali-arm64" / "qmp.sock"
+        qmp_path.parent.mkdir(parents=True, exist_ok=True)
+        qmp_path.write_text("", encoding="utf-8")
+        write_json(
+            manager.runtime_state_path("kali-arm64"),
+            {
+                "schema": 1,
+                "profile_id": "kali-arm64",
+                "pid": pid,
+                "spice_client_pid": client_pid,
+                "qmp_path": str(qmp_path),
+                "log_path": str(log_path),
+                "started_at": "2026-10-05T00:00:00+00:00",
+            },
+        )
+
+    def _fixture(self):
+        events: list[str] = []
+        alive = {"qemu": 4242, "client": 5151}
+
+        def fake_alive(pid: int) -> bool:
+            return pid in alive.values()
+
+        def fake_kill(pid: int, signum: int) -> None:
+            if pid == alive["qemu"]:
+                events.append("qemu-killed")
+                alive["qemu"] = -1
+            elif pid == alive["client"]:
+                events.append("client-terminated")
+                alive["client"] = -1
+
+        def fake_qmp(path, command, **kwargs):
+            events.append(f"qmp:{command}")
+            return {}
+
+        return events, alive, fake_alive, fake_kill, fake_qmp
+
+    def test_plain_stop_disconnects_client_before_qemu_shutdown(self) -> None:
+        events, alive, fake_alive, fake_kill, fake_qmp = self._fixture()
+
+        def guest_ignores_acpi(path, command, **kwargs):
+            fake_qmp(path, command)
+            if command == "quit":
+                events.append("qemu-killed")
+                alive["qemu"] = -1
+            return {}
+
+        with tempfile.TemporaryDirectory() as directory:
+            manager = LabManager(Path(directory))
+            log = manager.logs_dir / "kali-arm64.log"
+            log.parent.mkdir(parents=True, exist_ok=True)
+            log.write_text("boot\n", encoding="utf-8")
+            self._write_runtime(manager, alive["qemu"], alive["client"], log)
+            with mock.patch.object(ctflab, "bool_pid_alive", side_effect=fake_alive), \
+                    mock.patch.object(ctflab.os, "kill", side_effect=fake_kill), \
+                    mock.patch.object(ctflab, "qmp_command", side_effect=guest_ignores_acpi), \
+                    mock.patch.object(ctflab, "FORCED_SHUTDOWN_TIMEOUT_SECONDS", 0.2):
+                stopped = manager.stop(["kali-arm64"])
+            self.assertEqual(stopped, ["kali-arm64"])
+            self.assertIn("client-terminated", events)
+            self.assertIn("qmp:system_powerdown", events)
+            self.assertIn("qmp:quit", events)
+            # 客户端断开必须先于任何 QMP 关机命令，规避 spice-server 销毁崩溃。
+            self.assertLess(events.index("client-terminated"),
+                            events.index("qmp:system_powerdown"))
+            self.assertFalse(manager.runtime_state_path("kali-arm64").exists())
+
+    def test_graceful_stop_keeps_client_until_guest_exits(self) -> None:
+        events, alive, fake_alive, fake_kill, fake_qmp = self._fixture()
+
+        def guest_shuts_down(path, command, **kwargs):
+            fake_qmp(path, command)
+            if command == "system_powerdown":
+                events.append("qemu-killed")
+                alive["qemu"] = -1
+            return {}
+
+        with tempfile.TemporaryDirectory() as directory:
+            manager = LabManager(Path(directory))
+            log = manager.logs_dir / "kali-arm64.log"
+            log.parent.mkdir(parents=True, exist_ok=True)
+            log.write_text("boot\n", encoding="utf-8")
+            self._write_runtime(manager, alive["qemu"], alive["client"], log)
+            with mock.patch.object(ctflab, "bool_pid_alive", side_effect=fake_alive), \
+                    mock.patch.object(ctflab.os, "kill", side_effect=fake_kill), \
+                    mock.patch.object(ctflab, "qmp_command", side_effect=guest_shuts_down), \
+                    mock.patch.object(ctflab, "GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS", 0.5):
+                stopped = manager.stop(["kali-arm64"], graceful=True)
+            self.assertEqual(stopped, ["kali-arm64"])
+            # 优雅路径同样先断客户端（来宾 ACPI 关机快于任何固定等待，延时无法
+            # 规避 spice-server 销毁崩溃），再请求 ACPI；不落 QMP quit 强制梯级。
+            self.assertEqual(events[0], "client-terminated")
+            self.assertIn("qmp:system_powerdown", events)
+            self.assertNotIn("qmp:quit", events)
+
+
 class ResidualNetworkTests(unittest.TestCase):
     def test_stop_all_cleans_network_without_instances(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -214,6 +320,41 @@ class DoctorOutputTests(unittest.TestCase):
         self.assertIn("OPT  utmctl", text)
         self.assertIn("OPT  Tesseract OCR", text)
         self.assertIn("未安装时截图分类降级为人工复核", text)
+
+
+class RemoveImageTests(unittest.TestCase):
+    """remove PROFILE：删除导入数据，带运行守卫与幂等拒绝。"""
+
+    def test_remove_deletes_image_and_instance(self) -> None:
+        import json
+        with tempfile.TemporaryDirectory() as state_dir:
+            manager = LabManager(Path(state_dir))
+            image_dir = manager.images_dir / "smoke"
+            image_dir.mkdir(parents=True)
+            (image_dir / "image.json").write_text(json.dumps({"schema": 1}), encoding="utf-8")
+            (image_dir / "base-abc.qcow2").write_bytes(b"base")
+            instance = manager.runtime_dir / "smoke"
+            instance.mkdir(parents=True)
+            (instance / "overlay.qcow2").write_bytes(b"overlay")
+            manager.remove_image("smoke")
+            self.assertFalse(image_dir.exists(), "images 目录应删除")
+            self.assertFalse(instance.exists(), "runtime 实例目录应删除")
+
+    def test_remove_refuses_running_and_missing(self) -> None:
+        import json
+        import os
+        with tempfile.TemporaryDirectory() as state_dir:
+            manager = LabManager(Path(state_dir))
+            with self.assertRaisesRegex(ctflab.CTFLabError, "没有已导入的镜像数据"):
+                manager.remove_image("smoke")
+            image_dir = manager.images_dir / "smoke"
+            image_dir.mkdir(parents=True)
+            (image_dir / "image.json").write_text("{}", encoding="utf-8")
+            run_path = manager.runtime_state_path("smoke")
+            run_path.parent.mkdir(parents=True, exist_ok=True)
+            run_path.write_text(json.dumps({"pid": os.getpid()}), encoding="utf-8")
+            with self.assertRaisesRegex(ctflab.CTFLabError, "正在运行"):
+                manager.remove_image("smoke")
 
 
 if __name__ == "__main__":

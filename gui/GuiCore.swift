@@ -7,6 +7,40 @@
 
 import Foundation
 
+/// 恢复点名称必须与 CLI 白名单一致，不接受路径或 shell 字符。
+public enum RecoveryRules {
+    public static func validName(_ name: String) -> Bool {
+        name.range(of: "^[a-z0-9][a-z0-9._-]{0,31}$", options: .regularExpression) != nil
+    }
+    public static func checkpointName() -> String {
+        "before-" + UUID().uuidString.lowercased().prefix(12)
+    }
+}
+public struct RecoverySnapshot: Codable, Identifiable {
+    public let tag: String
+    public let date: String
+    public var id: String { tag }
+}
+public struct RecoveryBackup: Codable, Identifiable {
+    public let name: String
+    public let complete: Bool
+    public var id: String { name }
+}
+public struct SnapshotReport: Codable { public let snapshots: [RecoverySnapshot] }
+public struct BackupReport: Codable { public let backups: [RecoveryBackup] }
+public struct DisplayOpenReport: Codable { public let pid: Int; public let reconnected: Bool }
+public struct PreflightReport: Codable {
+    public struct Check: Codable { public let name: String; public let ok: Bool; public let detail: String; public let hint: String? }
+    public let ok: Bool
+    public let checks: [Check]
+    public var guidance: String { checks.filter { !$0.ok }.map { $0.detail + "\n" + ($0.hint ?? "") }.joined(separator: "\n\n") }
+    public static func decode(_ text: String) -> PreflightReport? {
+        guard let start = text.firstIndex(of: "{"), let end = text.lastIndex(of: "}"), start <= end else { return nil }
+        return try? JSONDecoder().decode(Self.self, from: Data(text[start...end].utf8))
+    }
+}
+public struct DisplayDiagnosisReport: Codable { public let state: String; public let hint: String }
+
 /// 内置三节点只是首个课程包的显示别名和默认顺序；运行管理不再限定这三个 ID。
 public enum LabNode: String, CaseIterable, Identifiable {
     case kali = "kali-arm64"
@@ -30,6 +64,13 @@ public enum LabNode: String, CaseIterable, Identifiable {
     /// 不猜测其硬件或 QEMU 参数。
     public static func displayName(for profileID: String) -> String {
         LabNode(rawValue: profileID)?.displayName ?? profileID
+    }
+
+    /// 列表与选择器的唯一标签：登记名与 profile ID 不同时附上 ID，
+    /// 避免多个同名登记（例如内置 Webserver 与历史 e2e 登记）无法区分。
+    public static func displayLabel(for profileID: String, name: String? = nil) -> String {
+        let display = (name?.isEmpty == false) ? name! : displayName(for: profileID)
+        return display == profileID ? display : "\(display)（\(profileID)）"
     }
 
     /// 统一排序：保留课堂三节点的依赖顺序，其余已登记节点按 ID 稳定排列。
@@ -97,23 +138,294 @@ public struct DistReport: Codable, Hashable {
 
 // MARK: - 状态与健康检查
 
+/// `status --json` 的启动阶段摘要（CLI 端 boot_stage_summary 的 UI 子集）。
+/// 四阶段由 CLI 依据进程、健康检查与显示客户端日志推导；GUI 只展示，不自行判断。
+public struct BootStage: Codable, Hashable {
+    public let name: String
+    public let ok: Bool?
+    public let detail: String?
+}
+
+public struct BootDiagnosis: Codable, Hashable {
+    public let message: String?
+    public let failedChecks: [String]?
+    public let logPath: String?
+    public let clientLogPath: String?
+    public let hint: String?
+
+    enum CodingKeys: String, CodingKey {
+        case message, hint
+        case failedChecks = "failed_checks"
+        case logPath = "log_path"
+        case clientLogPath = "client_log_path"
+    }
+}
+
+public struct BootSummary: Codable, Hashable {
+    public let phase: String
+    public let phaseLabel: String
+    /// ready / booting / timeout；与阶段名分开，避免把整体超时误当第五阶段。
+    public let overall: String
+    public let elapsedSeconds: Int?
+    public let readinessTimeoutSeconds: Int?
+    public let stages: [BootStage]?
+    public let diagnosis: BootDiagnosis?
+
+    enum CodingKeys: String, CodingKey {
+        case phase, overall, stages, diagnosis
+        case phaseLabel = "phase_label"
+        case elapsedSeconds = "elapsed_seconds"
+        case readinessTimeoutSeconds = "readiness_timeout_seconds"
+    }
+
+    public var isTimedOut: Bool { overall == "timeout" }
+
+    /// 表格单元显示：阶段标签 + 计时；超时附标记，诊断细节由提示列/日志承担。
+    public var displayText: String {
+        let elapsed = elapsedSeconds.map(String.init) ?? "?"
+        let limit = readinessTimeoutSeconds.map(String.init) ?? "?"
+        var text = "\(phaseLabel)（\(elapsed)s/\(limit)s）"
+        if isTimedOut { text += " · 超时" }
+        return text
+    }
+}
+
+/// 显示客户端状态（与虚拟机状态分列展示，第 8 项）。
+public struct SpiceClientStatus: Codable, Hashable {
+    public let pid: Int?
+    public let alive: Bool?
+    public let displayReady: Bool?
+    public var lastTransitionReason: String? = nil
+
+    enum CodingKeys: String, CodingKey {
+        case pid, alive
+        case displayReady = "display_ready"
+        case lastTransitionReason = "last_transition_reason"
+    }
+
+    /// 客户端列文案：已连接（display 通道就绪）/ 连接中（进程在、画面未就绪）/
+    /// 未连接（进程不在）/ —（非 SPICE 节点）。
+    public static func columnText(_ status: SpiceClientStatus?) -> String {
+        guard let status else { return "—" }
+        if status.alive == false { return "未连接" }
+        if status.displayReady == true { return "已连接" }
+        if status.alive == true { return "连接中" }
+        return "未连接"
+    }
+}
+
+public struct NodeResourceStatus: Codable, Hashable {
+    public let memoryMB: Int?
+    public let cpus: Int?
+    public let cpuPercent: Double?
+    public let rssMB: Double?
+    public let acceleration: String?
+    enum CodingKeys: String, CodingKey {
+        case cpus, acceleration
+        case memoryMB = "memory_mb"
+        case cpuPercent = "cpu_percent"
+        case rssMB = "rss_mb"
+    }
+}
+
 public struct StatusProfile: Codable, Hashable, Identifiable {
     public let id: String
     public let name: String?
+    /// 是否随包内置的课程配置；内置节点不能被移除登记。
+    public let builtin: Bool?
     public let imported: Bool
     public let importState: String?
+    /// 导入来源路径（image.json 记录）；扫描导入用它做幂等判断。
+    public let sourcePath: String?
     public let running: Bool
     public let pid: Int?
     public let logPath: String?
     public let baseSHA256: String?
     public let stalePid: Int?
+    public let boot: BootSummary?
+    public let spiceClient: SpiceClientStatus?
+    public var resources: NodeResourceStatus? = nil
 
     enum CodingKeys: String, CodingKey {
-        case id, name, imported, running, pid
+        case id, name, builtin, imported, running, pid, boot, resources
         case importState = "import_state"
+        case sourcePath = "source_path"
         case logPath = "log_path"
         case baseSHA256 = "base_sha256"
         case stalePid = "stale_pid"
+        case spiceClient = "spice_client"
+    }
+}
+
+/// 仅解释已知进程/通道状态；不以显示就绪推断登录、解锁或可见窗口。
+public enum DisplaySessionGuidance {
+    public static func message(for profile: StatusProfile) -> String? {
+        guard profile.running, let client = profile.spiceClient else { return nil }
+        if client.alive == false {
+            return "显示窗口未连接，但虚拟机仍在运行。点“重新打开显示窗口”即可恢复连接，无需再次启动或重启节点。"
+        }
+        if client.lastTransitionReason == "timeout" {
+            return "上一次分辨率过渡超时，不等同虚拟机死机。可先诊断显示，再只重连显示；不会自动重启来宾。"
+        }
+        if client.alive == true && client.displayReady != true {
+            return "正在连接或重建显示画面；虚拟机仍在运行，请先等待。长时间没有画面时可点“重连显示”，不会重启虚拟机。"
+        }
+        if client.displayReady == true {
+            return "显示通道已连接，不代表已登录或已解锁。窗口被隐藏或最小化时，点“打开显示窗口”可找回；画面卡住可点“重连显示”。"
+        }
+        return "显示状态尚不明确；可打开显示窗口查看，不必重复启动节点。"
+    }
+
+    public static func actionTitle(for profile: StatusProfile) -> String {
+        profile.spiceClient?.alive == false ? "重新打开显示窗口" : "打开显示窗口"
+    }
+
+    public static func canReconnect(_ profile: StatusProfile) -> Bool {
+        profile.running && profile.spiceClient != nil
+    }
+
+    public static func loginHelp(for profile: StatusProfile) -> String? {
+        guard ["kali-arm64", "kali"].contains(profile.id) else { return nil }
+        return "冷启动、重启或注销后是登录界面；会话锁屏后通常只需密码解锁。“Kali User”是显示名称，不一定是登录用户名。关闭显示窗口不会自动关机；重新打开会回到原会话。请使用安装时设置的账号和密码。"
+    }
+
+    public static func sleepHelp(for profile: StatusProfile) -> String? {
+        guard ["kali-arm64", "kali"].contains(profile.id) else { return nil }
+        return "睡眠恢复尚未通过验收，请暂用“锁定屏幕”或正常关机。重新打开显示窗口只恢复显示连接，不能保证唤醒来宾；不要把睡眠黑屏当作已关机。"
+    }
+}
+
+/// 节点统一运行状态（第 8 项）：由 status 字段推导，GUI 不做第二套探测。
+public enum NodeOperationalState: String, CaseIterable {
+    case notImported = "未导入"
+    case baseMissing = "基盘失效"
+    case stopped = "已停止"
+    case booting = "启动中"
+    case running = "运行中"
+    case timedOut = "启动超时"
+    case stale = "状态残留"
+
+    public var isProblem: Bool { self == .timedOut || self == .stale || self == .baseMissing }
+
+    /// 推导规则：残留 > 导入态 > 运行细分（超时 > 启动中 > 就绪）。
+    public static func state(for profile: StatusProfile) -> NodeOperationalState {
+        if profile.stalePid != nil { return .stale }
+        if !profile.imported {
+            return profile.importState == "missing-base" ? .baseMissing : .notImported
+        }
+        if !profile.running { return .stopped }
+        switch profile.boot?.overall {
+        case "timeout": return .timedOut
+        case "ready": return .running
+        default: return .booting
+        }
+    }
+
+    /// 状态列详情：启动中附带当前阶段标签，其余附 PID 或恢复提示。
+    public static func detailText(for profile: StatusProfile) -> String {
+        switch state(for: profile) {
+        case .booting:
+            return profile.boot.map { "阶段：\($0.phaseLabel)" } ?? "等待阶段信息"
+        case .running:
+            return profile.pid.map { "PID \($0)" } ?? "PID?"
+        case .timedOut:
+            return "查看诊断与日志后可 stop（只影响该节点）"
+        case .stale:
+            return "进程已退出，状态文件待清理（stop --all）"
+        case .baseMissing:
+            return "导入登记失效：基盘被移动或删除"
+        case .stopped, .notImported:
+            return ""
+        }
+    }
+}
+
+/// 节点搜索（第 8 项）：匹配 profile ID、登记名或显示名，大小写不敏感；
+/// 空查询匹配全部；分组与收藏由独立的本地管理元数据提供。
+public enum NodeSearch {
+    public static func matches(_ profile: StatusProfile, query: String) -> Bool {
+        let trimmed = query.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty else { return true }
+        let haystacks = [profile.id,
+                         profile.name ?? "",
+                         LabNode.displayName(for: profile.id)]
+        let needle = trimmed.lowercased()
+        return haystacks.contains { $0.lowercased().contains(needle) }
+    }
+
+    public static func filter(_ profiles: [StatusProfile], query: String) -> [StatusProfile] {
+        profiles.filter { matches($0, query: query) }
+    }
+}
+
+public enum NodeStatusFilter: String, CaseIterable {
+    case all = "全部状态", active = "正在运行", stopped = "已停止", problems = "需要处理"
+    public func matches(_ node: StatusProfile) -> Bool {
+        switch self {
+        case .all: return true
+        case .active: return node.running
+        case .stopped: return node.imported && !node.running && node.stalePid == nil
+        case .problems: return NodeOperationalState.state(for: node).isProblem
+        }
+    }
+}
+
+/// 管理元数据不修改 profile、镜像或网络，编码为独立状态目录作用域的本地偏好。
+public struct NodeLibraryPreferences: Codable, Equatable {
+    public var favorites: Set<String> = []
+    public var groups: [String: String] = [:]
+    public var lastUsed: [String: Date] = [:]
+    public var courses: [NodeCourse] = []
+    public init() {}
+
+    public mutating func setGroup(_ value: String, for id: String) {
+        let group = String(value.trimmingCharacters(in: .whitespacesAndNewlines).prefix(64))
+        groups[id] = group.isEmpty ? nil : group
+    }
+
+    public func ordered(_ profiles: [StatusProfile], recentFirst: Bool) -> [StatusProfile] {
+        profiles.sorted { left, right in
+            if favorites.contains(left.id) != favorites.contains(right.id) {
+                return favorites.contains(left.id)
+            }
+            if recentFirst {
+                let a = lastUsed[left.id] ?? .distantPast
+                let b = lastUsed[right.id] ?? .distantPast
+                if a != b { return a > b }
+            }
+            return left.id < right.id
+        }
+    }
+}
+
+public struct NodeCourse: Codable, Equatable, Identifiable {
+    public let id: String
+    public let name: String
+    public let profileIDs: [String]
+    public init(name: String, profileIDs: [String], id: String = UUID().uuidString) {
+        self.id = id
+        self.name = String(name.trimmingCharacters(in: .whitespacesAndNewlines).prefix(64))
+        self.profileIDs = LabNode.orderedProfileIDs(Array(Set(profileIDs)))
+    }
+}
+
+public enum CourseLaunchRules {
+    /// 全组合先校验，缺节点拒绝；已在运行节点不重复启动，失败不停止已有节点。
+    public static func pending(_ course: NodeCourse, profiles: [StatusProfile]) throws -> [String] {
+        guard !course.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              !course.profileIDs.isEmpty else {
+            throw NSError(domain: "CTFLab.Course", code: 1,
+                          userInfo: [NSLocalizedDescriptionKey: "课程组合需要名称和至少一个节点。"])
+        }
+        var result: [String] = []
+        for id in LabNode.orderedProfileIDs(Array(Set(course.profileIDs))) {
+            guard let profile = profiles.first(where: { $0.id == id }), profile.imported else {
+                throw NSError(domain: "CTFLab.Course", code: 2,
+                              userInfo: [NSLocalizedDescriptionKey: "组合中的 \(id) 未导入或已被移除，请先修正组合。"])
+            }
+            if !profile.running { result.append(id) }
+        }
+        return result
     }
 }
 
@@ -197,6 +509,23 @@ public struct ImageInspectionReport: Codable, Hashable {
 }
 
 public enum ImageOnboardingRules {
+    /// 同名登记只是 ID 冲突，不代表镜像已经导入；为新来源生成可编辑候选 ID。
+    public static func availableProfileID(sourcePath: String, existingIDs: Set<String>) -> String {
+        let base = suggestedProfileID(sourcePath: sourcePath)
+        if !existingIDs.contains(base) { return base }
+        var index = 2
+        while true {
+            let suffix = "-\(index)"
+            let candidate = String(base.prefix(49 - suffix.count)) + suffix
+            if !existingIDs.contains(candidate) { return candidate }
+            index += 1
+        }
+    }
+
+    public static func pendingImages(_ entries: [ImageLibraryEntry], nodes: [StatusProfile]) -> [ImageLibraryEntry] {
+        let importedSources = Set(nodes.filter(\.imported).compactMap(\.sourcePath))
+        return entries.filter { !importedSources.contains($0.path) }
+    }
     /// 从文件名给出可编辑的安全 id；CLI 仍会做最终校验与排他写入。
     public static func suggestedProfileID(sourcePath: String) -> String {
         let name = URL(fileURLWithPath: sourcePath).deletingPathExtension().lastPathComponent.lowercased()
@@ -214,6 +543,40 @@ public enum ImageOnboardingRules {
         return profileID.allSatisfy {
             $0.isASCII && ($0.isLowercase || $0.isNumber || $0 == "-")
         }
+    }
+}
+
+// MARK: - 镜像文件夹扫描
+
+/// 镜像文件夹顶层发现的磁盘镜像（只登记，不识别、不导入）。
+public struct ImageLibraryEntry: Identifiable, Hashable {
+    public let fileName: String
+    public let path: String
+    public let sizeBytes: Int64?
+
+    public var id: String { path }
+}
+
+/// 只读扫描镜像文件夹的顶层磁盘镜像。空文件夹是合法状态（返回空数组）；
+/// 目录遍历失败同样返回空数组，由调用方决定如何提示。
+public enum ImageFolderScanner {
+    public static let supportedExtensions = ["qcow2", "ova", "vmdk", "vdi", "vhd", "vhdx", "img", "raw"]
+
+    public static func scan(_ dir: String, fileManager: FileManager = .default) -> [ImageLibraryEntry] {
+        guard !dir.isEmpty, let names = try? fileManager.contentsOfDirectory(atPath: dir) else {
+            return []
+        }
+        let root = URL(fileURLWithPath: dir)
+        return names
+            .filter { supportedExtensions.contains(
+                URL(fileURLWithPath: $0).pathExtension.lowercased()) }
+            .sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+            .map { name in
+                let path = root.appendingPathComponent(name).path
+                let attributes = try? fileManager.attributesOfItem(atPath: path)
+                let size = (attributes?[.size] as? NSNumber)?.int64Value
+                return ImageLibraryEntry(fileName: name, path: path, sizeBytes: size)
+            }
     }
 }
 
@@ -256,10 +619,11 @@ public struct GuiState: Equatable {
     public var anyRunning: Bool { !runningProfileIDs.isEmpty }
     public var canVerify: Bool { !(distDir ?? "").isEmpty && !phase.isBusy }
     public var canImport: Bool { verificationPassed && !anyRunning && !phase.isBusy }
+    /// 启动只依赖状态目录里已导入的节点：镜像文件夹可以只是普通文件夹（可为空、
+    /// 无分发清单），不要求先通过成套分发的校验。
     public var canStartSelected: Bool {
         guard let selectedProfileID else { return false }
-        return verificationPassed
-            && importedProfileIDs.contains(selectedProfileID)
+        return importedProfileIDs.contains(selectedProfileID)
             && !runningProfileIDs.contains(selectedProfileID)
             && !phase.isBusy
     }
@@ -280,11 +644,12 @@ public struct GuiState: Equatable {
     public var statusLine: String {
         if let lastError { return "失败：\(lastError)" }
         if phase.isBusy { return progressText.isEmpty ? "执行中…" : progressText }
-        if verificationPassed && allImported {
-            return anyRunning ? "实验环境运行中" : "实验环境已就绪（未运行）"
+        if anyRunning { return "实验环境运行中" }
+        if verificationPassed && allImported && !configuredProfileIDs.isEmpty {
+            return "实验环境已就绪（未运行）"
         }
-        if verificationPassed { return "分发目录已通过校验" }
-        return "请选择并校验分发目录"
+        if verificationPassed { return "镜像文件夹已通过校验" }
+        return "选择镜像文件夹，或直接启动已导入的节点"
     }
 }
 
@@ -295,7 +660,17 @@ public enum CliAction: Equatable {
     case importNode(node: LabNode, sourcePath: String, manifestPath: String)
     case run(nodes: [LabNode])
     case importProfile(profileID: String, sourcePath: String, manifestPath: String)
-    case runProfiles(profileIDs: [String])
+    case runProfiles(profileIDs: [String], clipboard: Bool, displayQuality: String? = nil,
+                     fileTransfer: Bool = false, resourcePreset: String? = nil)
+    case showDisplay(profileID: String)
+    case reconnectDisplay(profileID: String)
+    case diagnostics(path: String)
+    case preflight(profileID: String, resourcePreset: String? = nil)
+    case displayDiagnose(profileID: String)
+    case updateStage(source: String, sha256: String)
+    case updateSelect(slot: String)
+    case updateRollback
+    case updateLaunch
     case status
     case health(node: LabNode)
     case healthProfile(profileID: String)
@@ -303,9 +678,15 @@ public enum CliAction: Equatable {
     case stopProfiles(profileIDs: [String])
     case resetNode(node: LabNode)
     case resetProfile(profileID: String)
+    case deregisterProfile(profileID: String)
+    case removeImage(profileID: String)
     case inspectImage(sourcePath: String)
     case onboardX86(sourcePath: String, profileID: String)
+    /// 扫描自动导入：不指定架构，由 CLI 的 inspect 证据推断（x86_64 与 aarch64 都支持）。
+    case onboardAuto(sourcePath: String, profileID: String)
     case probeProfile(profileID: String, matrix: Bool)
+    case snapshot(profileID: String, operation: String, name: String? = nil)
+    case backupReset(profileID: String, name: String = RecoveryRules.checkpointName())
 
     /// 参数数组：不做 shell 拼接，路径（含空格）保持为单个参数。
     public func arguments(stateDir: String? = nil) -> [String] {
@@ -323,10 +704,41 @@ public enum CliAction: Equatable {
             args += ["run"] + LabNode.orderedProfileIDs(nodes.map(\.rawValue))
         case .importProfile(let profileID, let sourcePath, let manifestPath):
             args += ["import", profileID, sourcePath, "--manifest", manifestPath]
-        case .runProfiles(let profileIDs):
+        case .runProfiles(let profileIDs, let clipboard, let displayQuality, let fileTransfer, let resourcePreset):
             args += ["run"] + LabNode.orderedProfileIDs(profileIDs)
+            if clipboard {
+                // 文本剪贴板共享是显式授权项：只有用户打开开关才传给 CLI。
+                args += ["--clipboard"]
+            }
+            if let displayQuality {
+                args += ["--display-quality", displayQuality]
+            }
+            if fileTransfer { args += ["--file-transfer"] }
+            if let resourcePreset { args += ["--resource-preset", resourcePreset] }
+        case .showDisplay(let profileID):
+            args += ["show", profileID]
+        case .reconnectDisplay(let profileID):
+            args += ["show", profileID, "--reconnect"]
+        case .diagnostics(let path):
+            args += ["doctor", "--diagnostics", path]
+        case .preflight(let profileID, let preset):
+            args += ["preflight", profileID]
+            if let preset { args += ["--resource-preset", preset] }
+        case .displayDiagnose(let profileID):
+            args += ["display-diagnose", profileID]
+        case .updateStage(let source, let sha256):
+            args += ["update", "stage", source, "--sha256", sha256, "--allow-local-candidate"]
+        case .updateSelect(let slot): args += ["update", "select", slot]
+        case .updateRollback: args += ["update", "rollback"]
+        case .updateLaunch: args += ["update", "launch"]
         case .status:
             args += ["status", "--json"]
+        case .snapshot(let profileID, let operation, let name):
+            args += ["snapshot", operation, profileID]
+            if let name { args.append(name) }
+            if operation == "list" || operation == "list-backups" { args.append("--json") }
+        case .backupReset(let profileID, let name):
+            args += ["reset", profileID, "--backup", name]
         case .health(let node):
             args += ["health", node.rawValue, "--json"]
         case .healthProfile(let profileID):
@@ -339,12 +751,19 @@ public enum CliAction: Equatable {
             args += ["reset", node.rawValue]
         case .resetProfile(let profileID):
             args += ["reset", profileID]
+        case .deregisterProfile(let profileID):
+            args += ["deregister", profileID]
+        case .removeImage(let profileID):
+            args += ["remove", profileID]
         case .inspectImage(let sourcePath):
             args += ["inspect", sourcePath, "--json"]
         case .onboardX86(let sourcePath, let profileID):
             // x86 向导只明确架构；固件、磁盘控制器、网卡仍由 inspect 证据生成候选，
             // 不在 GUI 中拼接任意 QEMU 原始参数。
             args += ["onboard", sourcePath, "--id", profileID, "--architecture", "x86_64"]
+        case .onboardAuto(let sourcePath, let profileID):
+            // 扫描自动导入：不指定架构，由 CLI 的 inspect 证据推断（x86_64/aarch64 均可）。
+            args += ["onboard", sourcePath, "--id", profileID]
         case .probeProfile(let profileID, let matrix):
             args += ["probe", profileID]
             if matrix { args += ["--matrix"] }

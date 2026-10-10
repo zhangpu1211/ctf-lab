@@ -295,6 +295,11 @@ state:
   `disable-copy-paste=off`（或省略），允许文本剪贴板，`disable-agent-file-xfer=on` 仍保留。
   负向 E2E 必须在 agent transport 存在的前提下验证未授权时英文、中文、多行文本双向均不泄漏；
   任一层不能证明隔离，则**不得实现路径 B**；
+- **2026-10-08 独立文件授权补充**：以上 `disable-agent-file-xfer=on` 描述的是未传
+  `--file-transfer` 的默认/文本共享路径。只有额外显式授权 `--file-transfer` 才改为
+  `disable-agent-file-xfer=off`；该选项不隐式打开文本剪贴板。GUI 两个开关分开，
+  客户端拖放目标也由文件授权独立控制。仅支持 Mac→Kali 拖放，未实现反向文件传输。
+  文件拖放正/负向 E2E 尚未完成，不得用参数测试冒充实际文件传输通过；
 - **范围限制**：SPICE 仅允许 `kali-arm64`；auto 启动靶机 profile（smoke、basic-pentesting-2 等）时
   一律选择 Cocoa，并有对应的选择测试；
 - **前置 PoC（独立门槛）**：自管 QEMU + SPICE 的图形设备与客户端组合必须先做独立 PoC；
