@@ -446,13 +446,13 @@ class GuiDocsGuardTests(unittest.TestCase):
 
     def test_tutorial_leads_with_gui_and_keeps_cli(self) -> None:
         text = self.TUTORIAL.read_text(encoding="utf-8")
-        gui_section = text.index("## 2. 图形界面流程")
-        cli_section = text.index("## 3. 命令行流程")
+        gui_section = text.index("## 2. 推荐图形流程")
+        cli_section = text.index("## 4. CLI 排障")
         self.assertLess(gui_section, cli_section, "图形流程必须排在命令行之前")
-        for needle in ("双击", "校验分发目录", "导入实验环境", "启动所选节点", "检查状态", "重置",
-                       "添加 x86 镜像", "只读识别", "受控回退矩阵"):
+        for needle in ("打开 CTFLab.app", "校验后导入缺失节点", "启动所选节点", "健康检查", "重置",
+                       "未知镜像向导", "只读识别", "矩阵结果"):
             self.assertIn(needle, text)
-        self.assertIn("Contents/Resources/bin/CTFLab", text)
+        self.assertIn("Contents/Resources/bin/ctflab-cli", text)
 
     def test_readme_mentions_gui_entry_and_cli_kept(self) -> None:
         text = self.README.read_text(encoding="utf-8")

@@ -125,9 +125,11 @@ class ProbeVerdictTests(unittest.TestCase):
         self.assertEqual(len(hints), 1)
         for keyword in ("固件", "磁盘总线", "启动顺序"):
             self.assertIn(keyword, hints[0])
-        # 其他分类不产生建议；人工确认边界由 requires_human_review 保持
-        self.assertEqual(probe_recommendations("uefi_shell"), [])
-        self.assertEqual(probe_recommendations("login_ready"), [])
+        # 故障分类给出处置建议；登录画面仍提醒网络和服务需要独立验收。
+        self.assertIn("EFI 引导项", " ".join(probe_recommendations("uefi_shell")))
+        self.assertIn("不是启动成功", " ".join(probe_recommendations("uefi_shell")))
+        self.assertIn("目标服务", " ".join(probe_recommendations("login_ready")))
+        self.assertIn("不自动标记", " ".join(probe_recommendations("login_ready")))
         self.assertEqual(probe_recommendations(None), [])
 
     def test_readiness_ordering_without_failure_screen(self) -> None:

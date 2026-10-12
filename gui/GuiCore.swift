@@ -99,6 +99,7 @@ public struct DistEntry: Codable, Identifiable, Hashable {
     public let role: String?
     public let size: Int64?
     public let expectedSize: Int64?
+    public let expectedSha256: String?
     public let status: String
     public let problem: String?
     public var id: String { file }
@@ -106,6 +107,7 @@ public struct DistEntry: Codable, Identifiable, Hashable {
     enum CodingKeys: String, CodingKey {
         case file, profile, role, size, status, problem
         case expectedSize = "expected_size"
+        case expectedSha256 = "expected_sha256"
     }
 
     public var statusText: String {
@@ -127,6 +129,87 @@ public struct DistSummary: Codable, Hashable {
     public let failed: Int
 }
 
+/// 内容包（schema 2 分发目录）在 `dist verify --json` 报告中的 `pack` 摘要。
+/// 本机冲突状态来自 CLI 的只读预览；导入决定仍以 dist install 的实际校验为准。
+public struct PackLocalStatus: Codable, Hashable {
+    public let kind: String
+    public let sha256: String?
+}
+
+public struct PackNode: Codable, Hashable {
+    public let profile: String
+    public let hasBase: Bool
+    public let hasNvram: Bool
+    public let name: String?
+    public let architecture: String?
+    public let firmware: String?
+    public let memoryMb: Int?
+    public let cpus: Int?
+    public let local: PackLocalStatus?
+
+    enum CodingKeys: String, CodingKey {
+        case profile, name, architecture, firmware, cpus, local
+        case hasBase = "has_base"
+        case hasNvram = "has_nvram"
+        case memoryMb = "memory_mb"
+    }
+}
+
+public struct PackSummary: Codable, Hashable {
+    public let id: String
+    public let name: String
+    public let version: String
+    public let requiresRunner: String
+    public let runner: String?
+    public let runnerSatisfied: Bool?
+    public let notes: [String]?
+    public let nodes: [PackNode]
+    public let docs: [String]?
+    public let claims: [String]?
+    public let claimsNote: String?
+
+    enum CodingKeys: String, CodingKey {
+        case id, name, version, notes, nodes, docs, claims
+        case requiresRunner = "requires_runner"
+        case runner = "runner"
+        case runnerSatisfied = "runner_satisfied"
+        case claimsNote = "claims_note"
+    }
+}
+
+/// `dist install --json` 的结果（成功时打印；失败走通用错误通道）。
+public struct PackInstallReport: Codable, Hashable {
+    public let ok: Bool
+    public let pack: PackSummary?
+    public let installed: [String]?
+    public let skippedIdentical: [String]?
+    public let imported: [String]?
+    public let docs: [String]?
+    public let record: String?
+
+    enum CodingKeys: String, CodingKey {
+        case ok, pack, installed, imported, docs, record
+        case skippedIdentical = "skipped_identical"
+    }
+
+    public static func parse(_ text: String) -> PackInstallReport? {
+        // stdout 可能混有导入进度行；从后往前找能整体解码成 JSON 的花括号起点。
+        var positions: [String.Index] = []
+        var index = text.startIndex
+        while let brace = text[index...].firstIndex(of: "{") {
+            positions.append(brace)
+            index = text.index(after: brace)
+        }
+        for brace in positions.reversed() {
+            if let data = String(text[brace...]).data(using: .utf8),
+               let report = try? JSONDecoder().decode(PackInstallReport.self, from: data) {
+                return report
+            }
+        }
+        return nil
+    }
+}
+
 public struct DistReport: Codable, Hashable {
     public let ok: Bool
     public let entries: [DistEntry]
@@ -134,6 +217,8 @@ public struct DistReport: Codable, Hashable {
     public let summary: DistSummary?
     public let dir: String?
     public let manifest: String?
+    /// schema 2 内容包摘要；旧分发目录（schema 1）为 nil，解码缺键时也为 nil。
+    public var pack: PackSummary? = nil
 }
 
 // MARK: - 状态与健康检查
@@ -657,6 +742,7 @@ public struct GuiState: Equatable {
 
 public enum CliAction: Equatable {
     case distVerify(dir: String)
+    case distInstall(dir: String)
     case importNode(node: LabNode, sourcePath: String, manifestPath: String)
     case run(nodes: [LabNode])
     case importProfile(profileID: String, sourcePath: String, manifestPath: String)
@@ -682,9 +768,12 @@ public enum CliAction: Equatable {
     case removeImage(profileID: String)
     case inspectImage(sourcePath: String)
     case onboardX86(sourcePath: String, profileID: String)
+    case retryOnboard(sourcePath: String, profileID: String)
     /// 扫描自动导入：不指定架构，由 CLI 的 inspect 证据推断（x86_64 与 aarch64 都支持）。
     case onboardAuto(sourcePath: String, profileID: String)
     case probeProfile(profileID: String, matrix: Bool)
+    case applyMatrixCandidate(profileID: String, reportPath: String)
+    case reviewMatrixCandidate(profileID: String, reportPath: String, attempt: Int)
     case snapshot(profileID: String, operation: String, name: String? = nil)
     case backupReset(profileID: String, name: String = RecoveryRules.checkpointName())
 
@@ -696,7 +785,11 @@ public enum CliAction: Equatable {
         }
         switch self {
         case .distVerify(let dir):
-            args += ["dist", "verify", "--dir", dir, "--json"]
+            // --conflicts 提供内容包冲突预览（只读）；schema 1 目录不受影响。
+            args += ["dist", "verify", "--dir", dir, "--json", "--conflicts"]
+        case .distInstall(let dir):
+            // 内容包一次性安装：校验→装配置→导基盘→复制说明；与 import 共用取消通道。
+            args += ["dist", "install", "--dir", dir, "--json"]
         case .importNode(let node, let sourcePath, let manifestPath):
             // 与 CLI 一致：基盘是位置参数，--manifest 负责哈希校验并配对同目录的 NVRAM 模板。
             args += ["import", node.rawValue, sourcePath, "--manifest", manifestPath]
@@ -756,7 +849,8 @@ public enum CliAction: Equatable {
         case .removeImage(let profileID):
             args += ["remove", profileID]
         case .inspectImage(let sourcePath):
-            args += ["inspect", sourcePath, "--json"]
+            // 向导只展示硬件候选；正式导入独立计算并登记来源哈希。
+            args += ["inspect", sourcePath, "--json", "--no-hash"]
         case .onboardX86(let sourcePath, let profileID):
             // x86 向导只明确架构；固件、磁盘控制器、网卡仍由 inspect 证据生成候选，
             // 不在 GUI 中拼接任意 QEMU 原始参数。
@@ -764,15 +858,135 @@ public enum CliAction: Equatable {
         case .onboardAuto(let sourcePath, let profileID):
             // 扫描自动导入：不指定架构，由 CLI 的 inspect 证据推断（x86_64/aarch64 均可）。
             args += ["onboard", sourcePath, "--id", profileID]
+        case .retryOnboard(let sourcePath, let profileID):
+            args += ["onboard", sourcePath, "--id", profileID, "--resume"]
         case .probeProfile(let profileID, let matrix):
             args += ["probe", profileID]
             if matrix { args += ["--matrix"] }
+        case .applyMatrixCandidate(let profileID, let reportPath):
+            args += ["probe", profileID, "--apply-matrix-report", reportPath, "--confirm-apply"]
+        case .reviewMatrixCandidate(let profileID, let reportPath, let attempt):
+            args += ["probe", profileID, "--apply-matrix-report", reportPath,
+                     "--review-attempt", String(attempt), "--confirm-apply"]
         }
         return args
     }
 
     public var displayCommand: String {
         (["ctflab"] + arguments()).joined(separator: " ")
+    }
+
+    public var controlsImport: Bool {
+        switch self {
+        case .importNode, .importProfile, .onboardX86, .onboardAuto, .retryOnboard, .distInstall: return true
+        default: return false
+        }
+    }
+
+    /// `dist verify` 失败时仍打印结构化 JSON；GUI 需要原文解码出红色校验行与具体问题，
+    /// 不能套用“命令失败 + 尾部截断”的通用文案（那会破坏 JSON 解码）。
+    public var preservesRawOutputOnFailure: Bool {
+        if case .distVerify = self { return true }
+        return false
+    }
+}
+
+/// 校验结果到导入动作的决策门：失败一律中止，包走单次安装，旧清单逐节点导入。
+/// 独立可测：verify 失败/输出不可解码时绝不能回退到普通镜像 onboard 路径。
+public enum DistImportGate {
+    public enum Decision: Equatable {
+        case installPack
+        case importMissing
+        case abort
+    }
+
+    public static func decide(report: DistReport?, manifestExists: Bool) -> Decision {
+        guard let report, report.ok, manifestExists else { return .abort }
+        if report.pack != nil { return .installPack }
+        return .importMissing
+    }
+
+    /// 包节点冲突预览文案：按本机候选与包内配置的实际哈希区分“一致将跳过”与
+    /// “不同将拒绝覆盖”，避免内容一致时仍显示误导性的冲突警告。
+    public static func conflictNote(local: PackLocalStatus?, profilePackSha256: String?) -> String? {
+        switch local?.kind {
+        case "builtin":
+            return "与内置课程同名，导入会被拒绝"
+        case "user":
+            if let pack = profilePackSha256, local?.sha256 == pack {
+                return "同名候选内容一致，重复导入将跳过"
+            }
+            return "已有同名候选配置；内容不同将拒绝覆盖"
+        default:
+            return nil
+        }
+    }
+}
+
+/// 从人读 CLI 输出提取“矩阵成功 + 报告路径”这一最小事实。
+/// 失败矩阵也会打印报告路径，因此只有同时出现成功结论时才允许 GUI 显示固化按钮。
+public struct MatrixProbeResult: Equatable {
+    public let summary: String
+    public let reportPath: String
+    public let reviewAttempt: Int?
+    public let screenshotPath: String?
+
+    public static func parse(_ output: String) -> MatrixProbeResult? {
+        var summary: String?
+        var reportPath: String?
+        var reviewAttempt: Int?
+        var screenshotPath: String?
+        for rawLine in output.components(separatedBy: .newlines) {
+            let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+            if line.hasPrefix("矩阵结论："), line.contains(" 可以启动（") {
+                summary = line
+            } else if line.hasPrefix("矩阵待人工复核：") {
+                let value = line.dropFirst("矩阵待人工复核：".count).split(separator: "（").first
+                if let value, let index = Int(value), index > 0 {
+                    reviewAttempt = index
+                    summary = line
+                }
+            } else if line.hasPrefix("复核截图：") {
+                let value = String(line.dropFirst("复核截图：".count)).trimmingCharacters(in: .whitespaces)
+                if value.hasPrefix("/") { screenshotPath = value }
+            } else if line.hasPrefix("矩阵报告：") {
+                let value = String(line.dropFirst("矩阵报告：".count))
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                if value.hasPrefix("/") { reportPath = value }
+            }
+        }
+        guard let summary, let reportPath else { return nil }
+        if reviewAttempt != nil && screenshotPath == nil { return nil }
+        return MatrixProbeResult(summary: summary, reportPath: reportPath,
+                                 reviewAttempt: reviewAttempt, screenshotPath: screenshotPath)
+    }
+}
+
+/// CLI 独立进度行；未收到完整行时等待，避免管道拆分 JSON 被误读。
+public struct ImportProgress: Decodable {
+    public let stage: String
+    public let done: Int64?
+    public let total: Int64?
+    public let elapsed_seconds: Double
+    public let cancellable: Bool
+
+    public static func latest(in output: String) -> ImportProgress? {
+        let lines = output.components(separatedBy: "\n").dropLast()
+        let prefix = "CTFLAB_IMPORT_PROGRESS "
+        for line in lines.reversed() where line.hasPrefix(prefix) {
+            if let data = String(line.dropFirst(prefix.count)).data(using: .utf8),
+               let progress = try? JSONDecoder().decode(ImportProgress.self, from: data) {
+                return progress
+            }
+        }
+        return nil
+    }
+
+    public var label: String {
+        let percent = total.flatMap { total in
+            total > 0 ? done.map { " \(min(100, max(0, Int(Double($0) / Double(total) * 100))))%" } : nil
+        } ?? ""
+        return "\(stage)\(percent) · \(Int(elapsed_seconds)) 秒"
     }
 }
 

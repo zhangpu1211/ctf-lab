@@ -33,7 +33,8 @@ COMMAND = re.compile(r"(?:\./tools/)?ctflab\s+([a-z][a-z0-9-]*)((?:[^\n`#&|;]*))
 DOC_PATHS = [PROJECT_ROOT / "README.md"] + sorted((PROJECT_ROOT / "docs").glob("*.md"))
 
 # 文档示例中尚未 onboard 的候选 profile（inspect/onboard 之后才会存在）。
-PLACEHOLDER_PROFILES = {"machine-1", "new-machine"}
+# smoke-mini 是内容包验收记录/分发指南中随包分发的示例节点，由内容包导入建立。
+PLACEHOLDER_PROFILES = {"machine-1", "new-machine", "smoke-mini"}
 
 
 def command_spec() -> tuple[dict[str, argparse.ArgumentParser], dict[str, argparse.Action]]:

@@ -27,6 +27,8 @@
 
 ## 2. `.app` 结构
 
+下面保留 Task 6.2 的早期启动器结构示意，不作为当前 GUI bundle 的逐键定义。当前主入口是 `Contents/MacOS/CTFLabGUI`，CLI 在 `Contents/Resources/bin/ctflab-cli`（兼容名 `CTFLab`），另含受控显示客户端；以构建器与具体包 MANIFEST/Info.plist 为准。最新发布版本与用户目录见[当前状态](ctflab-current-status.md)。
+
 ```
 CTFLab.app/
 ├── Contents/

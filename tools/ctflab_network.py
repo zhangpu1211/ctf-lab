@@ -274,8 +274,10 @@ class DHCPServer:
         *,
         pcap_path: Path | None = None,
         max_frames_per_second: int = 10000,
+        listener_fd: int | None = None,
     ):
         self.port = port
+        self.listener_fd = listener_fd
         self.static_leases = {key.lower(): value for key, value in static_leases.items()}
         self.state_path = state_path
         self.leases: dict[str, str] = {}
@@ -360,10 +362,16 @@ class DHCPServer:
     def serve(self) -> int:
         import select
 
-        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        listener.bind((HUB_HOST, self.port))
-        listener.listen(8)
+        if self.listener_fd is not None:
+            listener = socket.socket(fileno=self.listener_fd)
+            if listener.getsockname() != (HUB_HOST, self.port):
+                listener.close()
+                raise ValueError("继承的监听端点与回环端口不一致")
+        else:
+            listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            listener.bind((HUB_HOST, self.port))
+            listener.listen(8)
         listener.setblocking(False)
         clients: dict[socket.socket, bytearray] = {}
         self.write_state()
@@ -454,6 +462,7 @@ class DHCPServer:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="CTFLab 回环 TCP 二层交换机和 DHCP 服务")
     parser.add_argument("--port", type=int, required=True)
+    parser.add_argument("--listener-fd", type=int, help=argparse.SUPPRESS)
     parser.add_argument("--state", type=Path, required=True)
     parser.add_argument("--lease", action="append", default=[], metavar="MAC=IP")
     parser.add_argument("--pcap", type=Path, help="可选的 Ethernet PCAP 输出路径")
@@ -479,6 +488,7 @@ def main() -> int:
         args.state,
         pcap_path=args.pcap,
         max_frames_per_second=args.max_frames_per_second,
+        listener_fd=args.listener_fd,
     )
     signal.signal(signal.SIGTERM, lambda _signum, _frame: setattr(server, "running", False))
     signal.signal(signal.SIGINT, lambda _signum, _frame: setattr(server, "running", False))

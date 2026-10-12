@@ -2,6 +2,8 @@
 
 第一阶段提供一个不依赖 UTM GUI 的 QEMU 运行器。它负责把镜像导入为只读基础镜像，启动时创建 qcow2 overlay，并让 Kali、Smoke、Basic Pentesting 2 加入同一个隔离实验网。
 
+> 2026-10-11 整理：本文主要面向源码维护；课堂图形流程见[使用教程](ctflab-student-distribution-tutorial.md)，最新发布/工作区/镜像库分别见[当前状态](ctflab-current-status.md)。产品最低 macOS 26、Apple Silicon。不要按旧验证记录中的已清理 App 路径操作。
+
 ## 0. 先选交付方式
 
 - **课堂/学生**：用打包好的 `CTFLab.app`（内置 QEMU 与 Python，不需要任何环境）+
@@ -172,7 +174,7 @@ Kali ARM64 镜像导入后，会与两台靶机处于同一二层网络，可直
 | Basic Pentesting 2 | SSH 22 | `127.0.0.1:12221` |
 | Kali | SSH 22 | `127.0.0.1:12210` |
 
-Kali 图形窗口由 `qemu-system-aarch64` 打开；x86 靶机也会各自打开 QEMU 窗口，但它们的主要用途是提供网络服务。若只做后台验证，可以使用 `--headless`，日志在 `~/Library/Application Support/CTFLab/logs/`。
+Kali 图形窗口在 SPICE 模式由受控显示客户端提供；Cocoa 退化模式与 x86 靶机由 QEMU 提供固定显示窗口。靶机主要提供网络服务。后台验证可用 `--headless`，日志在 `~/Library/Application Support/CTFLab/logs/`。
 
 实验网会学习来宾 MAC，仅把已知单播发往目标端口；广播、组播和未知单播仍按二层交换规则转发。每个来宾默认限制为每秒 10000 帧，超出部分会丢弃并显示在 `status` 的 `dropped` 计数中。使用 `run --pcap` 后，抓包写入 `~/Library/Application Support/CTFLab/pcap/`；PCAP 可能包含实验口令或利用流量，不应直接公开分发。
 
@@ -190,7 +192,7 @@ Kali 图形会话处于活动状态时，ACPI 电源键会打开来宾自己的�
 
 `run` 的 `--display auto` 是默认策略：Kali 在 SPICE 能力完整时使用真实自动分辨率，x86 靶机使用
 Cocoa 固定显示；无头模式不启动图形客户端。
-如需调试已验证的实验显示路径，可显式传 `--display spice`；它仍只允许单独的 Kali 图形会话，缺少
+如需明确选择 SPICE 路径，可显式传 `--display spice`；显示能力仅用于 Kali 图形会话，缺少
 SPICE 能力时会在创建虚拟机前失败，不自动回退。见[联网与动态分辨率验证](verification-display-network-2026-09-16.md)
 与[动态分辨率设计](ctflab-dynamic-resolution-design.md)。
 
@@ -208,7 +210,7 @@ Ghidra 的帮助异常（JavaHelp `view is invalid`）来自 Kali `ghidra` 发�
 tail -f "$HOME/Library/Application Support/CTFLab/logs/basic-pentesting-2.log"
 ```
 
-`reset` 只删除运行 overlay，不删除导入的基础镜像，也不会触碰原始下载目录。第一阶段暂不创建 macOS 的 host-only 网卡，因此 Mac 侧采用端口映射；Kali 与靶机通过回环 TCP 二层交换机互通。当前 Python 交换机已具备 MAC 学习、限速和 PCAP，后续仍会迁移为独立的 Go `ctflab-switch`，并补充可选的 Mac 主机直连模式。
+`reset` 丢弃运行实例及其中快照（需保留时使用停机备份），不删除导入基础镜像，也不改原始下载。当前未创建 macOS host-only 网卡，Mac 侧采用端口映射；Kali 与靶机通过回环 TCP 二层交换机互通。Python 交换机已具备 MAC 学习、限速和 PCAP；独立交换机/主机直连属于后续设计，不是当前能力。
 
 导入、候选配置生成、启动、停止和重置由状态目录中的内核文件锁串行化。两个终端同时修改运行状态时，后发命令最多等待 10 秒；仍未取得锁会显示当前占用进程和操作，且不会删除或覆盖对方的中间文件。锁由操作系统随进程退出自动释放，不需要手工清理锁文件。
 

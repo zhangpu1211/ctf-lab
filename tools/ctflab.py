@@ -28,20 +28,48 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 import time
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Iterable, Iterator, TextIO
 import urllib.error
+import urllib.parse
 import urllib.request
 
-from ctflab_inspect import InspectionError, inspect_image, profile_from_report, report_text
+from ctflab_inspect import (IMPORT_CONTROL, import_session, InspectionError, PreparedOva, inspect_image, prepare_ova,
+                            profile_from_report, report_text, require_free_space, source_identity)
 from ctflab_utm import PublishError, UTMExportError, exclusive_rename, export_utm_package
 
 try:
     import yaml
 except ImportError:  # pragma: no cover - 在不含 PyYAML 的分发环境中给出清晰提示
     yaml = None
+
+
+# 长驻 QEMU/交换机由运行状态文件管理。父 CLI 在同一进程内做探测时仍需保留
+# Popen 对象并在停止后 wait，否则 Python 会在子进程仍运行时产生 ResourceWarning，
+# 也可能延后回收已退出子进程。
+_BACKGROUND_PROCESSES: dict[int, subprocess.Popen[Any]] = {}
+_BACKGROUND_PROCESSES_LOCK = threading.Lock()
+
+
+def track_background_process(process: subprocess.Popen[Any]) -> None:
+    with _BACKGROUND_PROCESSES_LOCK:
+        _BACKGROUND_PROCESSES[process.pid] = process
+
+
+def reap_background_process(pid: int) -> None:
+    with _BACKGROUND_PROCESSES_LOCK:
+        process = _BACKGROUND_PROCESSES.pop(pid, None)
+    if process is None:
+        return
+    try:
+        process.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        # 仍在运行说明停止流程保留了它；继续跟踪，绝不因回收辅助逻辑强杀。
+        with _BACKGROUND_PROCESSES_LOCK:
+            _BACKGROUND_PROCESSES[pid] = process
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -89,6 +117,57 @@ def run_command(command: list[str], *, capture: bool = True) -> subprocess.Compl
     except subprocess.CalledProcessError as exc:
         detail = (exc.stderr or exc.stdout or "").strip()
         raise CTFLabError(f"命令执行失败：{' '.join(command)}\n{detail}") from exc
+
+
+def import_hash(path: Path, stage: str) -> str:
+    control = IMPORT_CONTROL.get()
+    if control is None:
+        return sha256_file(path)
+    digest = hashlib.sha256()
+    total, done = path.stat().st_size, 0
+    control.progress(stage, 0, total)
+    with path.open("rb") as handle:
+        while chunk := handle.read(8 * 1024 * 1024):
+            control.check()
+            digest.update(chunk)
+            done += len(chunk)
+            control.progress(stage, done, total)
+    return digest.hexdigest()
+
+
+def run_import_conversion(command: list[str]) -> None:
+    control = IMPORT_CONTROL.get()
+    if control is None:
+        run_command(command, capture=False)
+        return
+    control.progress("转换")
+    try:
+        process = subprocess.Popen(command)
+    except OSError as exc:
+        raise CTFLabError(f"无法启动镜像转换：{exc}") from exc
+    try:
+        last_progress = time.monotonic()
+        while process.poll() is None:
+            control.check()
+            if time.monotonic() - last_progress >= 1:
+                control.progress("转换")
+                last_progress = time.monotonic()
+            try:
+                process.wait(timeout=0.25)
+            except subprocess.TimeoutExpired:
+                pass
+        control.check()
+        if process.returncode != 0:
+            raise CTFLabError(f"镜像转换失败（退出码 {process.returncode}），候选配置保留，可重试。")
+    finally:
+        # 必须先回收本次子进程，再由调用者删除其未完成文件；不影响其他 QEMU。
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
 
 
 def runtime_root() -> Path | None:
@@ -538,6 +617,42 @@ def available_profiles() -> list[str]:
     return sorted(profile_ids)
 
 
+LAB_NETWORK = "192.168.242.0/24"
+_READINESS_HTTP_PATH_RE = re.compile(r"^/[^@\s]*$")
+
+
+def validate_http_check_path(path_value: Any, path: Path) -> str:
+    """HTTP 就绪检查只允许站内相对路径；拒绝 userinfo/绝对 URL/控制字符逃逸。
+
+    `http://127.0.0.1:<port>` + path 拼接出的最终 URL 会按 URL 语义解析：
+    `@example.invalid/` 这类值会把请求指向外部主机，这里在配置层直接拒绝。
+    """
+    if not isinstance(path_value, str) or not _READINESS_HTTP_PATH_RE.match(path_value):
+        raise CTFLabError(
+            f"HTTP 就绪检查 path 必须是以 / 开头的站内相对路径（不允许 @ 或空白）：{path}：{path_value!r}")
+    return path_value
+
+
+def http_probe_url(host_port: int, path_value: Any, *, source: Path | None = None) -> str:
+    """构造并复核 HTTP 就绪检查的最终 URL；目标主机必须是 127.0.0.1。"""
+    path = validate_http_check_path(path_value, source or Path("<runtime>"))
+    url = f"http://127.0.0.1:{int(host_port)}{path}"
+    host = urllib.parse.urlsplit(url).hostname
+    if host != "127.0.0.1":
+        raise CTFLabError(f"HTTP 就绪检查目标主机越界（{host}），拒绝探测：{url}")
+    return url
+
+
+class _LoopbackRedirectBlocker(urllib.request.HTTPRedirectHandler):
+    """就绪检查不跟随重定向：重定向可能把探测带离授权的回环目标。"""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D102
+        host = urllib.parse.urlsplit(newurl).hostname
+        if host not in {"127.0.0.1", "::1"}:
+            raise urllib.error.URLError(f"重定向离开回环目标，已阻止：{newurl}")
+        return None
+
+
 def validate_profile(data: dict[str, Any], path: Path) -> None:
     """校验运行器实际会使用的白名单字段，拒绝任意 QEMU 原始参数。"""
     required = ("schema", "id", "name", "guest", "disk", "network")
@@ -580,6 +695,100 @@ def validate_profile(data: dict[str, Any], path: Path) -> None:
             raise CTFLabError(f"端口映射必须为正整数：{path}") from exc
         if guest_port <= 0 or host_port <= 0 or host_port > 65535 or guest_port > 65535:
             raise CTFLabError(f"端口映射必须为正整数：{path}")
+    readiness = data.get("readiness")
+    if readiness is not None:
+        if not isinstance(readiness, dict):
+            raise CTFLabError(f"readiness 必须是对象：{path}")
+        for item in readiness.get("checks", []) or []:
+            check = {"type": item} if isinstance(item, str) else item
+            if not isinstance(check, dict):
+                raise CTFLabError(f"readiness 检查项必须是字符串或对象：{path}")
+            if check.get("type") == "http":
+                validate_http_check_path(check.get("path", "/"), path)
+                expected = check.get("expected_status")
+                if expected is not None and not isinstance(expected, int):
+                    raise CTFLabError(f"HTTP 就绪检查 expected_status 必须是整数：{path}")
+
+
+def validate_pack_profile(data: dict[str, Any], path: Path) -> None:
+    """内容包 profile 的额外白名单：在 validate_profile 之上收紧字段与敏感能力。
+
+    内容包是外部输入：除运行器读取的白名单字段外，不允许夹带其他键（防止用
+    未实现字段误导接收者）；不得声明互联网访问或非 lab 网段——实际联网本来就
+    由运行期的显式开关控制，这里拒绝的是误导性/越界声明。
+    """
+    import ctflab_dist  # noqa: PLC0415
+
+    validate_profile(data, path)
+    for section, allowed in (
+            (None, ctflab_dist.PACK_PROFILE_TOP_KEYS),
+            ("guest", ctflab_dist.PACK_PROFILE_GUEST_KEYS),
+            ("disk", ctflab_dist.PACK_PROFILE_DISK_KEYS),
+            ("network", ctflab_dist.PACK_PROFILE_NETWORK_KEYS)):
+        source = data if section is None else data.get(section) or {}
+        unknown = sorted(set(source) - set(allowed))
+        if unknown:
+            label = "顶层" if section is None else f"{section} 段"
+            raise CTFLabError(f"内容包配置{label}含有白名单之外的字段：{path}：{', '.join(unknown)}")
+    network = data["network"]
+    if network.get("internet") is True:
+        raise CTFLabError(f"内容包配置不得声明互联网访问：{path}")
+    segment = network.get("segment")
+    if segment is not None and segment != "lab":
+        raise CTFLabError(f"内容包配置只能使用 lab 实验网段：{path}：{segment!r}")
+    lab_ip = network.get("lab_ip")
+    if lab_ip is not None:
+        import ipaddress  # noqa: PLC0415
+
+        try:
+            address = ipaddress.ip_address(str(lab_ip))
+        except ValueError as exc:
+            raise CTFLabError(f"内容包 lab_ip 不是合法地址：{path}：{lab_ip!r}") from exc
+        if address not in ipaddress.ip_network(LAB_NETWORK):
+            raise CTFLabError(
+                f"内容包 lab_ip 超出实验网段 {LAB_NETWORK}：{path}：{lab_ip}")
+    for forward in network.get("host_forwards", []) or []:
+        if not isinstance(forward, dict) or set(forward) - {"name", "guest_port", "host_port"}:
+            raise CTFLabError(f"内容包端口映射只允许 name/guest_port/host_port：{path}")
+    readiness = data.get("readiness")
+    if readiness is not None:
+        if not isinstance(readiness, dict) or set(readiness) - {"timeout_seconds", "checks"}:
+            raise CTFLabError(f"内容包 readiness 只允许 timeout_seconds/checks：{path}")
+        timeout = readiness.get("timeout_seconds")
+        try:
+            timeout_value = int(timeout)
+        except (TypeError, ValueError) as exc:
+            raise CTFLabError(f"内容包 readiness.timeout_seconds 必须是整数：{path}") from exc
+        if not 1 <= timeout_value <= 3600:
+            raise CTFLabError(f"内容包 readiness.timeout_seconds 超出范围：{path}：{timeout}")
+        checks = readiness.get("checks", [])
+        if not isinstance(checks, list):
+            raise CTFLabError(f"内容包 readiness.checks 必须是数组：{path}")
+        for item in checks:
+            if isinstance(item, str):
+                if item not in {"dhcp", "tcp", "http", "ssh"}:
+                    raise CTFLabError(f"内容包 readiness 检查类型不支持：{path}：{item!r}")
+                continue
+            if not isinstance(item, dict) or set(item) - {"type", "port", "path", "expected_status"}:
+                raise CTFLabError(f"内容包 readiness 检查项只允许 type/port/path/expected_status：{path}")
+            if item.get("type") not in {"dhcp", "tcp", "http", "ssh"}:
+                raise CTFLabError(f"内容包 readiness 检查类型不支持：{path}：{item.get('type')!r}")
+            if item.get("type") in {"tcp", "http", "ssh"}:
+                try:
+                    port_value = int(item.get("port"))
+                except (TypeError, ValueError) as exc:
+                    raise CTFLabError(f"内容包 readiness 检查端口必须是整数：{path}") from exc
+                if not 1 <= port_value <= 65535:
+                    raise CTFLabError(f"内容包 readiness 检查端口超出范围：{path}：{port_value}")
+            if item.get("type") == "http":
+                validate_http_check_path(item.get("path", "/"), path)
+                expected = item.get("expected_status")
+                if expected is not None and not isinstance(expected, int):
+                    raise CTFLabError(f"HTTP 就绪检查 expected_status 必须是整数：{path}")
+    if not isinstance(data.get("verification"), (dict, type(None))):
+        raise CTFLabError(f"内容包 verification 段必须是对象或省略：{path}")
+    if not isinstance(data.get("description"), (str, type(None))):
+        raise CTFLabError(f"内容包 description 必须是字符串或省略：{path}")
 
 
 def load_profile(profile_id: str) -> dict[str, Any]:
@@ -749,7 +958,41 @@ AARCH64_BOOT_MATRIX: tuple[dict[str, str], ...] = (
 
 def matrix_candidates(architecture: str) -> tuple[dict[str, str], ...]:
     """按客体架构返回白名单候选；aarch64 只支持 UEFI + VirtIO。"""
+    if architecture not in {"aarch64", "x86_64"}:
+        raise CTFLabError(f"不支持的客体架构：{architecture}；拒绝猜测为 x86_64。")
     return AARCH64_BOOT_MATRIX if architecture == "aarch64" else X86_BOOT_MATRIX
+
+
+def ordered_matrix_candidates(profile: dict[str, Any]) -> list[dict[str, str]]:
+    """来源生成的候选优先，仍只使用白名单；旧的非候选配置保持原编号。"""
+    guest, disk = profile.get("guest", {}), profile.get("disk", {})
+    candidates = list(matrix_candidates(str(guest.get("architecture", "x86_64"))))
+    if profile.get("detection", {}).get("status") != "candidate":
+        return candidates
+    preferred = {"firmware": guest.get("firmware"), "bus": disk.get("bus")}
+    if disk.get("controller"):
+        preferred["controller"] = disk["controller"]
+    # 排序不把任意来源控制器或 QEMU 参数放进白名单。
+    return sorted(candidates, key=lambda item: (
+        item != preferred, item["firmware"] != guest.get("firmware"),
+        item["bus"] != disk.get("bus")))
+
+
+def startup_failure(error: str) -> dict[str, Any]:
+    """保守区分宿主阻塞和设备兼容性；未知错误不盲目重启八次。"""
+    text = error.lower()
+    rules = (
+        ("storage", False, ("no space left", "空间不足", "permission denied", "permission error", "权限", "基础镜像已丢失", "overlay 指向旧基础镜像", "failed to get.*lock"), "先检查存储、权限和磁盘锁；不要通过换固件绕过完整性错误。"),
+        ("resources", False, ("cannot allocate memory", "内存", "资源预检", "hv_no_device", "error creating platform vgic"), "先检查内存与运行时授权；换磁盘总线不能修复宿主资源问题。"),
+        ("firmware_dependency", True, ("缺少 uefi 固件", "未找到.*固件", "未找到.*nvram", "uefi 固件不存在"), "当前固件依赖缺失，其他白名单候选仍可探测；不要推断镜像需要 BIOS。"),
+        ("runtime_dependency", False, ("缺少 qemu", "找不到命令", "未找到 qemu", "spice.*未就绪"), "先补齐受控运行时依赖，再重试；不自动回退显示后端。"),
+        ("device_compatibility", True, ("is not a valid device model", "unsupported.*device", "bus .*not found", "no .*bus.*found"), "可尝试下一项白名单固件/控制器组合，命中后仍须人工复核。"),
+    )
+    for category, retryable, patterns, hint in rules:
+        if any(re.search(pattern, text) for pattern in patterns):
+            return {"category": category, "retryable": retryable, "hint": hint}
+    return {"category": "unclassified", "retryable": False,
+            "hint": "启动错误尚未归类，停止自动回退；查看原始日志后再决定下一步。"}
 
 
 def candidate_label(candidate: dict[str, str]) -> str:
@@ -762,6 +1005,15 @@ def candidate_label(candidate: dict[str, str]) -> str:
 def probe_recommendations(screen_classification: str | None) -> list[str]:
     """按画面分类生成 probe 报告的人工处置建议。"""
     recommendations: list[str] = []
+    hints = {
+        "uefi_shell": "当前固件未进入系统：检查 EFI 引导项、固件类型和磁盘控制器；UEFI Shell 不是启动成功。",
+        "no_boot_device": "检查系统盘选择、BIOS/UEFI 和磁盘控制器；格式转换成功不证明引导器完整。",
+        "kernel_error": "内核或根文件系统启动失败：优先核对原控制器和根盘依赖；多磁盘镜像可能缺数据/根盘，不自动改写来宾。",
+        "login_ready": "登录画面是启动候选证据；仍需人工登录、验证网络和目标服务，不自动标记为可用。",
+        "unknown": "无法可靠识别画面；保留截图与协议证据，不把非黑画面或 DHCP 当成磁盘启动成功。",
+    }
+    if screen_classification in hints:
+        recommendations.append(hints[str(screen_classification)])
     if screen_classification == "pxe_network_boot":
         recommendations.append(
             "来宾进入 PXE 网络启动，说明当前固件/总线组合没有从磁盘引导；"
@@ -946,6 +1198,7 @@ class LabManager:
         self.logs_dir = self.state_dir / "logs"
         self.pcap_dir = self.state_dir / "pcap"
         self.install_dir = self.state_dir / "install"
+        self.content_packs_dir = self.state_dir / "content-packs"
         self.locks_dir = self.state_dir / "locks"
         self._operation_lock_depth = 0
         self._operation_lock_handle: TextIO | None = None
@@ -1059,11 +1312,12 @@ class LabManager:
     def import_image(self, profile_id: str, source_arg: str, *, expect_sha256: str | None = None,
                      manifest: str | Path | None = None,
                      nvram: str | Path | None = None,
-                     ova_disk: str | None = None) -> dict[str, Any]:
+                     ova_disk: str | None = None,
+                     _prepared_ova: PreparedOva | None = None) -> dict[str, Any]:
         with self.operation_lock(f"导入 {profile_id}"):
             return self._import_image_unlocked(profile_id, source_arg, expect_sha256=expect_sha256,
                                                manifest=manifest, nvram=nvram,
-                                               ova_disk=ova_disk)
+                                               ova_disk=ova_disk, _prepared_ova=_prepared_ova)
 
     def distribution_expectations(self, profile_id: str, expect_sha256: str | None,
                                   manifest: str | Path | None,
@@ -1117,7 +1371,8 @@ class LabManager:
                                expect_sha256: str | None = None,
                                manifest: str | Path | None = None,
                                nvram: str | Path | None = None,
-                               ova_disk: str | None = None) -> dict[str, Any]:
+                               ova_disk: str | None = None,
+                               _prepared_ova: PreparedOva | None = None) -> dict[str, Any]:
         profile_id = PROFILE_ALIASES.get(profile_id, profile_id)
         profile = load_profile(profile_id)
         plan = self.distribution_expectations(profile_id, expect_sha256, manifest, nvram)
@@ -1126,21 +1381,7 @@ class LabManager:
         ova_disk_names: list[str] = []
         temporary_dir: tempfile.TemporaryDirectory[str] | None = None
         try:
-            if source.suffix.lower() == ".ova":
-                from ctflab_inspect import find_disk_and_ovf  # noqa: PLC0415
-                temporary_dir = tempfile.TemporaryDirectory(prefix="ctflab-ova-")
-                try:
-                    source_for_convert, _ovf_path, _warnings, ova_disk_names = find_disk_and_ovf(
-                        source, Path(temporary_dir.name), preferred_disk=ova_disk)
-                except InspectionError as exc:
-                    raise CTFLabError(str(exc)) from exc
-                if len(ova_disk_names) > 1 and ova_disk is None:
-                    # 导入是写操作：多磁盘必须显式选系统盘，不取“第一个”猜测。
-                    raise CTFLabError(
-                        f"OVA 内有 {len(ova_disk_names)} 个磁盘：{', '.join(ova_disk_names)}。"
-                        f"请先用 inspect 查看后用 --disk 选择系统盘重试；"
-                        "数据盘暂不支持（多磁盘场景逐步补齐）。")
-            source_hash = sha256_file(source)
+            source_hash = import_hash(source, "来源校验")
             updates: dict[str, Any] = {}
             if plan["expect_sha256"]:
                 if source_hash != plan["expect_sha256"]:
@@ -1170,6 +1411,40 @@ class LabManager:
                 updates["uefi_vars_path"] = str(nvram_path)
                 updates["uefi_vars_sha256"] = nvram_hash
             existing = self.image_state(profile_id)
+            # 已登记 OVA 的重复导入先核对两份完整哈希，再复用基盘；
+            # 不为仅需校验的操作再次展开整个归档。旧记录/多盘未选/换盘不走快路径。
+            if (source.suffix.lower() == ".ova" and existing
+                    and existing.get("source_sha256") == source_hash
+                    and existing.get("base_sha256")
+                    and Path(str(existing.get("base_path", ""))).is_file()
+                    and existing.get("ova_disk")
+                    and ((ova_disk is None and existing.get("ova_disk_count") == 1)
+                         or ova_disk == existing.get("ova_disk"))):
+                return self._reuse_existing_base(profile_id, existing, source,
+                                                 updates=updates)
+            if source.suffix.lower() == ".ova":
+                from ctflab_inspect import find_disk_and_ovf  # noqa: PLC0415
+                try:
+                    if _prepared_ova is not None:
+                        _prepared_ova.validate(source, ova_disk)
+                        source_for_convert, _ovf_path, _warnings, ova_disk_names = _prepared_ova.located
+                    else:
+                        temporary_dir = tempfile.TemporaryDirectory(prefix="ctflab-ova-")
+                        source_for_convert, _ovf_path, _warnings, ova_disk_names = find_disk_and_ovf(
+                            source, Path(temporary_dir.name), preferred_disk=ova_disk)
+                except (InspectionError, tarfile.TarError) as exc:
+                    # 损坏 OVA 常见为 tarfile.ReadError；统一包成运行器错误，
+                    # 避免裸 traceback 逸出内容包导入等事务边界。
+                    raise CTFLabError(f"OVA 无法解析：{source}（{exc}）") from exc
+                if len(ova_disk_names) > 1 and ova_disk is None:
+                    raise CTFLabError(
+                        f"OVA 内有 {len(ova_disk_names)} 个磁盘：{', '.join(ova_disk_names)}。"
+                        f"请先用 inspect 查看后用 --disk 选择系统盘重试；"
+                        "数据盘暂不支持（多磁盘场景逐步补齐）。")
+                if (existing and existing.get("source_sha256") == source_hash
+                        and existing.get("ova_disk")
+                        and existing["ova_disk"] != source_for_convert.name):
+                    raise CTFLabError("该配置已登记此 OVA 的另一磁盘；请用新配置导入，不能静默复用旧盘。")
             if (
                 existing
                 and existing.get("source_sha256") == source_hash
@@ -1209,7 +1484,7 @@ class LabManager:
                 "source_sha256": source_hash,
                 "source_format": source_format,
                 "base_path": str(base_path),
-                "base_sha256": sha256_file(base_path),
+                "base_sha256": import_hash(base_path, "基盘校验与登记"),
                 "base_sha256_evidence": evidence,
                 "virtual_size": destination_info.get("virtual-size"),
                 "imported_at": now_iso(),
@@ -1241,7 +1516,7 @@ class LabManager:
         base_path = Path(str(existing.get("base_path")))
         registered = str(existing.get("base_sha256") or "")
         if registered:
-            if sha256_file(base_path) != registered:
+            if import_hash(base_path, "已登记基盘校验") != registered:
                 raise CTFLabError(
                     f"{profile_id} 的基础镜像与登记 base_sha256 不一致；拒绝静默重新登记。"
                     "请人工核对，或等待后续专门的完整性迁移流程。"
@@ -1265,15 +1540,24 @@ class LabManager:
 
     def _convert_base_image(self, source: Path, source_format: str, base_path: Path) -> None:
         """新转换写入临时文件，info/check 通过后再排他发布，并设为只读。"""
+        try:
+            require_free_space(base_path.parent, source.stat().st_blocks * 512, "基盘转换最低")
+        except InspectionError as exc:
+            raise CTFLabError(str(exc)) from exc
         temporary_base = base_path.parent / f"{base_path.stem}.partial-{os.getpid()}-{int(time.time() * 1000)}.qcow2"
         try:
-            run_command(
-                [qemu_img_path(), "convert", "-f", source_format, "-O", "qcow2", str(source), str(temporary_base)],
-                capture=False,
-            )
+            run_import_conversion(
+                [qemu_img_path(), "convert", "-f", source_format, "-O", "qcow2", str(source), str(temporary_base)])
+            control = IMPORT_CONTROL.get()
+            if control:
+                control.progress("转换完整性检查")
             if str(qemu_info(temporary_base).get("format") or "") != "qcow2":
                 raise CTFLabError("基础镜像转换结果不是 qcow2，拒绝发布。")
             run_command([qemu_img_path(), "check", "-q", str(temporary_base)])
+            if control:
+                control.check()
+                control.committing = True
+                control.progress("发布与登记（取消将在本项完成后生效）")
             try:
                 exclusive_rename(temporary_base, base_path)
             except PublishError as exc:
@@ -1284,6 +1568,277 @@ class LabManager:
         finally:
             if temporary_base.exists():
                 temporary_base.unlink(missing_ok=True)
+
+    # ---- 内容包（schema 2 分发目录）安装 ----
+
+    def content_pack_profile_status(self, profile_id: str) -> dict[str, Any]:
+        """冲突预览：某个 profile id 目前的占用来源与内容哈希（只读，不建目录）。"""
+        profile_id = PROFILE_ALIASES.get(profile_id, profile_id)
+        builtin = BUILTIN_PROFILE_DIR / f"{profile_id}.yaml"
+        if builtin.is_file() and not builtin.is_symlink():
+            return {"kind": "builtin", "sha256": sha256_file(builtin)}
+        user = user_profile_dir() / f"{profile_id}.yaml"
+        if user.is_file() and not user.is_symlink():
+            return {"kind": "user", "sha256": sha256_file(user)}
+        return {"kind": "absent", "sha256": None}
+
+    def _plan_pack_profiles(self, pack_dir: Path, parsed: dict[str, Any],
+                            ctflab_dist: Any) -> dict[str, dict[str, Any]]:
+        """安装前把每个包内 profile 完整校验并分类；全部通过才开始写任何文件。"""
+        plan: dict[str, dict[str, Any]] = {}
+        for profile_id in sorted(parsed["profiles"]):
+            slot = parsed["profiles"][profile_id]
+            yaml_entry = slot[ctflab_dist.PROFILE_ROLE]
+            yaml_path = ctflab_dist.resolve_pack_file(pack_dir, yaml_entry["file"])
+            if yaml_path.is_symlink():
+                raise CTFLabError(f"包内配置不允许是符号链接：{yaml_entry['file']}")
+            if yaml is None:
+                raise CTFLabError("当前 Python 缺少 PyYAML，无法校验内容包配置。")
+            try:
+                data = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
+            except (OSError, yaml.YAMLError) as exc:
+                raise CTFLabError(f"无法读取包内配置：{yaml_path}（{exc}）") from exc
+            if not isinstance(data, dict):
+                raise CTFLabError(f"包内配置不是有效的 YAML 映射：{yaml_path}")
+            if str(data.get("id", "")) != profile_id:
+                raise CTFLabError(f"包内配置 id 与清单登记不一致：{yaml_path}（id={data.get('id')!r}）")
+            validate_pack_profile(data, yaml_path)
+            local = self.content_pack_profile_status(profile_id)
+            action: str
+            if local["kind"] == "builtin":
+                raise CTFLabError(
+                    f"配置 id {profile_id} 与内置配置同名，内容包不得覆盖内置课程："
+                    "请让制作者更换 id 后重新打包。")
+            if local["kind"] == "user":
+                if local["sha256"] == yaml_entry["sha256"]:
+                    action = "skip-identical"
+                else:
+                    raise CTFLabError(
+                        f"配置 id {profile_id} 已有同名的用户候选配置，且内容不同，默认不覆盖：\n"
+                        f"  已有：{user_profile_dir() / f'{profile_id}.yaml'}"
+                        f"（sha256 {str(local['sha256'])[:12]}…）\n"
+                        f"  包内：{yaml_entry['file']}（sha256 {yaml_entry['sha256'][:12]}…）\n"
+                        "  请更换包内 id 重打，或人工移除已有候选配置后重试。")
+            else:
+                action = "install"
+            plan[profile_id] = {"data": data, "yaml_path": yaml_path, "action": action,
+                                "entry": yaml_entry}
+        return plan
+
+    def _publish_pack_profile(self, profile_id: str, source: Path) -> Path:
+        """把包内 profile 以排他方式发布到用户候选目录；不覆盖任何既有文件。"""
+        destination = user_profile_dir() / f"{profile_id}.yaml"
+        destination.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".pack-{profile_id}-", suffix=".yaml", dir=destination.parent)
+        temporary = Path(temporary_name)
+        try:
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(source.read_bytes())
+            os.chmod(temporary, 0o600)
+            try:
+                os.link(temporary, destination)
+            except FileExistsError as exc:
+                raise CTFLabError(f"配置 {profile_id} 已存在，拒绝覆盖。") from exc
+        finally:
+            temporary.unlink(missing_ok=True)
+        return destination
+
+    def install_content_pack(self, pack_dir: Path) -> dict[str, Any]:
+        """校验并安装目录式内容包；失败时回滚本轮写入，已提交节点如实保留。
+
+        顺序：整体校验（哈希/大小/结构/冲突）→ 说明文件冲突预检 → 排他安装
+        profile → 复制说明 → 逐节点导入基盘（复用 import 的事务与哈希核对，
+        NVRAM 模板复制进状态目录，不保留对原包路径的依赖）→ 最后写包记录。
+        回滚只删除“本轮创建且未被已提交节点使用”的文件：某个节点导入成功后，
+        它的配置、基盘与登记一律保留，后续节点失败不回溯删除。包内 claims 与
+        配置中的 verification 段只作为声明存进登记，不设置任何“已验证”状态。
+        """
+        import ctflab_dist  # noqa: PLC0415
+
+        pack_dir = Path(pack_dir).expanduser()
+        with self.operation_lock("导入内容包"):
+            try:
+                report = ctflab_dist.verify_distribution(
+                    pack_dir, profile_status=self.content_pack_profile_status,
+                    runner_version=CTFLAB_VERSION)
+                manifest = ctflab_dist.load_manifest(pack_dir)
+                parsed = ctflab_dist.parse_pack(manifest, runner_version=CTFLAB_VERSION)
+            except ctflab_dist.DistError as exc:
+                raise CTFLabError(str(exc)) from exc
+            if not report["ok"]:
+                raise CTFLabError("内容包校验失败，未做任何导入：\n"
+                                  + "\n".join(f"  - {problem}" for problem in report["problems"]))
+            plan = self._plan_pack_profiles(pack_dir, parsed, ctflab_dist)
+
+            pack_id = parsed["id"]
+            manifest_sha256 = sha256_file(ctflab_dist.manifest_path(pack_dir))
+            record_path = self.content_packs_dir / pack_id / "pack.json"
+            record_existed = record_path.exists()
+            installed_profiles: list[str] = []
+            skipped_profiles: list[str] = []
+            docs_copied: list[str] = []
+            docs_dir = self.content_packs_dir / pack_id / "docs"
+            docs_dir_created = False
+            # created_files 记录本轮创建、且仍可回滚的文件；节点提交后其 YAML 移出该集合。
+            created_files: list[tuple[Path, str | None]] = []
+            committed: set[str] = set()
+            completed_imports: list[str] = []
+
+            # 说明文件冲突必须在任何写入/登记变化之前拒绝（失败重装不得触碰既有状态）。
+            if parsed["docs"]:
+                for doc_entry in parsed["docs"]:
+                    doc_name = str(doc_entry["file"])
+                    target = docs_dir / doc_name
+                    if target.exists() and sha256_file(target) != doc_entry["sha256"]:
+                        raise CTFLabError(
+                            f"状态目录中已有同名但内容不同的说明文件，拒绝覆盖：{doc_name}")
+
+            try:
+                for profile_id, item in plan.items():
+                    if item["action"] == "skip-identical":
+                        skipped_profiles.append(profile_id)
+                        continue
+                    published = self._publish_pack_profile(profile_id, item["yaml_path"])
+                    created_files.append((published, profile_id))
+                    installed_profiles.append(profile_id)
+
+                if parsed["docs"]:
+                    docs_dir.mkdir(parents=True, exist_ok=True)
+                    docs_dir_created = True
+                    for doc_entry in parsed["docs"]:
+                        doc_name = str(doc_entry["file"])
+                        source = ctflab_dist.resolve_pack_file(pack_dir, doc_name)
+                        target = docs_dir / doc_name
+                        if not target.exists():
+                            shutil.copy2(source, target)
+                            created_files.append((target, None))
+                        docs_copied.append(doc_name)
+
+                claims_manifest = parsed["claims"]
+                for profile_id, item in plan.items():
+                    slot = parsed["profiles"][profile_id]
+                    base_entry = slot[ctflab_dist.BASE_ROLE]
+                    if base_entry is None:
+                        raise CTFLabError(f"内容包节点 {profile_id} 缺少 base 登记，无法导入")
+                    # NVRAM 先校验并复制进状态目录：失败时该节点尚未提交、登记未被
+                    # 触碰，原有登记（可能指向旧的模板副本）原样保留。导入本身只做
+                    # 基盘哈希核对（expect_sha256），不再携带 manifest——避免导入路径
+                    # 把 uefi_vars_path 临时写成包内路径并在后续失败时残留。
+                    nvram_target: Path | None = None
+                    nvram_entry = slot[ctflab_dist.NVRAM_ROLE]
+                    if nvram_entry is not None:
+                        vars_source = ctflab_dist.resolve_pack_file(pack_dir, nvram_entry["file"])
+                        vars_hash = sha256_file(vars_source)
+                        vars_target = self.images_dir / profile_id / f"uefi-vars-{vars_hash[:12]}.fd"
+                        if vars_target.exists():
+                            if sha256_file(vars_target) != vars_hash:
+                                raise CTFLabError(
+                                    f"状态目录中的 UEFI NVRAM 模板与包内登记不一致，拒绝覆盖：{vars_target}")
+                        else:
+                            vars_target.parent.mkdir(parents=True, exist_ok=True)
+                            temporary = vars_target.parent / f".{vars_target.name}.partial-{os.getpid()}"
+                            try:
+                                shutil.copy2(vars_source, temporary)
+                                os.replace(temporary, vars_target)
+                            except OSError as exc:
+                                raise CTFLabError(
+                                    f"复制 UEFI NVRAM 模板到状态目录失败：{vars_target}（{exc}）") from exc
+                            finally:
+                                temporary.unlink(missing_ok=True)
+                            vars_target.chmod(0o444)
+                            created_files.append((vars_target, profile_id))
+                        nvram_target = vars_target
+
+                    base_path = ctflab_dist.resolve_pack_file(pack_dir, base_entry["file"])
+                    try:
+                        state = self._import_image_unlocked(
+                            profile_id, base_path,
+                            expect_sha256=str(base_entry["sha256"]))
+                    except CTFLabError as exc:
+                        raise CTFLabError(f"内容包节点 {profile_id} 导入失败：{exc}") from exc
+                    committed.add(profile_id)
+                    completed_imports.append(profile_id)
+                    # 已提交节点：其配置随后续失败不再回滚。
+                    created_files = [(path, owner) for path, owner in created_files
+                                     if owner != profile_id]
+
+                    base_sha = str(base_entry["sha256"])
+                    updates: dict[str, Any] = {
+                        "content_pack": {"id": pack_id, "version": parsed["version"],
+                                         "manifest_sha256": manifest_sha256},
+                        # 导入按包内清单登记的哈希核对基盘；把 method 记为
+                        # content-pack-manifest 以区分普通 --manifest 导入。
+                        "source_verification": {
+                            "expected_sha256": base_sha,
+                            "actual_sha256": str(state.get("source_sha256") or base_sha),
+                            "method": "content-pack-manifest",
+                            "manifest": str(ctflab_dist.manifest_path(pack_dir)),
+                            "verified_at": now_iso(),
+                        },
+                    }
+                    if nvram_target is not None:
+                        updates["uefi_vars_path"] = str(nvram_target)
+                        updates["uefi_vars_sha256"] = sha256_file(nvram_target)
+                    claims: dict[str, Any] = {}
+                    if isinstance(claims_manifest.get(profile_id), dict):
+                        claims["manifest"] = claims_manifest[profile_id]
+                    if isinstance(item["data"].get("verification"), dict):
+                        claims["profile"] = item["data"]["verification"]
+                    if claims:
+                        # 仅声明：来源与范围照抄包内数据，接收方本机验收状态不受影响。
+                        updates["claims_from_pack"] = claims
+                    self._apply_state_updates(profile_id, state, updates)
+
+                record = {
+                    "schema": 1,
+                    "pack": {"id": pack_id, "name": parsed["name"], "version": parsed["version"],
+                             "requires_runner": parsed["requires_runner"]},
+                    "manifest_sha256": manifest_sha256,
+                    "installed_at": now_iso(),
+                    "installed_profiles": installed_profiles,
+                    "skipped_identical_profiles": skipped_profiles,
+                    "imported_profiles": completed_imports,
+                    "docs": docs_copied,
+                    "claims": claims_manifest,
+                    "imported_from": str(pack_dir),
+                }
+                self.content_packs_dir.mkdir(parents=True, exist_ok=True)
+                write_json(record_path, record)
+            except Exception as exc:
+                # 回滚本轮明确创建、且不属于已提交节点的文件；既有包记录永不删除。
+                for path, _owner in created_files:
+                    path.unlink(missing_ok=True)
+                if docs_dir_created and not any(docs_dir.iterdir()):
+                    docs_dir.rmdir()
+                if not record_existed and record_path.exists():
+                    record_path.unlink()
+                if isinstance(exc, CTFLabError):
+                    detail = str(exc)
+                    kept = sorted(committed)
+                    summary = f"已完成并保留的节点：{', '.join(kept)}" if kept \
+                        else "本轮没有已提交的节点；新装配置已回滚"
+                    raise CTFLabError(f"{detail}\n{summary}；原内容包未被修改，可修复后重试。") from exc
+                raise
+            return {
+                "pack": report.get("pack"),
+                "installed": installed_profiles,
+                "skipped_identical": skipped_profiles,
+                "imported": completed_imports,
+                "docs": docs_copied,
+                "record": str(record_path),
+            }
+
+    def pack_records(self) -> list[dict[str, Any]]:
+        """状态目录中已安装内容包的登记（按安装时间排序）。"""
+        records: list[dict[str, Any]] = []
+        if not self.content_packs_dir.is_dir():
+            return records
+        for path in sorted(self.content_packs_dir.glob("*/pack.json")):
+            data = read_json(path)
+            if isinstance(data, dict):
+                records.append(data)
+        return records
 
     def installer_command(
         self,
@@ -1758,15 +2313,38 @@ class LabManager:
             lab_ip = profile.get("network", {}).get("lab_ip")
             if lab_ip:
                 leases.append(f"{profile['network']['mac']}={lab_ip}")
+        # 绑定后把监听 FD 交给子进程；避免“先检查再绑定”的跨状态竞争，
+        # 也绝不连接或结束其它状态/程序已经占用的交换机。
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        candidates = [lab_port] + [port for port in range(23400, 23500) if port != lab_port]
+        for port in candidates:
+            try:
+                listener.bind(("127.0.0.1", port))
+                listener.listen(8)
+                lab_port = port
+                break
+            except OSError as exc:
+                if exc.errno not in {48, 98}:  # macOS/Linux EADDRINUSE
+                    listener.close()
+                    raise CTFLabError(f"无法绑定实验网回环端口：{exc}") from exc
+        else:
+            listener.close()
+            raise CTFLabError("没有可用的实验网回环端口；未操作其他实例。")
+        state_path = self.network_state_path(lab_port)
         command = [sys.executable, str(NETWORK_SCRIPT), "--port", str(lab_port), "--state", str(state_path)]
+        command += ["--listener-fd", str(listener.fileno())]
         command += ["--max-frames-per-second", str(max_frames_per_second)]
         if pcap_path:
             command += ["--pcap", str(pcap_path)]
         for lease in leases:
             command += ["--lease", lease]
         log_path = self.logs_dir / f"network-{lab_port}.log"
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        log_handle = log_path.open("a", encoding="utf-8")
+        try:
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            log_handle = log_path.open("a", encoding="utf-8")
+        except OSError:
+            listener.close()
+            raise
         try:
             process = subprocess.Popen(
                 command,
@@ -1775,16 +2353,19 @@ class LabManager:
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
                 text=True,
+                pass_fds=(listener.fileno(),),
             )
         except OSError as exc:
             log_handle.close()
             raise CTFLabError(f"无法启动实验网交换机/DHCP：{exc}") from exc
         finally:
             log_handle.close()
+            listener.close()
         time.sleep(0.2)
         if process.poll() is not None:
             detail = log_path.read_text(encoding="utf-8", errors="replace").strip()
             raise CTFLabError(f"实验网交换机/DHCP 未能启动（退出码 {process.returncode}）。{detail}")
+        track_background_process(process)
         # 网络子进程是状态文件的唯一写入者，避免父子进程竞争覆盖 leases 字典。
         deadline = time.monotonic() + 1
         while time.monotonic() < deadline:
@@ -1815,6 +2396,7 @@ class LabManager:
                     pass
         if state_path.exists():
             state_path.unlink()
+        reap_background_process(pid)
 
     def dhcp_lease(self, profile_id: str) -> str | None:
         profile_id = PROFILE_ALIASES.get(profile_id, profile_id)
@@ -1916,12 +2498,34 @@ class LabManager:
         directory = self.runtime_dir / profile_id / "spice"
         directory.mkdir(parents=True, exist_ok=True)
         os.chmod(directory, 0o700)
-        socket_path = directory / "display.sock"
+        socket_path = self._spice_endpoint_path(profile_id)
         if socket_path.exists() or socket_path.is_symlink():
             if socket_path.is_dir():
                 raise CTFLabError(f"SPICE socket 路径被目录占用：{socket_path}")
             socket_path.unlink()
         return socket_path
+
+    def _spice_endpoint_path(self, profile_id: str) -> Path:
+        """计算实际端点；登记和连接时不能调用会清理 socket 的准备方法。"""
+        return self._unix_socket_path(profile_id, "display.sock",
+                                      self.runtime_dir / profile_id / "spice" / "display.sock")
+
+    def _unix_socket_path(self, profile_id: str, name: str, preferred: Path) -> Path:
+        """长路径只将 socket 放到当前用户的私有短目录，磁盘仍留在原状态目录。"""
+        if len(os.fsencode(preferred)) < 100:
+            return preferred
+        identity = hashlib.sha256((str(self.state_dir.resolve()) + "\0" + profile_id).encode()).hexdigest()[:24]
+        root = Path("/tmp") / f"ctflab-sockets-{os.getuid()}"
+        directory = root / identity
+        for path in (root, directory):
+            path.mkdir(mode=0o700, exist_ok=True)
+            info = path.lstat()
+            if path.is_symlink() or not path.is_dir() or info.st_uid != os.getuid() or info.st_mode & 0o077:
+                raise CTFLabError(f"短 socket 目录不是当前用户私有目录：{path}")
+        return directory / name
+
+    def _qmp_socket(self, profile_id: str) -> Path:
+        return self._unix_socket_path(profile_id, "qmp.sock", self.runtime_dir / profile_id / "qmp.sock")
 
     def _spice_ticket(self, profile_id: str) -> Path:
         """写入本次运行的 SPICE ticket 并返回 0600 ticket 文件路径。
@@ -2102,7 +2706,7 @@ class LabManager:
                 "-chardev", "qemu-vdagent,id=ctflab_clipboard,clipboard=on,mouse=off",
                 "-device", "virtserialport,chardev=ctflab_clipboard,name=com.redhat.spice.0",
             ]
-        qmp_path = self.runtime_dir / profile_id / "qmp.sock"
+        qmp_path = self._qmp_socket(profile_id)
         if qmp_path.exists():
             qmp_path.unlink()
         command += ["-qmp", f"unix:{qmp_path},server=on,wait=off"]
@@ -2204,6 +2808,7 @@ class LabManager:
             lab_port,
             pcap_path=pcap_path,
         )
+        lab_port = int(network_state.get("port", lab_port))
         started: list[dict[str, Any]] = []
         for profile_id in profile_ids:
             old = self.runtime_state(profile_id)
@@ -2246,6 +2851,7 @@ class LabManager:
             if process.poll() is not None:
                 detail = log_path.read_text(encoding="utf-8", errors="replace").strip()
                 raise CTFLabError(f"QEMU 未能启动 {profile_id}（退出码 {process.returncode}）。{detail}")
+            track_background_process(process)
             state = {
                 "schema": 1,
                 "profile_id": profile_id,
@@ -2254,7 +2860,7 @@ class LabManager:
                 "cpus": profile.get("guest", {}).get("cpus"),
                 "command": command,
                 "overlay_path": str(overlay),
-                "qmp_path": str(self.runtime_dir / profile_id / "qmp.sock"),
+                "qmp_path": str(self._qmp_socket(profile_id)),
                 "log_path": str(log_path),
                 "lab_port": lab_port,
                 "host_forwards": host_forwards,
@@ -2278,7 +2884,7 @@ class LabManager:
                 ),
                 "spice_endpoint": (
                     f"spice://127.0.0.1:{spice_tcp_port}" if spice_tcp
-                    else str(self.runtime_dir / profile_id / "spice" / "display.sock")
+                    else str(self._spice_endpoint_path(profile_id))
                 ) if displays[profile_id] == "spice" else None,
                 "spice_listen": spice_listen if displays[profile_id] == "spice" else None,
             }
@@ -2289,7 +2895,7 @@ class LabManager:
                 # 受控端口可连接为止，ticket 通过 0600 文件交给客户端。
                 endpoint_text = str(state["spice_endpoint"])
                 spice_tcp = endpoint_text.startswith("spice://")
-                endpoint = Path(self.runtime_dir / profile_id / "spice" / "display.sock") if not spice_tcp else None
+                endpoint = Path(endpoint_text) if not spice_tcp else None
                 ticket_path = Path(self.runtime_dir / profile_id / "spice" / "ticket") if spice_tcp else None
                 deadline = time.monotonic() + 5.0
                 if spice_tcp:
@@ -2336,6 +2942,7 @@ class LabManager:
                         self._stop_unlocked([profile_id])
                         raise CTFLabError(f"无法启动 SPICE 客户端：{exc}") from exc
                 state["spice_client_pid"] = client_process.pid
+                track_background_process(client_process)
                 state["spice_client_log_path"] = str(client_log)
                 write_json(self.runtime_state_path(profile_id), state)
             started.append(state)
@@ -2368,7 +2975,7 @@ class LabManager:
                 endpoint = str(state["spice_endpoint"])
             else:
                 ticket = None
-                endpoint = str(directory / "display.sock")
+                endpoint = str(state.get("spice_endpoint") or self._spice_endpoint_path(profile_id))
                 if not Path(endpoint).is_socket():
                     raise CTFLabError("运行中节点的 SPICE socket 不存在；请查看诊断，不会重启节点。")
             # 显式恢复用于进程仍存活但窗口不绘制；先核验恢复前提，再只断开客户端。
@@ -2392,6 +2999,7 @@ class LabManager:
             except OSError as exc:
                 raise CTFLabError(f"恢复显示失败，虚拟机保持运行：{exc}") from exc
             state["spice_client_pid"] = process.pid
+            track_background_process(process)
             state["spice_client_log_path"] = str(log)
             write_json(self.runtime_state_path(profile_id), state)
             return {"profile": profile_id, "pid": process.pid, "reconnected": True}
@@ -2422,6 +3030,7 @@ class LabManager:
                     # （2026-10-05 崩溃报告实证优雅/强制两条路径都命中）。来宾
                     # 关机可快于任何固定等待，不能靠延时规避；窗口随停止关闭。
                     terminate_spice_client(client_pid)
+                    reap_background_process(client_pid)
                     client_pid = 0
                 try:
                     if qmp_path.exists():
@@ -2459,14 +3068,17 @@ class LabManager:
                 # 优雅停止路径：QEMU 退出后客户端通常经 qemu-pid 监控自行退出，
                 # 残留时在此有界回收。
                 terminate_spice_client(client_pid)
+            if client_pid:
+                reap_background_process(client_pid)
             if qmp_path.exists():
                 qmp_path.unlink()
             spice_endpoint = Path(str(state.get("spice_endpoint", "")))
-            if spice_endpoint.is_file() or spice_endpoint.is_symlink():
+            if spice_endpoint.is_socket() or spice_endpoint.is_file() or spice_endpoint.is_symlink():
                 spice_endpoint.unlink()
             state_path = self.runtime_state_path(profile_id)
             if state_path.exists():
                 state_path.unlink()
+            reap_background_process(pid)
             stopped.append(profile_id)
         remaining = self.running_states()
         if not remaining:
@@ -2830,9 +3442,15 @@ class LabManager:
                     ok, detail = pending_or_failed(str(exc))
                     results.append({"name": f"tcp:{guest_port}", "ok": ok, "detail": detail})
             elif check.get("type") == "http":
-                url = f"http://127.0.0.1:{host_port}{check.get('path', '/') }"
                 try:
-                    with urllib.request.urlopen(url, timeout=2.0) as response:
+                    url = http_probe_url(host_port, check.get("path", "/"))
+                except CTFLabError as exc:
+                    results.append({"name": f"http:{guest_port}", "ok": False, "detail": str(exc)})
+                    continue
+                try:
+                    # 不跟随重定向：重定向可能把探测带离授权的回环目标。
+                    opener = urllib.request.build_opener(_LoopbackRedirectBlocker())
+                    with opener.open(url, timeout=2.0) as response:
                         expected = int(check.get("expected_status", 200))
                         results.append({"name": f"http:{guest_port}", "ok": response.status == expected, "detail": f"HTTP {response.status}"})
                 except (OSError, urllib.error.URLError) as exc:
@@ -3027,15 +3645,28 @@ class LabManager:
 
     def boot_matrix(self, profile_id: str, *, per_candidate_timeout: int = 90,
                     max_candidates: int | None = None, start_at: int = 1) -> dict[str, Any]:
+        with self.operation_lock(f"启动回退 {profile_id}"):
+            return self._boot_matrix_unlocked(profile_id, per_candidate_timeout=per_candidate_timeout,
+                                              max_candidates=max_candidates, start_at=start_at)
+
+    def _boot_matrix_unlocked(self, profile_id: str, *, per_candidate_timeout: int = 90,
+                              max_candidates: int | None = None, start_at: int = 1) -> dict[str, Any]:
         """受控启动回退矩阵：按白名单顺序尝试固件/磁盘组合，用画面分类决定是否继续。
 
         候选只作用于本次启动（不写入 profile）；识别到 UEFI Shell、无启动盘、PXE
         网络启动或内核错误就立即换下一个候选，命中协议级就绪或登录界面即停止。
         """
         profile_id = PROFILE_ALIASES.get(profile_id, profile_id)
+        running = self.runtime_state(profile_id)
+        if running and bool_pid_alive(int(running.get("pid", 0))):
+            raise CTFLabError("该节点正在运行；拒绝用当前实例冒充回退候选，也不会自动停止它。")
+        instance_dir = self.runtime_dir / profile_id
+        if instance_dir.exists():
+            raise CTFLabError("该节点已有运行盘或 NVRAM；为保护改动，拒绝用它做启动矩阵。请先人工备份并重置，或以新配置导入。")
         base = load_profile(profile_id)
+        initial_profile_hash = sha256_file(profile_path(profile_id))
         architecture = str(base.get("guest", {}).get("architecture", "x86_64"))
-        candidates = list(matrix_candidates(architecture))
+        candidates = ordered_matrix_candidates(base)
         if max_candidates is not None:
             candidates = candidates[: max(1, max_candidates)]
         start_at = max(1, int(start_at))
@@ -3043,6 +3674,7 @@ class LabManager:
         timeout = max(5, min(int(per_candidate_timeout), 1800))
         attempts: list[dict[str, Any]] = []
         selected: dict[str, Any] | None = None
+        stopped_reason: dict[str, Any] | None = None
         for index, candidate in enumerate(candidates, 1):
             override = copy.deepcopy(base)
             override.setdefault("guest", {})["firmware"] = candidate["firmware"]
@@ -3060,14 +3692,30 @@ class LabManager:
                     abort_on_failure_screen=True,
                 )
             except CTFLabError as exc:
+                failure = startup_failure(str(exc))
                 attempts.append({"candidate": candidate, "label": candidate_label(candidate),
-                                 "error": str(exc)})
+                                 "error": str(exc), "failure": failure})
                 print(f"    无法启动：{exc}")
+                if not failure["retryable"]:
+                    stopped_reason = failure
+                    break
                 continue
+            finally:
+                # 入口已确认没有用户运行盘；只清理本矩阵创建的运行目录。
+                # 必须先结束本次实例，再删派生 overlay/NVRAM，避免不同候选互相污染。
+                if instance_dir.exists():
+                    self.stop([profile_id])
+                    state = self.runtime_state(profile_id)
+                    if state and bool_pid_alive(int(state.get("pid", 0))):
+                        raise CTFLabError("回退实例未能停止；保留运行盘和状态，停止后续尝试，请人工检查。")
+                    self.reset(profile_id)
             screen = report.get("screen", {})
             verdict = str(report.get("verdict"))
             classification = str(screen.get("classification", "unknown"))
-            success = verdict in BOOT_MATRIX_SUCCESS_VERDICTS or classification in BOOT_MATRIX_SUCCESS_SCREENS
+            success = (report.get("process_running_at_verdict") is True
+                       and classification not in SCREEN_FAILURE_CLASSES
+                       and (verdict in BOOT_MATRIX_SUCCESS_VERDICTS
+                            or classification in BOOT_MATRIX_SUCCESS_SCREENS))
             attempt = {
                 "candidate": candidate,
                 "label": candidate_label(candidate),
@@ -3075,14 +3723,28 @@ class LabManager:
                 "screen": classification,
                 "confidence": screen.get("confidence"),
                 "early_failure": report.get("early_failure"),
+                "process_running_at_verdict": report.get("process_running_at_verdict"),
                 "screenshot_path": report.get("screenshot_path"),
+                "display_active": report.get("display", {}).get("active") is True,
                 "report_path": report.get("report_path"),
+                "recommendations": report.get("recommendations", probe_recommendations(classification)),
             }
             attempts.append(attempt)
+            screenshot = Path(str(attempt.get("screenshot_path") or ""))
+            if screenshot.is_file() and not screenshot.is_symlink():
+                attempt["screenshot_sha256"] = sha256_file(screenshot)
             print(f"    结论：{verdict}（画面 {classification}/{screen.get('confidence', 'low')}）")
             if success:
                 selected = attempt
                 break
+            if (classification == "unknown" and attempt["display_active"]
+                    and attempt["process_running_at_verdict"] is True
+                    and verdict in {"display_activity_only", "network_and_display_candidate"}
+                    and attempt.get("screenshot_sha256")):
+                # 暂停回退等待人工查看；不把 DHCP/非黑画面自动升级为成功。
+                break
+        if sha256_file(profile_path(profile_id)) != initial_profile_hash:
+            raise CTFLabError("候选配置在矩阵运行期间被修改；拒绝生成可固化报告，请重新探测。")
         result = {
             "schema": 1,
             "profile_id": profile_id,
@@ -3090,16 +3752,141 @@ class LabManager:
             "timeout_per_candidate": timeout,
             "attempts": attempts,
             "selected": selected,
+            "review_attempt": (len(attempts) if selected is None and attempts
+                               and attempts[-1].get("screenshot_sha256")
+                               and attempts[-1].get("screen") == "unknown"
+                               and attempts[-1].get("display_active") is True
+                               and attempts[-1].get("process_running_at_verdict") is True
+                               and attempts[-1].get("verdict") in {"display_activity_only", "network_and_display_candidate"}
+                               else None),
             "succeeded": selected is not None,
-            "note": "候选只作用于本次启动，不会写入 profile；命中结果需要人工复核截图后才能标记为已验证交付。",
+            "stopped_reason": stopped_reason,
+            "ordering": "source-candidate-first" if base.get("detection", {}).get("status") == "candidate" else "legacy-whitelist",
+            "runtime_policy": "fresh-overlay-and-nvram-per-attempt; existing-runtime-refused",
+            "profile_sha256": initial_profile_hash,
+            "source_sha256": (self.image_state(profile_id) or {}).get("source_sha256"),
+            "base_sha256": (self.image_state(profile_id) or {}).get("base_sha256"),
+            "note": "候选只作用于本次启动；人工复核后可保存候选硬件参数，完整启动、网络和服务验收仍需另行完成。",
         }
         report_root = self.logs_dir / "probes"
         report_root.mkdir(parents=True, exist_ok=True)
-        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
         matrix_path = report_root / f"{profile_id}-matrix-{stamp}.json"
         write_json(matrix_path, result)
         result["report_path"] = str(matrix_path)
         return result
+
+    def apply_matrix_candidate(self, profile_id: str, report_arg: str, *, confirm: bool,
+                               review_attempt: int | None = None) -> dict[str, Any]:
+        with self.operation_lock(f"保存回退候选 {profile_id}"):
+            try:
+                return self._apply_matrix_candidate_unlocked(profile_id, report_arg, confirm=confirm,
+                                                              review_attempt=review_attempt)
+            except OSError as exc:
+                raise CTFLabError(f"无法保存回退候选参数：{exc}；请查看 profile-backups 中的原配置备份。") from exc
+
+    def _apply_matrix_candidate_unlocked(self, profile_id: str, report_arg: str, *, confirm: bool,
+                                        review_attempt: int | None = None) -> dict[str, Any]:
+        """人工确认后仅固化启动参数；保留 candidate 状态和原配置备份。"""
+        if not confirm:
+            raise CTFLabError("保存回退参数需要 --confirm-apply；这只固化候选参数，不代表镜像已经验收。")
+        profile_id = PROFILE_ALIASES.get(profile_id, profile_id)
+        destination = user_profile_dir() / f"{profile_id}.yaml"
+        if (profile_id in PROFILE_ALIASES or not destination.is_file() or destination.is_symlink()
+                or profile_path(profile_id).resolve() != destination.resolve()):
+            raise CTFLabError("只允许保存用户接入的候选配置；内置配置、链接或路径异常均拒绝修改。")
+        if self.runtime_state(profile_id) or (self.runtime_dir / profile_id).exists():
+            raise CTFLabError("该节点存在运行状态或运行盘；请先正常停止并人工备份/重置，再保存候选参数。")
+        report_path = Path(report_arg).expanduser()
+        probes_root = (self.logs_dir / "probes").resolve()
+        if report_path.is_symlink() or not report_path.is_file():
+            raise CTFLabError(f"矩阵报告不存在或是链接：{report_path}")
+        report_path = report_path.resolve()
+        if not report_path.is_relative_to(probes_root):
+            raise CTFLabError("矩阵报告必须来自当前状态目录的 probes；拒绝外部或其他实例报告。")
+        report = read_json(report_path) or {}
+        selected = report.get("selected")
+        manual = review_attempt is not None
+        if manual:
+            attempts = report.get("attempts", [])
+            if (not isinstance(review_attempt, int) or review_attempt < 1 or review_attempt > len(attempts)
+                    or report.get("review_attempt") != review_attempt):
+                raise CTFLabError("人工复核序号不是报告中的待复核候选。")
+            selected = attempts[review_attempt - 1]
+            if not isinstance(selected, dict):
+                raise CTFLabError("人工复核候选格式不正确。")
+            screenshot = Path(str(selected.get("screenshot_path") or ""))
+            if (selected.get("screen") != "unknown" or selected.get("display_active") is not True
+                    or selected.get("verdict") not in {"display_activity_only", "network_and_display_candidate"}
+                    or screenshot.is_symlink() or not screenshot.is_file()
+                    or not screenshot.resolve().is_relative_to(probes_root)
+                    or sha256_file(screenshot) != selected.get("screenshot_sha256")):
+                raise CTFLabError("人工复核截图缺失、失配或该画面不允许保存；未改变候选。")
+        candidate = selected.get("candidate") if isinstance(selected, dict) else None
+        if (report.get("schema") != 1 or report.get("profile_id") != profile_id
+                or (not manual and report.get("succeeded") is not True) or not isinstance(candidate, dict)
+                or selected.get("process_running_at_verdict") is not True
+                or selected.get("screen") in SCREEN_FAILURE_CLASSES
+                or not (manual or selected.get("verdict") in BOOT_MATRIX_SUCCESS_VERDICTS
+                        or selected.get("screen") in BOOT_MATRIX_SUCCESS_SCREENS)
+                or candidate not in matrix_candidates("x86_64")):
+            raise CTFLabError("矩阵报告没有可固化的 x86_64 白名单启动候选，或成功证据不完整。")
+        current_bytes = destination.read_bytes()
+        current_identity = source_identity(destination)
+        if hashlib.sha256(current_bytes).hexdigest() != report.get("profile_sha256"):
+            raise CTFLabError("候选配置在矩阵之后已变化；拒绝应用过期报告，请重新运行矩阵。")
+        image = self.image_state(profile_id) or {}
+        base_path = Path(str(image.get("base_path", "")))
+        if (not base_path.is_file() or image.get("source_sha256") != report.get("source_sha256")
+                or image.get("base_sha256") != report.get("base_sha256")
+                or sha256_file(base_path) != report.get("base_sha256")):
+            raise CTFLabError("来源或基础镜像与矩阵报告不一致；拒绝应用过期/失配结果。")
+        profile = load_profile(profile_id)
+        if (profile.get("guest", {}).get("architecture") != "x86_64"
+                or profile.get("detection", {}).get("status") != "candidate"):
+            raise CTFLabError("该配置不是用户候选；拒绝改写已验证或未知状态配置。")
+        updated = copy.deepcopy(profile)
+        updated["guest"]["firmware"] = candidate["firmware"]
+        updated["disk"]["bus"] = candidate["bus"]
+        if candidate.get("controller"):
+            updated["disk"]["controller"] = candidate["controller"]
+        else:
+            updated["disk"].pop("controller", None)
+        updated["detection"]["matrix_applied"] = {
+            "report": report_path.name,
+            "applied_at": now_iso(),
+            "candidate": candidate,
+            "verdict": selected.get("verdict"),
+            "screen": selected.get("screen"),
+            "human_confirmed": True,
+            "review_mode": "screenshot-only" if manual else "protocol-or-login",
+            "review_attempt": review_attempt,
+            "note": "仅固化本次启动候选；boot_verified/service_verified 仍为 false。",
+        }
+        updated["detection"]["boot_verified"] = False
+        updated["detection"]["service_verified"] = False
+        validate_profile(updated, destination)
+        backup_dir = self.state_dir / "profile-backups" / profile_id
+        backup_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+        backup = backup_dir / f"pre-matrix-{stamp}.yaml"
+        descriptor = os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(current_bytes)
+        descriptor, temporary_name = tempfile.mkstemp(prefix=f".{profile_id}-matrix-", suffix=".yaml",
+                                                       dir=destination.parent)
+        temporary = Path(temporary_name)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                handle.write(yaml.safe_dump(updated, allow_unicode=True, sort_keys=False))
+            if source_identity(destination) != current_identity:
+                raise CTFLabError("候选配置在发布前被外部修改；已保留备份，拒绝覆盖。")
+            os.replace(temporary, destination)
+        finally:
+            temporary.unlink(missing_ok=True)
+        return {"profile_id": profile_id, "profile_path": str(destination),
+                "backup_path": str(backup), "candidate": candidate,
+                "status": "candidate", "verified": False}
 
 
 def cmd_doctor(manager: LabManager, args: argparse.Namespace) -> int:
@@ -3198,11 +3985,46 @@ def cmd_onboard(manager: LabManager, args: argparse.Namespace) -> int:
     profile_id = args.id.lower()
     if not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,47}[a-z0-9])?", profile_id):
         raise CTFLabError("配置 id 只能包含小写字母、数字和连字符，长度 1～49，且不能以连字符开头或结尾。")
+    if getattr(args, "resume", False):
+        destination = user_profile_dir() / f"{profile_id}.yaml"
+        report_path = manager.images_dir / profile_id / "detection.json"
+        report = read_json(report_path) or {}
+        if (args.no_import or profile_id in PROFILE_ALIASES
+                or not report.get("source_path") or not isinstance(report.get("candidate"), dict)
+                or not destination.is_file() or destination.is_symlink()
+                or profile_path(profile_id).resolve() != destination.resolve()
+                or manager.image_state(profile_id)
+                or Path(str(report.get("source_path", ""))).expanduser().resolve()
+                != Path(args.source).expanduser().resolve()
+                or report.get("import_disk") != getattr(args, "disk", None)):
+            raise CTFLabError("只允许重试本来源、同选盘且尚未登记基盘的用户候选配置；不覆盖既有节点。")
+        state = manager.import_image(profile_id, args.source, ova_disk=getattr(args, "disk", None))
+        report["source_sha256"] = state["source_sha256"]
+        write_json(report_path, report)
+        print(f"重试导入完成：{profile_id}；候选仍未启动验证。")
+        return 0
     if profile_id in PROFILE_ALIASES or profile_exists(profile_id):
         raise CTFLabError(f"配置 {profile_id} 已存在；为避免覆盖已验证参数，请换一个 id。")
+    source = Path(args.source).expanduser()
+    if source.is_file() and source.suffix.lower() == ".ova" and not args.no_import:
+        try:
+            with prepare_ova(source, getattr(args, "disk", None)) as prepared:
+                if len(prepared.located[3]) > 1 and getattr(args, "disk", None) is None:
+                    raise CTFLabError("OVA 含多磁盘，请先显式选择系统盘；未创建候选配置。")
+                return _cmd_onboard_ready(manager, args, prepared)
+        except InspectionError as exc:
+            raise CTFLabError(str(exc)) from exc
+    return _cmd_onboard_ready(manager, args)
+
+
+def _cmd_onboard_ready(manager: LabManager, args: argparse.Namespace,
+                       prepared: PreparedOva | None = None) -> int:
+    profile_id = args.id.lower()
     try:
-        report = inspect_image(args.source, calculate_hash=True,
-                               preferred_disk=getattr(args, "disk", None))
+        # 正常接入由正式 import 独立核验来源；只生成候选时仍保留来源摘要。
+        report = inspect_image(args.source, calculate_hash=args.no_import,
+                               preferred_disk=getattr(args, "disk", None),
+                               **({"_prepared_ova": prepared} if prepared is not None else {}))
     except InspectionError as exc:
         raise CTFLabError(str(exc)) from exc
     architecture = args.architecture if args.architecture != "auto" else report["candidate"]["architecture"]
@@ -3260,6 +4082,7 @@ def cmd_onboard(manager: LabManager, args: argparse.Namespace) -> int:
     finally:
         temporary.unlink(missing_ok=True)
     detection_path = manager.images_dir / profile_id / "detection.json"
+    report["import_disk"] = getattr(args, "disk", None)
     write_json(detection_path, report)
     print(f"候选配置已生成：{destination}")
     print(f"探测报告：{detection_path}")
@@ -3269,7 +4092,10 @@ def cmd_onboard(manager: LabManager, args: argparse.Namespace) -> int:
         print("已按 --no-import 跳过磁盘导入；候选配置尚未启动验证。")
         return 0
     state = manager.import_image(profile_id, args.source,
-                                 ova_disk=getattr(args, "disk", None))
+                                 ova_disk=getattr(args, "disk", None),
+                                 **({"_prepared_ova": prepared} if prepared is not None else {}))
+    report["source_sha256"] = state.get("source_sha256")
+    write_json(detection_path, report)
     print(f"导入完成：{profile_id}")
     print(f"基础镜像：{state['base_path']}")
     print(f"下一步：./tools/ctflab probe {profile_id}")
@@ -3345,11 +4171,25 @@ def cmd_dist_prepare(manager: LabManager, args: argparse.Namespace) -> int:
 
 
 def cmd_dist_verify(_manager: LabManager, args: argparse.Namespace) -> int:
-    """复核分发目录：逐文件大小与 SHA-256 与清单一致。"""
+    """复核分发目录：逐文件大小与 SHA-256 与清单一致；内容包附带结构校验与包摘要。"""
     import ctflab_dist  # noqa: PLC0415
 
+    profile_status = None
+    if getattr(args, "conflicts", False):
+        # 冲突预览只读内置/用户 profile 目录（CTFLAB_PROFILE_DIR 环境变量生效），
+        # 不创建状态目录；未指定 --conflicts 时保持输出与旧版完全一致。
+        def profile_status(profile_id: str) -> dict[str, Any]:
+            builtin = BUILTIN_PROFILE_DIR / f"{profile_id}.yaml"
+            if builtin.is_file() and not builtin.is_symlink():
+                return {"kind": "builtin", "sha256": sha256_file(builtin)}
+            user = user_profile_dir() / f"{profile_id}.yaml"
+            if user.is_file() and not user.is_symlink():
+                return {"kind": "user", "sha256": sha256_file(user)}
+            return {"kind": "absent", "sha256": None}
+
     try:
-        report = ctflab_dist.verify_distribution(args.dir)
+        report = ctflab_dist.verify_distribution(args.dir, profile_status=profile_status,
+                                                 runner_version=CTFLAB_VERSION)
     except ctflab_dist.DistError as exc:
         if getattr(args, "json", False):
             print(json.dumps({"ok": False, "entries": [], "problems": [str(exc)],
@@ -3364,10 +4204,84 @@ def cmd_dist_verify(_manager: LabManager, args: argparse.Namespace) -> int:
     if report["ok"]:
         print(f"分发目录校验通过：{Path(args.dir).expanduser()}"
               f"（{len(report['entries'])} 个文件与清单一致）")
+        pack = report.get("pack")
+        if pack:
+            print(f"内容包：{pack['name']}（{pack['id']} v{pack['version']}；"
+                  f"要求运行器 {pack['requires_runner']}）")
+            for node in pack["nodes"]:
+                local = node.get("local") or {}
+                conflict = {"builtin": "与内置同名（拒绝导入）",
+                            "user": "已有同名候选（内容不同时拒绝覆盖）"}.get(local.get("kind"))
+                resources = (f"{node.get('memory_mb', '?')} MiB / {node.get('cpus', '?')} vCPU"
+                             if node.get("memory_mb") else "资源未知")
+                note = f"；{conflict}" if conflict else ""
+                print(f"  节点 {node['profile']}：{resources}{note}")
+            if pack["docs"]:
+                print(f"  说明文件：{', '.join(pack['docs'])}")
+            if pack["claims"]:
+                print(f"  包内验收声明：{', '.join(pack['claims'])}（仅供参考，不代表本机已验收）")
         return 0
     for problem in report["problems"]:
         print(f"不一致：{problem}", file=sys.stderr)
     raise CTFLabError(f"分发目录校验失败：{len(report['problems'])} 项不一致")
+
+
+def cmd_dist_install(manager: LabManager, args: argparse.Namespace) -> int:
+    """校验并安装目录式内容包：配置、基盘、固件与说明一并登记到状态目录。"""
+    result = manager.install_content_pack(args.dir)
+    if getattr(args, "json", False):
+        print(json.dumps({"ok": True, **result}, ensure_ascii=False, indent=2))
+        return 0
+    pack = result.get("pack") or {}
+    if pack:
+        print(f"内容包：{pack.get('name')}（{pack.get('id')} v{pack.get('version')}）")
+    if result["installed"]:
+        print(f"已安装配置：{', '.join(result['installed'])}")
+    if result["skipped_identical"]:
+        print(f"内容一致，跳过：{', '.join(result['skipped_identical'])}")
+    for profile_id in result["imported"]:
+        state = manager.image_state(profile_id) or {}
+        print(f"已导入节点 {profile_id}：基盘 {state.get('base_path')}")
+    if result["docs"]:
+        print(f"说明文件：{', '.join(result['docs'])}")
+    if pack and pack.get("claims"):
+        print(f"包内验收声明：{', '.join(pack['claims'])}（仅供参考；导入未把任何节点标记为本机已验证，"
+              "实际验收以本机 probe/matrix 证据为准）")
+    print("导入不会自动启动虚拟机；使用 ctflab run <profile> 或 GUI 启动。")
+    return 0
+
+
+def cmd_dist_make_pack(_manager: LabManager, args: argparse.Namespace) -> int:
+    """制作 schema 2 内容包目录：完整校验 profile 后复制文件并生成清单。"""
+    import ctflab_dist  # noqa: PLC0415
+
+    profile_yaml = Path(args.profile).expanduser()
+    if yaml is None:
+        raise CTFLabError("当前 Python 缺少 PyYAML，无法读取 profile。")
+    try:
+        data = yaml.safe_load(profile_yaml.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError) as exc:
+        raise CTFLabError(f"无法读取 profile：{profile_yaml}（{exc}）") from exc
+    if not isinstance(data, dict):
+        raise CTFLabError(f"profile 不是有效的 YAML 映射：{profile_yaml}")
+    profile_id = str(data.get("id", ""))
+    validate_pack_profile(data, profile_yaml)
+    try:
+        result = ctflab_dist.make_pack(
+            args.out, pack_id=args.pack_id, profile_yaml=profile_yaml,
+            base_image=Path(args.base).expanduser(), name=args.name,
+            version=args.version, requires_runner=args.requires_runner,
+            nvram=Path(args.nvram).expanduser() if args.nvram else None,
+            docs=[Path(item).expanduser() for item in args.doc or []],
+            profile_data=data)
+    except ctflab_dist.DistError as exc:
+        raise CTFLabError(str(exc)) from exc
+    print(f"内容包已生成：{result['dir']}")
+    for entry in result["entries"]:
+        print(f"  {entry['file']}（{entry['role']}，{ctflab_dist.human_size(int(entry['size']))}，"
+              f"sha256 {entry['sha256'][:12]}…）")
+    print("导入：ctflab dist install --dir <内容包目录>（先整体校验，不自动启动）")
+    return 0
 
 
 def cmd_utm_export(manager: LabManager, args: argparse.Namespace) -> int:
@@ -4035,6 +4949,9 @@ def _status_report(manager: LabManager) -> dict[str, Any]:
             "imported": imported,
             "import_state": import_state,
             "source_format": image.get("source_format"),
+            # 内容包导入的节点显示来源包；claims_from_pack 只用于展示声明，不代表本机验收。
+            "content_pack": image.get("content_pack"),
+            "has_pack_claims": bool(image.get("claims_from_pack")),
             # GUI 的“扫描并导入新增”用它做幂等：同一路径不重复 onboard。
             "source_path": image.get("source_path"),
             "base_path": image.get("base_path"),
@@ -4404,6 +5321,19 @@ def cmd_health(manager: LabManager, args: argparse.Namespace) -> int:
 
 
 def cmd_probe(manager: LabManager, args: argparse.Namespace) -> int:
+    if args.apply_matrix_report:
+        if (args.matrix or args.keep_running or args.timeout is not None
+                or args.matrix_timeout != 90 or args.matrix_max is not None or args.matrix_start != 1):
+            raise CTFLabError("--apply-matrix-report 只执行离线保存，不能与启动/矩阵参数混用。")
+        result = manager.apply_matrix_candidate(args.profile, args.apply_matrix_report,
+                                                confirm=args.confirm_apply,
+                                                review_attempt=args.review_attempt)
+        print(f"已保存白名单候选参数：{candidate_label(result['candidate'])}")
+        print(f"原配置备份：{result['backup_path']}")
+        print("状态仍为 candidate；尚未完成登录、网络和目标服务验收。")
+        return 0
+    if args.confirm_apply or args.review_attempt is not None:
+        raise CTFLabError("--confirm-apply 必须与 --apply-matrix-report 同时使用。")
     if args.matrix:
         result = manager.boot_matrix(
             args.profile,
@@ -4422,7 +5352,17 @@ def cmd_probe(manager: LabManager, args: argparse.Namespace) -> int:
                   f"请人工查看截图后再修改 profile。")
             print(f"矩阵报告：{result['report_path']}")
             return 0
-        print("矩阵结论：所有白名单候选都没有识别到可用启动画面；请人工检查截图与日志。")
+        if result.get("review_attempt"):
+            index = result["review_attempt"]
+            print(f"矩阵待人工复核：{index}（没有自动成功结论）")
+            print(f"复核截图：{result['attempts'][index - 1]['screenshot_path']}")
+            print(f"矩阵报告：{result['report_path']}")
+            return 0
+        if result.get("stopped_reason"):
+            print(f"矩阵结论：已提前停止（{result['stopped_reason']['category']}）；"
+                  f"{result['stopped_reason']['hint']}")
+        else:
+            print("矩阵结论：本次已尝试的白名单候选没有识别到可用启动画面；请人工检查截图与日志。")
         print(f"矩阵报告：{result['report_path']}")
         return 1
     report = manager.probe(args.profile, timeout_seconds=args.timeout, keep_running=args.keep_running)
@@ -4501,6 +5441,7 @@ def build_parser() -> argparse.ArgumentParser:
     onboard_parser.add_argument("--cpus", type=int)
     onboard_parser.add_argument("--lab-ip", help="固定实验网地址；默认自动从 192.168.242.30 起分配")
     onboard_parser.add_argument("--no-import", action="store_true", help="只生成候选配置和报告，不转换磁盘")
+    onboard_parser.add_argument("--resume", action="store_true", help="重试同来源、同选盘的未登记用户候选；不覆盖已有节点")
 
     import_parser = subparsers.add_parser("import", help="导入 VMDK/QCOW2/OVA 等镜像")
     import_parser.add_argument("profile", choices=profile_choices)
@@ -4531,6 +5472,28 @@ def build_parser() -> argparse.ArgumentParser:
     dist_verify.add_argument("--dir", type=Path, required=True)
     dist_verify.add_argument("--json", action="store_true",
                              help="输出机器可读报告（GUI 使用；失败时返回 1 且仍打印 JSON）")
+    dist_verify.add_argument("--conflicts", action="store_true",
+                             help="内容包冲突预览：标注与内置/用户同名配置（只读）")
+    dist_install = dist_sub.add_parser(
+        "install", help="安装目录式内容包（schema 2）：校验→装配置→导基盘→复制说明；不自动启动")
+    dist_install.add_argument("--dir", type=Path, required=True,
+                              help="内容包目录（含 schema 2 DISTRIBUTION.json）")
+    dist_install.add_argument("--json", action="store_true", help="输出机器可读结果")
+    dist_make_pack = dist_sub.add_parser(
+        "make-pack", help="制作目录式内容包：校验 profile 后复制文件并生成清单（不改动来源）")
+    dist_make_pack.add_argument("--out", type=Path, required=True,
+                                help="内容包目录；目标已存在且非空时拒绝")
+    dist_make_pack.add_argument("--pack-id", required=True,
+                                help="内容包 id（小写字母/数字/短横线；区别于节点 profile id）")
+    dist_make_pack.add_argument("--name", help="内容包显示名；默认用 pack-id")
+    dist_make_pack.add_argument("--version", default="1.0.0", help="内容包版本，默认 1.0.0")
+    dist_make_pack.add_argument("--requires-runner", help="最低运行器约束，默认 >=当前版本")
+    dist_make_pack.add_argument("--profile", type=Path, required=True,
+                                help="节点配置 YAML（按内容包白名单完整校验）")
+    dist_make_pack.add_argument("--base", type=Path, required=True, help="基盘镜像（原样复制）")
+    dist_make_pack.add_argument("--nvram", type=Path, help="可选 UEFI NVRAM 模板（aarch64 推荐）")
+    dist_make_pack.add_argument("--doc", type=Path, action="append",
+                                help="说明文件（md/txt/pdf/png/jpg），可多次给出")
 
     install_parser = subparsers.add_parser("install", help="从 ARM64 安装 ISO 创建 Kali 基础镜像")
     install_parser.add_argument("profile", choices=profile_choices)
@@ -4644,10 +5607,13 @@ def build_parser() -> argparse.ArgumentParser:
     probe_parser.add_argument("profile", choices=profile_choices)
     probe_parser.add_argument("--timeout", type=int, help="探测超时秒数，默认使用配置 readiness 超时")
     probe_parser.add_argument("--keep-running", action="store_true", help="探测结束后保留本次启动的虚拟机")
-    probe_parser.add_argument("--matrix", action="store_true", help="受控启动回退矩阵：按白名单尝试 BIOS/UEFI × IDE/SATA/SCSI/VirtIO")
+    probe_parser.add_argument("--matrix", action="store_true", help="新运行盘上的受控回退；已有运行盘拒绝；来源候选优先，仍限 BIOS/UEFI × 白名单总线")
     probe_parser.add_argument("--matrix-timeout", type=int, default=90, help="矩阵中每个候选的探测秒数，默认 90")
     probe_parser.add_argument("--matrix-max", type=int, help="只尝试前 N 个候选（用于快速排查）")
     probe_parser.add_argument("--matrix-start", type=int, default=1, help="跳过前 N-1 个候选，从第 N 个开始（用于验证回退路径与定位）")
+    probe_parser.add_argument("--apply-matrix-report", help="人工复核后保存当前状态目录中的矩阵命中参数；不升级验证状态")
+    probe_parser.add_argument("--review-attempt", type=int, help="显式确认已查看报告中指定待复核候选的截图；仅保存未验收硬件参数")
+    probe_parser.add_argument("--confirm-apply", action="store_true", help="确认只固化报告中的白名单固件/总线参数，并保留原配置备份")
 
     utm_export_parser = subparsers.add_parser(
         "utm-export",
@@ -4750,7 +5716,8 @@ def main(argv: list[str] | None = None) -> int:
     content_handlers = {"pack": cmd_content_pack, "verify": cmd_content_verify,
                         "unpack": cmd_content_unpack}
     app_handlers = {"build": cmd_app_build, "verify": cmd_app_verify}
-    dist_handlers = {"prepare": cmd_dist_prepare, "verify": cmd_dist_verify}
+    dist_handlers = {"prepare": cmd_dist_prepare, "verify": cmd_dist_verify,
+                     "install": cmd_dist_install, "make-pack": cmd_dist_make_pack}
     try:
         # 纯打包/校验命令不需要运行状态；避免仅执行 package/content 时在默认
         # 状态目录创建 locks/ 等运行时目录，保持该类操作的只读/构建边界。
@@ -4762,8 +5729,8 @@ def main(argv: list[str] | None = None) -> int:
             return app_handlers[args.app_command](None, args)  # type: ignore[arg-type]
         if args.command == "update":
             return cmd_update(None, args)  # type: ignore[arg-type]
-        if args.command == "dist" and args.dist_command == "verify":
-            # verify 只读分发目录，不需要运行状态；不要在默认状态目录创建 locks/。
+        if args.command == "dist" and args.dist_command in {"verify", "make-pack"}:
+            # verify/make-pack 不写运行状态；不要在默认状态目录创建 locks/。
             return dist_handlers[args.dist_command](None, args)  # type: ignore[arg-type]
         manager = LabManager(args.state_dir)
         if args.command == "stop" and not args.all and not args.profiles:
@@ -4775,12 +5742,22 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "onboard":
             # onboard 会同时分配 IP、写入 profile、保存探测报告并可能导入镜像，
             # 整体持锁才能避免两个终端生成重复地址或覆盖中间状态。
-            with manager.operation_lock(f"接入 {args.id}"):
+            with manager.operation_lock(f"接入 {args.id}"), import_session(
+                    Path(os.environ["CTFLAB_IMPORT_CANCEL_FILE"]) if os.environ.get("CTFLAB_IMPORT_CANCEL_FILE") else None):
                 return handlers[args.command](manager, args)
+        if args.command == "import":
+            with import_session(Path(os.environ["CTFLAB_IMPORT_CANCEL_FILE"])
+                                if os.environ.get("CTFLAB_IMPORT_CANCEL_FILE") else None):
+                return handlers[args.command](manager, args)
+        if args.command == "dist" and args.dist_command == "install":
+            # 内容包安装可能做长时间镜像转换：接入与 import 同一套协作取消机制。
+            with import_session(Path(os.environ["CTFLAB_IMPORT_CANCEL_FILE"])
+                                if os.environ.get("CTFLAB_IMPORT_CANCEL_FILE") else None):
+                return dist_handlers[args.dist_command](manager, args)  # type: ignore[arg-type]
         if args.command == "dist":
             return dist_handlers[args.dist_command](manager, args)  # type: ignore[arg-type]
         return handlers[args.command](manager, args)
-    except CTFLabError as exc:
+    except (CTFLabError, InspectionError) as exc:
         print(f"错误：{exc}", file=sys.stderr)
         return 2
 

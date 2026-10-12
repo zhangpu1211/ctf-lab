@@ -9,6 +9,14 @@
 !/gui/
 
 /docs/*
+!/docs/ctflab-current-status.md
+!/docs/verification-content-pack-2026-10-12.md
+!/docs/verification-content-pack-independent-2026-10-12.md
+!/docs/verification-content-pack-fix-2026-10-12.md
+!/docs/verification-content-pack-recheck-2026-10-12.md
+!/docs/verification-content-pack-final-20261012.md
+!/docs/ctflab-documentation-review-2026-10-11.md
+!/docs/verification-import-review-2026-10-11.md
 !/docs/ctflab-mac-mvp-implementation-plan.md
 !/docs/ctflab-ux-2026-10-08.md
 !/docs/ctflab-phase1-quickstart.md
@@ -123,3 +131,7 @@ __pycache__/
 runtime/
 logs/
 probes/
+
+!docs/verification-followup-acfun-2026-10-11.md
+
+!docs/verification-acfun-continuation-2026-10-12.md

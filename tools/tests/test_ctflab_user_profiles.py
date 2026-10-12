@@ -36,6 +36,41 @@ REPORT = {
 
 
 class UserProfileTests(unittest.TestCase):
+    def failed_candidate(self):
+        args = self.args()
+        report = copy.deepcopy(REPORT)
+        report["source_path"] = args.source
+        with mock.patch.object(ctflab, "inspect_image", return_value=report), \
+                mock.patch.object(self.manager, "import_image", side_effect=ctflab.CTFLabError("转换失败")), \
+                self.assertRaises(ctflab.CTFLabError):
+            ctflab.cmd_onboard(self.manager, args)
+        args.resume = True
+        return args
+
+    def test_failed_candidate_resume_preserves_yaml_and_updates_digest(self):
+        args = self.failed_candidate()
+        candidate = self.profile_dir / "legacy-box.yaml"
+        before = candidate.read_bytes()
+        with mock.patch.object(self.manager, "import_image", return_value={"source_sha256": "b" * 64}), \
+                mock.patch.object(ctflab, "inspect_image", side_effect=AssertionError("不得重新生成候选")):
+            self.assertEqual(ctflab.cmd_onboard(self.manager, args), 0)
+        self.assertEqual(candidate.read_bytes(), before)
+        report = ctflab.read_json(self.manager.images_dir / args.id / "detection.json")
+        self.assertEqual(report["source_sha256"], "b" * 64)
+
+    def test_resume_rejects_other_source_disk_and_registered_node(self):
+        args = self.failed_candidate()
+        for changes in ({"source": "/other/disk.ova"}, {"disk": "other.vmdk"}):
+            changed = copy.copy(args)
+            for key, value in changes.items():
+                setattr(changed, key, value)
+            with mock.patch.object(self.manager, "import_image") as imported, self.assertRaises(ctflab.CTFLabError):
+                ctflab.cmd_onboard(self.manager, changed)
+            imported.assert_not_called()
+        with mock.patch.object(self.manager, "image_state", return_value={"base_path": "registered"}), \
+                self.assertRaises(ctflab.CTFLabError):
+            ctflab.cmd_onboard(self.manager, args)
+
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.root = pathlib.Path(self.temp.name)
@@ -77,6 +112,25 @@ class UserProfileTests(unittest.TestCase):
             ctflab.cmd_onboard(self.manager, self.args())
         self.assertIn("已存在", str(raised.exception))
         self.assertEqual(candidate.read_text(encoding="utf-8"), original)
+
+    def test_onboard_skips_inspection_hash_and_records_import_digest(self) -> None:
+        report = copy.deepcopy(REPORT)
+        report["source_sha256"] = None
+        with mock.patch.object(ctflab, "inspect_image", return_value=report) as inspect, \
+                mock.patch.object(self.manager, "import_image", return_value={
+                    "base_path": "/derived/base.qcow2", "source_sha256": "b" * 64}):
+            ctflab.cmd_onboard(self.manager, self.args())
+        self.assertFalse(inspect.call_args.kwargs["calculate_hash"])
+        saved = ctflab.read_json(self.manager.images_dir / "legacy-box" / "detection.json")
+        self.assertEqual(saved["source_sha256"], "b" * 64)
+        self.assertFalse(saved.get("verification", {}).get("boot_verified", False))
+
+    def test_candidate_only_onboard_keeps_independent_source_hash(self) -> None:
+        with mock.patch.object(ctflab, "inspect_image", return_value=copy.deepcopy(REPORT)) as inspect, \
+                mock.patch.object(self.manager, "import_image") as importer:
+            ctflab.cmd_onboard(self.manager, self.args(no_import=True))
+        self.assertTrue(inspect.call_args.kwargs["calculate_hash"])
+        importer.assert_not_called()
 
     def test_builtin_profiles_remain_preferred_and_user_collision_is_not_usable(self) -> None:
         self.profile_dir.mkdir(parents=True)

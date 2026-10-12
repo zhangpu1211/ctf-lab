@@ -13,11 +13,15 @@
 from __future__ import annotations
 
 import copy
+import contextlib
+import io
+import json
 import pathlib
 import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -36,6 +40,66 @@ def fake_run(command, *, capture=True):
 
 
 class ImportIntegrityTests(unittest.TestCase):
+    def test_cancel_before_hash_does_not_register_or_modify_source(self):
+        cancel = self.root / "cancel"
+        cancel.touch()
+        original = self.source.read_bytes()
+        with ctflab.import_session(cancel), self.assertRaises(ctflab.InspectionError):
+            self.manager.import_image(PROFILE_ID, str(self.source))
+        self.assertEqual(self.source.read_bytes(), original)
+        self.assertFalse(self.state_path.exists())
+        self.assertFalse(self.base_path.exists())
+
+    def test_cancel_conversion_reaps_real_child_before_partial_cleanup(self):
+        cancel = self.root / "cancel"
+        original_popen = subprocess.Popen
+        children = []
+        def spawn(command):
+            child = original_popen([sys.executable, "-c",
+                "import pathlib,time; pathlib.Path(__import__('sys').argv[1]).write_bytes(b'partial'); time.sleep(60)",
+                command[-1]])
+            children.append(child)
+            return child
+        timer = threading.Timer(0.5, cancel.touch)
+        timer.start()
+        try:
+            with ctflab.import_session(cancel), \
+                    mock.patch.object(ctflab, "qemu_img_path", return_value="fake-qemu"), \
+                    mock.patch.object(ctflab.subprocess, "Popen", side_effect=spawn), \
+                    self.assertRaises(ctflab.InspectionError):
+                self.manager._convert_base_image(self.source, "raw", self.base_path)
+        finally:
+            timer.join()
+        self.assertEqual(len(children), 1)
+        self.assertIsNotNone(children[0].poll())
+        self.assertFalse(self.base_path.exists())
+        self.assertFalse(list(self.image_dir.glob("*.partial-*")))
+
+    def test_publish_commit_finishes_registration_even_if_cancel_arrives(self):
+        cancel = self.root / "cancel"
+        rename = ctflab.exclusive_rename
+        def publish(source, target):
+            rename(source, target)
+            cancel.touch()
+        with ctflab.import_session(cancel), \
+                mock.patch.object(ctflab, "run_import_conversion", side_effect=lambda command: fake_run(command)), \
+                mock.patch.object(ctflab, "exclusive_rename", side_effect=publish):
+            state = self.import_with()
+        self.assertEqual(state["base_sha256"], ctflab.sha256_file(self.base_path))
+        self.assertTrue(self.state_path.is_file())
+
+    def test_progress_has_stage_bytes_time_and_commit_boundary(self):
+        output = io.StringIO()
+        with contextlib.redirect_stderr(output), ctflab.import_session() as control:
+            self.assertEqual(ctflab.import_hash(self.source, "来源校验"), self.source_hash)
+            control.committing = True
+            control.progress("发布与登记")
+        records = [json.loads(line.split(" ", 1)[1]) for line in output.getvalue().splitlines()]
+        self.assertEqual(records[0]["done"], 0)
+        self.assertEqual(records[1]["done"], self.source.stat().st_size)
+        self.assertGreaterEqual(records[-1]["elapsed_seconds"], 0)
+        self.assertFalse(records[-1]["cancellable"])
+
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
@@ -125,6 +189,54 @@ class ImportIntegrityTests(unittest.TestCase):
         self.assertEqual(leftovers, [])
 
     # ---- 重复导入 --------------------------------------------------------
+
+    def registered_ova(self) -> dict:
+        self.source = self.source.rename(self.source.with_suffix(".ova"))
+        self.base_path.write_bytes(b"registered-ova-base")
+        state = {"profile_id": PROFILE_ID, "source_sha256": self.source_hash,
+                 "base_path": str(self.base_path),
+                 "base_sha256": ctflab.sha256_file(self.base_path),
+                 "ova_disk": "disk.vmdk", "ova_disk_count": 1}
+        ctflab.write_json(self.state_path, state)
+        return state
+
+    def test_registered_ova_reimport_checks_hashes_without_unpacking(self) -> None:
+        expected = self.registered_ova()
+        with mock.patch("ctflab_inspect.find_disk_and_ovf", side_effect=AssertionError("不得解包")), \
+                mock.patch.object(self.manager, "_convert_base_image", side_effect=AssertionError("不得转换")), \
+                mock.patch.object(ctflab, "sha256_file", wraps=ctflab.sha256_file) as hashes:
+            self.assertEqual(self.manager.import_image(PROFILE_ID, str(self.source)), expected)
+        self.assertEqual([call.args[0].resolve() for call in hashes.call_args_list],
+                         [self.source.resolve(), self.base_path.resolve()])
+
+    def test_registered_ova_fast_path_rejects_tampered_base(self) -> None:
+        self.registered_ova()
+        self.base_path.write_bytes(b"tampered")
+        with mock.patch("ctflab_inspect.find_disk_and_ovf", side_effect=AssertionError("不得解包")):
+            with self.assertRaisesRegex(ctflab.CTFLabError, "不一致"):
+                self.manager.import_image(PROFILE_ID, str(self.source))
+
+    def test_bad_expected_ova_hash_is_rejected_before_unpacking(self) -> None:
+        self.registered_ova()
+        with mock.patch("ctflab_inspect.find_disk_and_ovf", side_effect=AssertionError("不得解包")):
+            with self.assertRaisesRegex(ctflab.CTFLabError, "期望值不一致"):
+                self.manager.import_image(PROFILE_ID, str(self.source), expect_sha256="f" * 64)
+
+    def test_multi_ova_without_selection_cannot_take_fast_path(self) -> None:
+        state = self.registered_ova()
+        state["ova_disk_count"] = 2
+        ctflab.write_json(self.state_path, state)
+        with mock.patch("ctflab_inspect.find_disk_and_ovf", return_value=(
+                self.source, None, [], ["disk.vmdk", "data.vmdk"])):
+            with self.assertRaisesRegex(ctflab.CTFLabError, "2 个磁盘"):
+                self.manager.import_image(PROFILE_ID, str(self.source))
+
+    def test_switching_ova_disk_cannot_silently_reuse_existing_base(self) -> None:
+        self.registered_ova()
+        with mock.patch("ctflab_inspect.find_disk_and_ovf", return_value=(
+                self.root / "other.vmdk", None, [], ["disk.vmdk", "other.vmdk"])):
+            with self.assertRaisesRegex(ctflab.CTFLabError, "另一磁盘"):
+                self.manager.import_image(PROFILE_ID, str(self.source), ova_disk="other.vmdk")
 
     def test_reimport_with_registered_hash_mismatch_is_refused(self) -> None:
         self.base_path.write_bytes(b"registered-base")

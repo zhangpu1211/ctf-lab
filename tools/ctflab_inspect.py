@@ -8,6 +8,9 @@
 from __future__ import annotations
 
 import hashlib
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass
 import ipaddress
 import json
 from pathlib import Path
@@ -16,6 +19,8 @@ import shutil
 import subprocess
 import tarfile
 import tempfile
+import time
+import sys
 from typing import Any
 import uuid
 import xml.etree.ElementTree as ET
@@ -27,6 +32,88 @@ EFI_SYSTEM_PARTITION = uuid.UUID("c12a7328-f81f-11d2-ba4b-00a0c93ec93b").bytes_l
 
 class InspectionError(RuntimeError):
     """镜像探测失败。"""
+
+
+class ImportControl:
+    """单次导入的协作取消；发布阶段开始后必须完成登记，不接受半途取消。"""
+    def __init__(self, cancel_path: Path | None = None):
+        self.cancel_path = cancel_path
+        self.started = time.monotonic()
+        self.last_emit = 0.0
+        self.committing = False
+
+    def check(self):
+        if not self.committing and self.cancel_path and self.cancel_path.exists():
+            raise InspectionError("导入已安全取消；候选配置保留，可重试，原始镜像未修改。")
+
+    def progress(self, stage: str, done: int | None = None, total: int | None = None):
+        self.check()
+        now = time.monotonic()
+        if done not in (None, 0, total) and now - self.last_emit < 0.25:
+            return
+        self.last_emit = now
+        print("CTFLAB_IMPORT_PROGRESS " + json.dumps({
+            "stage": stage, "done": done, "total": total,
+            "elapsed_seconds": round(now - self.started, 1),
+            "cancellable": not self.committing,
+        }, ensure_ascii=False), file=sys.stderr, flush=True)
+
+
+IMPORT_CONTROL: ContextVar[ImportControl | None] = ContextVar("import_control", default=None)
+
+
+@contextmanager
+def import_session(cancel_path: Path | None = None):
+    token = IMPORT_CONTROL.set(ImportControl(cancel_path))
+    try:
+        yield IMPORT_CONTROL.get()
+    finally:
+        IMPORT_CONTROL.reset(token)
+
+
+def require_free_space(directory: Path, minimum: int, stage: str) -> None:
+    """保留 64 MiB 余量；这是最低空间检查，不承诺压缩镜像展开后的峰值。"""
+    required = minimum + 64 * 1024 * 1024
+    free = shutil.disk_usage(directory).free
+    if free < required:
+        raise InspectionError(f"{stage}空间不足：至少需要 {required} 字节，当前可用 {free} 字节。请释放空间或更换存储位置。")
+
+
+def source_identity(source: Path) -> tuple[int, int, int, int, int]:
+    try:
+        stat = source.stat()
+    except OSError as exc:
+        raise InspectionError("OVA 来源在接入期间不可读，请重新接入。") from exc
+    return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns
+
+
+@dataclass
+class PreparedOva:
+    """仅限同一次接入的受控暂存，不是跨次缓存或用户提供的摘要凭据。"""
+    source: Path
+    identity: tuple[int, int, int, int, int]
+    preferred_disk: str | None
+    located: tuple[Path, Path | None, list[str], list[str]]
+
+    def validate(self, source: Path, preferred_disk: str | None) -> None:
+        if (source.resolve() != self.source or preferred_disk != self.preferred_disk
+                or source_identity(self.source) != self.identity):
+            raise InspectionError("OVA 来源或选盘在接入期间发生变化，拒绝复用暂存；请重新接入。")
+        if not self.located[0].is_file() or self.located[0].is_symlink():
+            raise InspectionError("OVA 暂存磁盘已丢失或变为链接，拒绝导入。")
+
+
+@contextmanager
+def prepare_ova(source: Path, preferred_disk: str | None = None):
+    source = source.resolve()
+    if source.suffix.lower() != ".ova" or not source.is_file():
+        raise InspectionError("受控暂存仅支持现有 OVA 文件。")
+    identity = source_identity(source)
+    with tempfile.TemporaryDirectory(prefix="ctflab-onboard-") as directory:
+        located = find_disk_and_ovf(source, Path(directory), preferred_disk=preferred_disk)
+        prepared = PreparedOva(source, identity, preferred_disk, located)
+        prepared.validate(source, preferred_disk)
+        yield prepared
 
 
 def sha256_file(path: Path, chunk_size: int = 8 * 1024 * 1024) -> str:
@@ -82,7 +169,17 @@ def copy_tar_member(archive: tarfile.TarFile, member: tarfile.TarInfo, destinati
         raise InspectionError(f"无法读取 OVA 成员：{member.name}")
     destination.parent.mkdir(parents=True, exist_ok=True)
     with source, destination.open("wb") as output:
-        shutil.copyfileobj(source, output, length=8 * 1024 * 1024)
+        control = IMPORT_CONTROL.get()
+        done = 0
+        if control:
+            control.progress("解包", done, member.size)
+        while chunk := source.read(8 * 1024 * 1024):
+            if control:
+                control.check()
+            output.write(chunk)
+            done += len(chunk)
+            if control:
+                control.progress("解包", done, member.size)
 
 
 def find_disk_and_ovf(source: Path, temporary_dir: Path, *,
@@ -130,6 +227,7 @@ def find_disk_and_ovf(source: Path, temporary_dir: Path, *,
         if not disks:
             raise InspectionError(f"OVA 内没有支持的虚拟磁盘：{source}")
         member, names = choose(disks)
+        require_free_space(temporary_dir, member.size + (ovfs[0].size if ovfs else 0), "OVA 解包")
         disk_path = temporary_dir / Path(member.name).name
         copy_tar_member(archive, member, disk_path)
         ovf_path = None
@@ -331,15 +429,21 @@ def infer_network(architecture: str, ovf: dict[str, Any]) -> tuple[str, str, str
 
 
 def inspect_image(source_arg: str | Path, *, calculate_hash: bool = True,
-                  preferred_disk: str | None = None) -> dict[str, Any]:
+                  preferred_disk: str | None = None,
+                  _prepared_ova: PreparedOva | None = None) -> dict[str, Any]:
     source = Path(source_arg).expanduser().resolve()
     if not source.exists():
         raise InspectionError(f"镜像不存在：{source}")
     hash_target = source if source.is_file() else None
     temporary = tempfile.TemporaryDirectory(prefix="ctflab-inspect-")
     try:
-        disk, ovf_path, warnings, disk_names = find_disk_and_ovf(
-            source, Path(temporary.name), preferred_disk=preferred_disk)
+        if _prepared_ova is not None:
+            _prepared_ova.validate(source, preferred_disk)
+            disk, ovf_path, warnings, disk_names = _prepared_ova.located
+            warnings = list(warnings)
+        else:
+            disk, ovf_path, warnings, disk_names = find_disk_and_ovf(
+                source, Path(temporary.name), preferred_disk=preferred_disk)
         info = qemu_info(disk)
         ovf = parse_ovf(ovf_path)
         descriptor = read_descriptor_hints(disk)

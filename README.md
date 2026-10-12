@@ -4,6 +4,8 @@ CTFLab 是面向 Apple Silicon Mac 的本地虚拟靶场运行器。它使用 QE
 
 当前仓库只包含运行器、候选配置、来宾修复模板、测试和设计文档，不包含虚拟磁盘、账号凭据、课程题库或成绩数据。
 
+> 2026-10-11 文档整理：当前发布为 **0.1.1-preview**，最低 macOS 26、Apple Silicon；工作区后续单镜像导入优化尚未重新打包。统一镜像库为 `/Users/pufei/Downloads/CTFLab-Library`：待处理输入、已处理三节点分发与软件分别保存。当前状态与历史证据入口见[文档总览](docs/ctflab-current-status.md)，接收者先看[使用教程](docs/ctflab-student-distribution-tutorial.md)。
+
 ## 当前能力
 
 - 导入 QCOW2、VMDK、VDI、VHD/VHDX、RAW、OVA；
@@ -20,6 +22,9 @@ CTFLab 是面向 Apple Silicon Mac 的本地虚拟靶场运行器。它使用 QE
 - `CTFLab.app` 自带受控 QEMU 与 Python 运行时（含 PyYAML），目标机器无需安装任何环境；
 - 基盘分发链（路线 A）：`dist prepare/verify` 生成 zstd 压缩基盘、`DISTRIBUTION.json`、`SHA256SUMS`
   与分发说明；`import --manifest/--expect-sha256` 强制核对下载文件哈希并把校验证据写入导入记录。
+- 目录式内容包（schema 2）：`dist make-pack` 把自定义 profile、基盘、可选 NVRAM 与说明打成
+  自包含目录；`dist install` 校验后整体导入（白名单配置、排他装 profile、事务回滚、不自动启动），
+  旧 schema 1 分发目录行为不变。
 - Kali 默认使用 SPICE 真实自动分辨率：启动前探测 SPICE QEMU、`spicevmc`、`virtserialport`
   与受控客户端；能力完整时窗口尺寸会驱动来宾实际分辨率。能力缺失时 `auto` 明确退化为 Cocoa 固定显示，
   显式 `--display spice` 缺件时会在创建虚拟机前拒绝。无头模式不启动图形客户端。
@@ -73,7 +78,7 @@ ctflab run kali-arm64                           # 3) 启动 Kali（默认联网�
 文本共享与文件写入独立授权：`run kali-arm64 --clipboard` 只共享文本；
 `run kali-arm64 --file-transfer` 只允许从 Mac 拖入文件到 Kali 的 SPICE 窗口。
 两个选项默认关闭，GUI 也提供分开的开关。文件传输不能在 Cocoa 中静默启用，
-且当前没有来宾→宿主文件传输功能。完整文件拖放与已登录桌面剪贴板仍需交互验收。
+且当前没有来宾→宿主文件传输功能。已登录桌面的文本剪贴板正/负向和重连有日期化人工证据，见发布门槛记录；不能扩展为任意文件拖放或跨设备验收。
 
 节点停止后可对运行 overlay 建命名快照（基础镜像只读、不受影响；快照连同 NVRAM
 副本存放在节点运行目录内，普通 `reset` 会一并丢弃）：
@@ -114,13 +119,13 @@ VMDK/OVA 导入链路：`inspect` 与 `import` 支持 VMDK/QCOW2/VDI/VHD/VHDX �
 `CTFLab.app` 的主入口是原生 SwiftUI 界面（Apple Silicon；随包 QEMU/SPICE 运行时要求 macOS 26.0+，
 不依赖 Electron/Node/浏览器）：
 
-- 流程：选择课程分发目录 → 校验（逐文件大小与 SHA-256，失败即禁用导入与启动）→ 导入分发包声明的基础节点 →
+- 流程：选择具体镜像文件夹（不递归扫描整个镜像库）→ 分发清单校验（失败不导入本包）→ 自动导入分发包缺失的基础节点 →
   选择一个节点 → 启动所选节点/停止所选节点 → 检查状态（health）→ 重置（先弹确认框，明确提示 overlay 改动会丢失）。
   表格中的“本机已登记”只表示该状态目录已有基础镜像，不表示当前分发目录已经导入；
   `stop --all` 仍作为 CLI 的显式故障恢复命令保留；
 - “添加 x86 镜像…”向导复用 `inspect --json`、`onboard` 与 `probe`：先只读识别并展示架构、固件、磁盘、网卡的置信度，
   经用户确认后才创建候选 profile 和派生基盘；首次探测失败时可显式运行 BIOS/UEFI × SCSI/IDE/SATA/VirtIO 的受控矩阵，
-  但矩阵命中不会自动写回配置；
+  但矩阵命中不会自动写回配置；工作区新增人工确认保存候选，写入前核对报告/profile/基盘哈希并保留备份，仍不自动标记已验证；该后续改进尚未重新打包；
 - 图形界面只调用内置 CLI：`dist verify --json`、`import <profile> <基盘> --manifest`、`run`、
   `status --json`、`health --json`、`stop <profile>`、`reset <profile>`、`inspect --json`、`onboard`、`probe`；
   已运行的其它节点不会阻塞当前节点操作。启动所选节点时由 CLI 自动为 Kali 配置联网并优先使用 SPICE 真实自动分辨率，为其他节点保持隔离，
@@ -134,7 +139,7 @@ VMDK/OVA 导入链路：`inspect` 与 `import` 支持 VMDK/QCOW2/VDI/VHD/VHDX �
 Smoke/Basic 的 x86 靶机静态控制台 E2E 已在限定范围内通过；旧 UTM 路径的历史记录仍保留为边界说明，
 其中固定显示与动态分辨率结论不适用于显式请求的 SPICE 实验路径。
 当前 App 的 Kali 默认选择带 SPICE QEMU 与本地 `spicy` 客户端的真实自动分辨率路径；`auto` 在能力缺失时退化为 Cocoa 固定显示，显式 `--display spice` 缺件时不会回退。当前验收包与限制见
-[`联网与动态分辨率验证记录`](docs/verification-display-network-2026-09-16.md)。
+[`当前状态与证据入口`](docs/ctflab-current-status.md)；2026-09-16 显示验证仅作历史证据。
 
 ## 测试
 
@@ -144,6 +149,8 @@ python3 -m py_compile tools/ctflab.py tools/ctflab_inspect.py tools/ctflab_netwo
 ```
 
 ## 文档
+
+- [当前状态、分发目录与文档阅读顺序（2026-10-11）](docs/ctflab-current-status.md)
 
 - [第一阶段快速使用](docs/ctflab-phase1-quickstart.md)
 - [学生分发版使用教程：校验、导入、启动与重置](docs/ctflab-student-distribution-tutorial.md)
@@ -178,11 +185,10 @@ python3 -m py_compile tools/ctflab.py tools/ctflab_inspect.py tools/ctflab_netwo
 - 在线元数据不能传入任意 QEMU 参数；
 - 虚拟磁盘、默认凭据和运行日志不得提交到本仓库；
 - 只有完成冷启动、显示/登录、网络、重启与目标服务验证的镜像，才能标记为已验证交付。
-# 日常操作补充（2026-10-08）
+## 日常操作补充（2026-10-11 整理）
 
 2026-10-09 新增[六项稳定性与本地更新实施记录](docs/verification-stability-2026-10-09.md)：
-显示诊断、输入释放、启动预检、状态筛选与本地更新槽位已实现；人工闲置
-恢复与界面点击验收不因代码完成而标为通过。本地更新不覆盖系统安装或镜像。
+显示诊断、输入释放、启动预检、状态筛选与本地更新槽位已实现；人工结果以指定候选、日期和发布门槛记录为准，不因代码完成而标为长期/跨设备通过。本地更新不覆盖系统安装或镜像。
 
 - 节点状态自动刷新：运行时约 3 秒，全部停止时约 15 秒；启动阶段依据运行器信号，不使用虚构百分比。
 - 运行中节点的“打开显示窗口”复用现有窗口或重连 SPICE，不重启虚拟机、不重置实验。Cocoa 窗口关闭若已导致节点退出，需要重新启动；不能恢复已停止进程的内存状态。

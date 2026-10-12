@@ -1,0 +1,32 @@
+schema: 1
+id: acfun
+name: Acfun
+version: 1.0.0
+guest:
+  architecture: x86_64
+  firmware: bios
+  machine: pc
+  memory_mb: 1024
+  cpus: 1
+disk:
+  format: qcow2
+  bus: ide
+network:
+  adapter: pcnet
+  mac: "52:54:00:24:00:32"
+  lab_ip: "192.168.242.32"
+  segment: lab
+  internet: false
+  # 来宾只配置第一块实验网卡；SSH 从同实验网 Kali 访问，不伪造宿主转发。
+  host_forwards: []
+readiness:
+  timeout_seconds: 90
+  checks:
+    - dhcp
+verification:
+  date: "2026-10-11"
+  source_sha256: "1e15d8b848b7d9bf33eeb2ad2543f12c240da93117199efe5cdb0d235f787fec"
+  scope: "冷启动登录画面、DHCP、实验网 SSH、正常关机及两轮再启动；无认证登录或挑战解题"
+  services:
+    - "实验网 SSH 22：SSH-2.0-OpenSSH_10.0"
+  evidence: "docs/verification-followup-acfun-2026-10-11.md"

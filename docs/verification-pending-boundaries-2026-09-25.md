@@ -1,5 +1,7 @@
 # 2026-09-25 待验收边界专项：剪贴板 E2E、未授权客户端、TCP 回退路径 B、全屏与拖拽
 
+> 历史验收快照：结论、测试数与产物路径只对应本记录日期及被测候选，不替代当前软件状态；部分本机旧产物已清理。当前使用、分发与未验证边界见[当前状态](ctflab-current-status.md)。原有失败和范围限制保留，文档整理不补做或升级验收。
+
 本轮目标：收口 `docs/verification-display-network-2026-09-16.md` 与
 `docs/ctflab-dynamic-resolution-design.md` 遗留的待验收项。除特别说明外，
 全部验证在本机（单显示器 Apple Silicon Mac，macOS 26）完成；跨 Mac 接收端

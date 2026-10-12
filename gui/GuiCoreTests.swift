@@ -21,6 +21,14 @@ func check(_ condition: Bool, _ name: String) {
 // MARK: 测试主体（@main 入口，避免 main.swift 命名限制）
 
 func runAll() {
+    let progressLine = "CTFLAB_IMPORT_PROGRESS {\"stage\":\"来源校验\",\"done\":50,\"total\":100,\"elapsed_seconds\":2.0,\"cancellable\":true}"
+    check(ImportProgress.latest(in: progressLine) == nil, "未完整的进度行等待下一批")
+    check(ImportProgress.latest(in: progressLine + "\n")?.label == "来源校验 50% · 2 秒", "阶段字节百分比和耗时解析")
+    check(ImportProgress.latest(in: progressLine + "\nCTFLAB_IMPORT_PROGRESS broken\n")?.cancellable == true, "坏进度行不覆盖有效状态")
+    check(CliAction.retryOnboard(sourcePath: "/tmp/a b.ova", profileID: "box").arguments()
+          == ["onboard", "/tmp/a b.ova", "--id", "box", "--resume"], "重试参数不覆盖候选、不经 shell")
+    check(!CliAction.status.controlsImport && CliAction.onboardAuto(sourcePath: "a", profileID: "box").controlsImport,
+          "取消通道只用于导入，不干扰状态查询")
 
     var state = GuiState()
     check(!state.canImport, "未选择目录时导入禁用")
@@ -31,9 +39,9 @@ func runAll() {
     check(state.canVerify, "选择目录后可校验")
 
     let okEntry = DistEntry(file: "kali-arm64-base.qcow2", profile: "kali-arm64", role: "base",
-                            size: 100, expectedSize: 100, status: "ok", problem: nil)
+                            size: 100, expectedSize: 100, expectedSha256: "abc", status: "ok", problem: nil)
     let badEntry = DistEntry(file: "smoke-base.qcow2", profile: "smoke", role: "base",
-                             size: 90, expectedSize: 100, status: "sha256-mismatch",
+                             size: 90, expectedSize: 100, expectedSha256: "abc", status: "sha256-mismatch",
                              problem: "SHA-256 不一致")
     let okReport = DistReport(ok: true, entries: [okEntry], problems: [],
                               summary: DistSummary(total: 1, ok: 1, failed: 0),
@@ -93,7 +101,7 @@ func runAll() {
     let spaced = CliAction.distVerify(dir: "/Users/student/课程 分发/dist")
     let spacedArgs = spaced.arguments(stateDir: "/Users/student/Library/Application Support/CTFLab")
     check(spacedArgs == ["--state-dir", "/Users/student/Library/Application Support/CTFLab",
-                         "dist", "verify", "--dir", "/Users/student/课程 分发/dist", "--json"],
+                         "dist", "verify", "--dir", "/Users/student/课程 分发/dist", "--json", "--conflicts"],
           "含空格路径保持为单个参数")
 
     let importArgs = CliAction.importNode(
@@ -119,7 +127,7 @@ func runAll() {
     check(CliAction.health(node: .smoke).arguments() == ["health", "smoke", "--json"], "健康检查按节点 JSON")
     check(CliAction.resetNode(node: .basic).arguments() == ["reset", "basic-pentesting-2"], "重置按节点")
     let inspectArgs = CliAction.inspectImage(sourcePath: "/tmp/legacy image.ova").arguments()
-    check(inspectArgs == ["inspect", "/tmp/legacy image.ova", "--json"],
+    check(inspectArgs == ["inspect", "/tmp/legacy image.ova", "--json", "--no-hash"],
           "x86 向导先调用只读 inspect JSON，含空格路径不拆分")
     let onboardArgs = CliAction.onboardX86(sourcePath: "/tmp/legacy image.ova", profileID: "legacy-image").arguments()
     check(onboardArgs == ["onboard", "/tmp/legacy image.ova", "--id", "legacy-image", "--architecture", "x86_64"],
@@ -128,6 +136,32 @@ func runAll() {
           == ["probe", "legacy-image"], "首次启动探测不隐式运行矩阵")
     check(CliAction.probeProfile(profileID: "legacy-image", matrix: true).arguments()
           == ["probe", "legacy-image", "--matrix"], "回退矩阵必须由用户显式请求")
+    check(CliAction.applyMatrixCandidate(profileID: "legacy-image", reportPath: "/tmp/with space/report.json").arguments()
+          == ["probe", "legacy-image", "--apply-matrix-report", "/tmp/with space/report.json", "--confirm-apply"],
+          "矩阵候选只在显式确认时保存，报告路径不经 shell")
+    check(!CliAction.applyMatrixCandidate(profileID: "legacy-image", reportPath: "/tmp/r.json").controlsImport,
+          "固化矩阵候选不占用导入取消通道")
+    let matrixSuccess = """
+      bios / ide: login_ready（画面 login_ready）
+    矩阵结论：bios / ide 可以启动（login_ready）；请人工查看截图后再修改 profile。
+    矩阵报告：/tmp/state with space/logs/probes/legacy-matrix.json
+    """
+    check(MatrixProbeResult.parse(matrixSuccess)?.reportPath
+          == "/tmp/state with space/logs/probes/legacy-matrix.json", "只解析明确成功的矩阵报告")
+    let matrixFailure = """
+    矩阵结论：所有白名单候选都没有识别到可用启动画面；请人工检查截图与日志。
+    矩阵报告：/tmp/state/logs/probes/failed.json
+    """
+    check(MatrixProbeResult.parse(matrixFailure) == nil, "失败矩阵即使有报告也不能显示固化按钮")
+    let manualReview = "矩阵待人工复核：1（没有自动成功结论）\n复核截图：/tmp/screenshot.png\n矩阵报告：/tmp/matrix.json\n"
+    check(MatrixProbeResult.parse(manualReview)?.reviewAttempt == 1, "待人工复核与自动成功分开")
+    check(MatrixProbeResult.parse("矩阵待人工复核：1（没有自动成功结论）\n矩阵报告：/tmp/matrix.json") == nil,
+          "无截图不提供人工确认入口")
+    check(CliAction.reviewMatrixCandidate(profileID: "sample", reportPath: "/tmp/r.json", attempt: 1).arguments()
+          == ["probe", "sample", "--apply-matrix-report", "/tmp/r.json", "--review-attempt", "1", "--confirm-apply"],
+          "截图人工确认只选择绑定报告的指定候选")
+    check(MatrixProbeResult.parse("矩阵结论：bios / ide 可以启动（login_ready）\n矩阵报告：relative.json\n") == nil,
+          "GUI 不接受相对报告路径")
     check(CliAction.run(nodes: [.kali, .smoke]).arguments().allSatisfy { !$0.contains(" ") || $0.hasPrefix("/") },
           "参数中不含被拼接的裸命令")
 
@@ -142,7 +176,98 @@ func runAll() {
     let decoded = GuiParsing.decodeDistReport(distJSON)
     check(decoded?.ok == true, "解析分发校验 JSON")
     check(decoded?.entries.first?.size == 8103198720, "解析条目大小")
+    check(decoded?.pack == nil, "旧分发目录没有内容包摘要")
     check(GuiParsing.decodeDistReport("not json") == nil, "非法 JSON 返回 nil")
+
+    // MARK: 内容包摘要与安装动作
+
+    let packJSON = """
+    {"ok": true, "entries": [], "problems": [], "summary": {"total": 3, "ok": 3, "failed": 0},
+     "dir": "/tmp/pack", "manifest": "/tmp/pack/DISTRIBUTION.json",
+     "pack": {"id": "mini-pack", "name": "Mini 测试包", "version": "1.0.0",
+      "requires_runner": ">=0.1.1", "runner": "0.1.1", "runner_satisfied": true,
+      "notes": [], "docs": ["使用说明.md"], "claims": ["mini-test"],
+      "claims_note": "包内验收声明仅供参考",
+      "nodes": [{"profile": "mini-test", "has_base": true, "has_nvram": false,
+        "name": "Mini Test", "architecture": "x86_64", "firmware": "bios",
+        "memory_mb": 1024, "cpus": 1,
+        "local": {"kind": "absent", "sha256": null}}]}}
+    """
+    let packReport = GuiParsing.decodeDistReport(packJSON)
+    check(packReport?.pack?.id == "mini-pack", "解析内容包摘要")
+    check(packReport?.pack?.nodes.first?.memoryMb == 1024, "解析包节点资源需求")
+    check(packReport?.pack?.nodes.first?.local?.kind == "absent", "解析包节点本机冲突预览")
+    check(packReport?.pack?.docs == ["使用说明.md"], "解析包说明文件清单")
+    check(packReport?.pack?.claims?.isEmpty == false, "解析包内验收声明")
+    let builtinPackJSON = packJSON.replacingOccurrences(of: "\"kind\": \"absent\"", with: "\"kind\": \"builtin\"")
+    check(GuiParsing.decodeDistReport(builtinPackJSON)?.pack?.nodes.first?.local?.kind == "builtin",
+          "内置同名冲突以 builtin 标注")
+    check(CliAction.distInstall(dir: "/tmp/内容 包").arguments()
+          == ["dist", "install", "--dir", "/tmp/内容 包", "--json"], "内容包安装走 dist install --json")
+    check(CliAction.distInstall(dir: "/tmp/pack").controlsImport, "内容包安装可取消（复用导入通道）")
+    check(CliAction.distVerify(dir: "/tmp/pack").arguments()
+          == ["dist", "verify", "--dir", "/tmp/pack", "--json", "--conflicts"],
+          "校验带 --conflicts：包摘要能提前显示冲突预览")
+    check(CliAction.distVerify(dir: "/tmp/pack").preservesRawOutputOnFailure,
+          "dist verify 失败时保留原始输出供结构化解码")
+    check(!CliAction.importNode(node: .smoke, sourcePath: "a", manifestPath: "b").preservesRawOutputOnFailure,
+          "导入失败仍使用通用错误文案")
+
+    // 决策门：校验失败/输出不可解码时必须中止，绝不回退普通镜像 onboard。
+    let okPackReport = GuiParsing.decodeDistReport(packJSON)!
+    let tamperedJSON = """
+    {"ok": false, "entries": [{"file": "smoke-mini-base.qcow2", "profile": "smoke-mini",
+    "role": "base", "expected_size": 267649024, "expected_sha256": "7620a", "size": 100,
+    "sha256": "7efdf", "status": "sha256-mismatch", "problem": "SHA-256 不一致"}],
+    "problems": ["smoke-mini-base.qcow2: SHA-256 不一致（清单 7620a…，实际 7efdf…）"],
+    "summary": {"total": 3, "ok": 2, "failed": 1}, "dir": "/tmp/pack",
+    "manifest": "/tmp/pack/DISTRIBUTION.json",
+    "pack": {"id": "smoke-mini-pack", "name": "Smoke Mini 内容包", "version": "1.0.0",
+      "requires_runner": ">=0.1.1", "runner": "0.1.1", "runner_satisfied": true,
+      "nodes": [{"profile": "smoke-mini", "has_base": true, "has_nvram": false}]}}
+    """
+    let failedPackReport = GuiParsing.decodeDistReport(tamperedJSON)
+    check(failedPackReport?.ok == false && failedPackReport?.pack != nil,
+          "篡改失败 JSON 可结构化解码，含包摘要")
+    check(failedPackReport?.problems.isEmpty == false
+          && failedPackReport?.entries.first?.status == "sha256-mismatch",
+          "失败报告携带问题明细与红色校验行")
+    check(DistImportGate.decide(report: okPackReport, manifestExists: true) == .installPack,
+          "校验通过且是内容包 → 单次安装")
+    check(DistImportGate.decide(report: failedPackReport, manifestExists: true) == .abort,
+          "校验失败 → 中止全部导入")
+    check(DistImportGate.decide(report: nil, manifestExists: true) == .abort,
+          "输出不可解码 → 中止全部导入（不得回退普通镜像路径）")
+    check(DistImportGate.decide(report: okPackReport, manifestExists: false) == .abort,
+          "无清单的普通目录不经此门导入")
+    // 冲突预览文案：按哈希区分“一致跳过”与“不同拒绝”，内置同名红色拒绝。
+    let sameSha = PackLocalStatus(kind: "user", sha256: "aa11")
+    let diffSha = PackLocalStatus(kind: "user", sha256: "bb22")
+    check(DistImportGate.conflictNote(local: sameSha, profilePackSha256: "aa11")
+          == "同名候选内容一致，重复导入将跳过", "内容一致提示跳过而非冲突")
+    check(DistImportGate.conflictNote(local: diffSha, profilePackSha256: "aa11")
+          == "已有同名候选配置；内容不同将拒绝覆盖", "内容不同提示拒绝覆盖")
+    check(DistImportGate.conflictNote(local: PackLocalStatus(kind: "builtin", sha256: nil),
+                                      profilePackSha256: "aa11")?.contains("内置") == true,
+          "内置同名提示拒绝")
+    check(DistImportGate.conflictNote(local: PackLocalStatus(kind: "absent", sha256: nil),
+                                      profilePackSha256: "aa11") == nil, "无占用不显示冲突")
+    let installOutput = """
+    CTFLAB_IMPORT_PROGRESS {"stage": "转换", "done": null, "total": null, "elapsed_seconds": 1.0, "cancellable": true}
+    {
+      "ok": true,
+      "pack": {"id": "mini-pack", "name": "Mini 测试包", "version": "1.0.0",
+        "requires_runner": ">=0.1.1", "runner": "0.1.1", "runner_satisfied": true,
+        "nodes": [{"profile": "mini-test", "has_base": true, "has_nvram": false}]},
+      "installed": ["mini-test"], "skipped_identical": [], "imported": ["mini-test"],
+      "docs": ["使用说明.md"], "record": "/tmp/state/content-packs/mini-pack/pack.json"
+    }
+    """
+    let installReport = PackInstallReport.parse(installOutput)
+    check(installReport?.ok == true && installReport?.installed == ["mini-test"],
+          "安装结果可从带进度行的输出中解析")
+    check(installReport?.imported == ["mini-test"], "安装结果包含已导入节点")
+    check(PackInstallReport.parse("错误：内容包校验失败") == nil, "失败输出不误解析为安装结果")
 
     let inspectionJSON = """
     {"source_path":"/tmp/legacy image.ova","format":"vmdk","virtual_size":4294967296,

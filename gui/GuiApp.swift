@@ -94,6 +94,29 @@ final class GuiModel: ObservableObject {
     @Published var onboardingProfileID = ""
     @Published var onboardingReport: ImageInspectionReport?
     @Published var onboardingImportedProfileID: String?
+    @Published var onboardingMatrixReportPath: String?
+    @Published var onboardingMatrixReviewAttempt: Int?
+    @Published var onboardingMatrixScreenshotPath: String?
+    @Published var showMatrixApplyConfirmation = false
+    @Published var importCanCancel = false
+    private var activeImportControl: URL?
+    private var retryCandidate: (id: String, source: String)?
+
+    var canRetryOnboarding: Bool {
+        retryCandidate?.id == onboardingProfileID && retryCandidate?.source == onboardingSourcePath
+    }
+
+    func cancelCurrentImport() {
+        guard importCanCancel, let directory = activeImportControl else { return }
+        do {
+            try Data().write(to: directory.appendingPathComponent("cancel"), options: .atomic)
+            stopImportQueueRequested = true
+            importCanCancel = false
+            state.progressText = "正在安全取消；发布已开始时将先完成本项登记…"
+        } catch {
+            state.lastError = "无法请求安全取消：\(error.localizedDescription)"
+        }
+    }
     @Published var onboardingMessage = ""
     @Published var showRecovery = false
     @Published var recoveryProfileID = ""
@@ -360,8 +383,17 @@ final class GuiModel: ObservableObject {
     }
 
     /// 清单导入的增量版：只导入尚未导入的 profile。
+    /// 内容包（schema 2，带 profile 登记）走单次 `dist install`，由 CLI 做整体
+    /// 校验、排他装配置与事务回滚；旧分发目录保持逐节点 import 循环不变。
     private func importMissingFromManifest() {
         guard let dir = state.distDir else { return }
+        // 双保险：本函数只允许在“本次校验通过”后进入；任何失败路径都不得
+        // 继续导入，更不得回退普通镜像 onboard。
+        guard state.report?.ok == true else { return }
+        if state.report?.pack != nil {
+            installContentPack()
+            return
+        }
         let layout = DistributionLayout(dir: dir)
         let profileIDs = layout.baseProfileIDs().filter { !state.importedProfileIDs.contains($0) }
         guard !profileIDs.isEmpty else {
@@ -373,6 +405,45 @@ final class GuiModel: ObservableObject {
         stopImportQueueRequested = false
         state.phase = .importing
         importNext(profileIDs: profileIDs, index: 0, layout: layout)
+    }
+
+    /// 安装已通过校验的内容包：CLI 负责冲突拒绝与失败回滚；GUI 只展示结论。
+    func installContentPack() {
+        guard let dir = state.distDir, !dir.isEmpty, !state.phase.isBusy else { return }
+        // 与决策门一致：只有本次校验通过的报告才允许触发安装。
+        guard state.report?.ok == true else { return }
+        stopImportQueueRequested = false
+        state.phase = .importing
+        state.progressText = "正在安装内容包（校验→配置→基盘→说明）…"
+        run(.distInstall(dir: dir)) { [weak self] outcome in
+            guard let self else { return }
+            switch outcome {
+            case .success(let text):
+                if let report = PackInstallReport.parse(text) {
+                    if let pack = report.pack {
+                        self.state.configuredProfileIDs = Set(pack.nodes.map(\.profile))
+                        self.state.selectedProfileID = nil
+                    }
+                    let installed = (report.installed ?? []).joined(separator: "、")
+                    let skipped = (report.skippedIdentical ?? []).joined(separator: "、")
+                    var summary = "内容包安装完成"
+                    if !installed.isEmpty { summary += "：新装 \(installed)" }
+                    if !skipped.isEmpty { summary += "；内容一致跳过 \(skipped)" }
+                    self.appendLog(summary + "。导入不会自动启动；请选择节点后启动。")
+                } else {
+                    self.appendLog("内容包安装完成。")
+                }
+                self.state.phase = .imported
+                self.state.progressText = ""
+                self.refreshStatus()
+                self.scanImageFolder()
+            case .failure(let message):
+                self.state.phase = .failed
+                self.state.progressText = ""
+                self.state.lastError = message
+                self.appendLog(message)
+            }
+        }
     }
 
     /// 真正待导入的文件夹镜像：来源未导入且建议 id 未被占用。
@@ -430,6 +501,10 @@ final class GuiModel: ObservableObject {
         onboardingProfileID = ImageOnboardingRules.availableProfileID(sourcePath: sourcePath, existingIDs: Set(nodes.map(\.id)))
         onboardingReport = nil
         onboardingImportedProfileID = nil
+        onboardingMatrixReportPath = nil
+        onboardingMatrixReviewAttempt = nil
+        onboardingMatrixScreenshotPath = nil
+        showMatrixApplyConfirmation = false
         onboardingMessage = "原始镜像只读；请先执行“只读识别”，确认候选硬件后再导入。"
         showImageOnboarding = true
     }
@@ -453,6 +528,7 @@ final class GuiModel: ObservableObject {
         state.progressText = "正在只读识别镜像…"
         onboardingReport = nil
         onboardingImportedProfileID = nil
+        onboardingMatrixReportPath = nil
         run(.inspectImage(sourcePath: onboardingSourcePath)) { [weak self] outcome in
             guard let self else { return }
             self.state.phase = .idle
@@ -479,6 +555,7 @@ final class GuiModel: ObservableObject {
 
     /// 用户确认 x86_64 候选后才调用既有 onboard。CLI 在用户状态目录排他写入 profile 并转换派生基盘。
     func importOnboardingCandidate() {
+        guard !state.phase.isBusy else { return }
         guard let report = onboardingReport, report.candidate.architecture == "x86_64" else {
             onboardingMessage = "请先完成 x86_64 只读识别。"
             return
@@ -487,30 +564,44 @@ final class GuiModel: ObservableObject {
             onboardingMessage = "配置 ID 只能用小写字母、数字和连字符，长度 1～49，且不能以连字符开头或结尾。"
             return
         }
-        if nodes.contains(where: { $0.id == onboardingProfileID }) {
+        let retry = canRetryOnboarding
+        if !retry && nodes.contains(where: { $0.id == onboardingProfileID }) {
             onboardingMessage = "该配置 ID 已存在，不能覆盖。请修改 ID（例如添加 -2）后重试。"
             return
         }
+        state.lastError = nil
         state.phase = .importing
         state.progressText = "正在创建候选配置并导入派生基盘…"
-        run(.onboardX86(sourcePath: onboardingSourcePath, profileID: onboardingProfileID)) { [weak self] outcome in
+        let importingID = onboardingProfileID
+        let importingSource = onboardingSourcePath
+        let action: CliAction = retry
+            ? .retryOnboard(sourcePath: importingSource, profileID: importingID)
+            : .onboardX86(sourcePath: importingSource, profileID: importingID)
+        run(action) { [weak self] outcome in
             guard let self else { return }
             self.state.phase = .idle
             self.state.progressText = ""
             switch outcome {
             case .success:
-                self.onboardingImportedProfileID = self.onboardingProfileID
-                self.state.configuredProfileIDs.insert(self.onboardingProfileID)
-                self.state.selectedProfileID = self.onboardingProfileID
+                self.retryCandidate = nil
+                self.onboardingImportedProfileID = importingID
+                self.onboardingMatrixReportPath = nil
+                self.state.configuredProfileIDs.insert(importingID)
+                self.state.selectedProfileID = importingID
                 // 该文件已导入：从“文件夹新增”分组退选，右侧切到新导入的节点。
-                if self.selectedFilePath == self.onboardingSourcePath {
+                if self.selectedFilePath == importingSource {
                     self.selectedFilePath = nil
                 }
                 self.onboardingMessage = "候选配置和派生基盘已创建；尚未启动验证，请执行“启动探测”。"
-                self.appendLog("x86_64 候选 \(self.onboardingProfileID) 已导入；原始镜像保持不变。")
+                self.appendLog("x86_64 候选 \(importingID) 已导入；原始镜像保持不变。")
                 self.refreshStatus()
             case .failure(let message):
-                self.onboardingMessage = "候选导入失败；原始镜像未修改。若已生成候选 profile，可修正后重试。"
+                self.retryCandidate = retry || (self.retryCandidate?.id == importingID
+                                                && self.retryCandidate?.source == importingSource)
+                    ? (importingID, importingSource) : nil
+                self.onboardingMessage = self.retryCandidate != nil
+                    ? "导入未完成；原始镜像未修改。再次点击导入可重试保留的候选配置。"
+                    : "导入未完成；尚未创建可重试候选，请修正问题后再次导入。"
                 self.state.lastError = message
             }
         }
@@ -518,6 +609,10 @@ final class GuiModel: ObservableObject {
 
     func probeOnboardingCandidate(matrix: Bool) {
         guard let profileID = onboardingImportedProfileID, !state.phase.isBusy else { return }
+        state.lastError = nil
+        onboardingMatrixReportPath = nil
+        onboardingMatrixReviewAttempt = nil
+        onboardingMatrixScreenshotPath = nil
         state.phase = .busy
         state.progressText = matrix ? "正在运行受控启动回退矩阵…" : "正在启动探测候选镜像…"
         run(.probeProfile(profileID: profileID, matrix: matrix)) { [weak self] outcome in
@@ -525,14 +620,52 @@ final class GuiModel: ObservableObject {
             self.state.phase = .idle
             self.state.progressText = ""
             switch outcome {
-            case .success:
-                self.onboardingMessage = matrix
-                    ? "回退矩阵完成：命中结果仅对本次探测有效，请查看截图和报告后再人工固化配置。"
-                    : "启动探测完成：请查看日志中的截图、网络和服务证据；这不等同于已验证交付。"
+            case .success(let text):
+                if matrix, let result = MatrixProbeResult.parse(text) {
+                    self.onboardingMatrixReportPath = result.reportPath
+                    self.onboardingMatrixReviewAttempt = result.reviewAttempt
+                    self.onboardingMatrixScreenshotPath = result.screenshotPath
+                    self.onboardingMessage = result.reviewAttempt != nil
+                        ? "没有自动成功结论。请打开并检查截图：只有确认系统正常引导，才保存该候选；UEFI Shell、PXE 或报错画面请勿确认。保存后仍未验收。"
+                        : "回退矩阵命中候选。请先人工查看截图；确认后仅保存固件和磁盘总线参数，状态仍是 candidate。"
+                } else {
+                    self.onboardingMessage = matrix
+                        ? "回退矩阵没有形成可固化的成功结论；请人工检查日志，原配置未修改。"
+                        : "启动探测完成：请查看日志中的截图、网络和服务证据；这不等同于已验证交付。"
+                }
             case .failure(let message):
+                if matrix { self.onboardingMatrixReportPath = nil }
                 self.onboardingMessage = matrix
                     ? "回退矩阵未找到可用候选，或需要人工查看失败截图；原始镜像未修改。"
                     : "首次启动探测未通过；可运行受控回退矩阵，不会自动改写候选配置。"
+                self.state.lastError = message
+            }
+        }
+    }
+
+    /// 只把已经人工复核的矩阵白名单硬件参数保存到候选 profile。
+    /// CLI 会再次校验报告归属、profile/基盘哈希和运行状态，并在替换前生成备份。
+    func applyOnboardingMatrixCandidate() {
+        guard let profileID = onboardingImportedProfileID,
+              let reportPath = onboardingMatrixReportPath,
+              !state.phase.isBusy else { return }
+        state.lastError = nil
+        state.phase = .busy
+        state.progressText = "正在校验报告并保存候选硬件参数…"
+        let action: CliAction = onboardingMatrixReviewAttempt.map {
+            .reviewMatrixCandidate(profileID: profileID, reportPath: reportPath, attempt: $0)
+        } ?? .applyMatrixCandidate(profileID: profileID, reportPath: reportPath)
+        run(action) { [weak self] outcome in
+            guard let self else { return }
+            self.state.phase = .idle
+            self.state.progressText = ""
+            switch outcome {
+            case .success:
+                self.onboardingMatrixReportPath = nil
+                self.onboardingMessage = "候选硬件参数已保存，原 profile 已备份；状态仍为 candidate，尚未完成登录、网络和目标服务验收。"
+                self.refreshStatus()
+            case .failure(let message):
+                self.onboardingMessage = "未保存矩阵候选：报告或当前基盘状态已变化。原配置保持不变。"
                 self.state.lastError = message
             }
         }
@@ -547,38 +680,56 @@ final class GuiModel: ObservableObject {
         state.phase = .verifying
         state.progressText = "正在校验分发目录…"
         run(.distVerify(dir: dir)) { [weak self] outcome in
-            defer { completion?() }
             guard let self else { return }
             switch outcome {
             case .success(let text), .failure(let text):
-                if let report = GuiParsing.decodeDistReport(text) {
-                    self.state.report = report
-                    self.verifyRows = report.entries
-                    let baseProfiles = report.entries.compactMap { entry -> String? in
-                        guard entry.role == "base", let profile = entry.profile,
-                              !profile.isEmpty else { return nil }
-                        return profile
-                    }
-                    if report.ok && !baseProfiles.isEmpty {
-                        self.state.configuredProfileIDs = Set(baseProfiles)
-                        // 校验只登记“本次分发目录有哪些节点”；它不等于已导入，
-                        // 也不替用户默认勾选或批量启动任何节点。
-                        self.state.selectedProfileID = nil
-                    }
-                    self.state.progressText = ""
-                    self.state.phase = report.ok ? .verified : .failed
-                    self.state.lastError = report.ok ? nil : GuiMessages.verifyFailedBanner
-                    let summary = report.summary.map {
-                        "通过 \($0.ok)/\($0.total)"
-                    } ?? ""
-                    self.appendLog(report.ok
-                        ? "分发目录校验通过（\(summary)）"
-                        : "分发目录校验失败：\(report.problems.joined(separator: "；"))")
-                } else {
+                // dist verify 失败时 CLI 仍输出结构化 JSON（原始透传，不做尾部截断），
+                // 因此这里必须能解码出红色校验行与具体问题。
+                guard let report = GuiParsing.decodeDistReport(text) else {
                     self.state.phase = .failed
                     self.state.progressText = ""
                     self.state.lastError = text
                     self.appendLog(text)
+                    return
+                }
+                self.state.report = report
+                self.verifyRows = report.entries
+                let baseProfiles = report.entries.compactMap { entry -> String? in
+                    guard entry.role == "base", let profile = entry.profile,
+                          !profile.isEmpty else { return nil }
+                    return profile
+                }
+                if report.ok && !baseProfiles.isEmpty {
+                    self.state.configuredProfileIDs = Set(baseProfiles)
+                    // 校验只登记“本次分发目录有哪些节点”；它不等于已导入，
+                    // 也不替用户默认勾选或批量启动任何节点。
+                    self.state.selectedProfileID = nil
+                }
+                self.state.progressText = ""
+                self.state.phase = report.ok ? .verified : .failed
+                if report.ok {
+                    self.state.lastError = nil
+                } else {
+                    // 失败横幅给出具体问题（缺件/哈希不符/结构非法），不只说“校验失败”。
+                    let detail = report.problems.prefix(3).joined(separator: "；")
+                    self.state.lastError = detail.isEmpty
+                        ? GuiMessages.verifyFailedBanner
+                        : "\(GuiMessages.verifyFailedBanner)\n\(detail)"
+                }
+                let summary = report.summary.map {
+                    "通过 \($0.ok)/\($0.total)"
+                } ?? ""
+                self.appendLog(report.ok
+                    ? "分发目录校验通过（\(summary)）"
+                    : "分发目录校验失败：\(report.problems.joined(separator: "；"))")
+                // 决策门：校验失败或输出不可解码时中止全部导入，
+                // 绝不能回退到普通镜像 onboard 路径（否则清单目录里的磁盘
+                // 会被当成新镜像自动登记成第二个节点）。
+                switch DistImportGate.decide(report: report, manifestExists: true) {
+                case .installPack, .importMissing:
+                    completion?()
+                case .abort:
+                    return
                 }
             }
         }
@@ -590,6 +741,10 @@ final class GuiModel: ObservableObject {
             return
         }
         guard let dir = state.distDir else { return }
+        if state.report?.pack != nil {
+            installContentPack()
+            return
+        }
         let layout = DistributionLayout(dir: dir)
         // 基盘路径来自分发清单（与老师生成的一致），缺失时明确报错而不是猜文件名。
         let profileIDs = layout.baseProfileIDs()
@@ -1078,6 +1233,22 @@ final class GuiModel: ObservableObject {
             environment["CTFLAB_PROFILE_DIR"] = URL(fileURLWithPath: stateDir)
                 .appendingPathComponent("profiles").path
         }
+        var controlDirectory: URL?
+        if action.controlsImport {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent("ctflab-import-\(UUID().uuidString)")
+            do {
+                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false,
+                                                       attributes: [.posixPermissions: 0o700])
+                controlDirectory = directory
+                activeImportControl = directory
+                importCanCancel = true
+                environment["CTFLAB_IMPORT_CANCEL_FILE"] = directory.appendingPathComponent("cancel").path
+            } catch {
+                completion(.failure("无法建立导入取消通道：\(error.localizedDescription)"))
+                return
+            }
+        }
+        let importDirectory = controlDirectory
         process.environment = environment
         let pipe = Pipe()
         process.standardOutput = pipe
@@ -1089,7 +1260,17 @@ final class GuiModel: ObservableObject {
             guard !chunk.isEmpty else { return }
             buffer.append(chunk)
             if let text = String(data: chunk, encoding: .utf8) {
-                Task { @MainActor [weak self] in self?.appendLog(text) }
+                let snapshot = buffer.text()
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    self.appendLog(text)
+                    if let directory = importDirectory, self.activeImportControl == directory,
+                       !FileManager.default.fileExists(atPath: directory.appendingPathComponent("cancel").path),
+                       let progress = ImportProgress.latest(in: snapshot) {
+                        self.state.progressText = progress.label
+                        self.importCanCancel = progress.cancellable
+                    }
+                }
             }
         }
         process.terminationHandler = { [weak self] finished in
@@ -1105,13 +1286,28 @@ final class GuiModel: ObservableObject {
             }
             let output = buffer.text()
             Task { @MainActor [weak self] in
-                guard self != nil else { return }
+                guard let self else { return }
+                if let directory = importDirectory {
+                    try? FileManager.default.removeItem(at: directory)
+                    if self.activeImportControl == directory {
+                        self.activeImportControl = nil
+                        self.importCanCancel = false
+                    }
+                }
                 if finished.terminationStatus == 0 {
                     completion(.success(output))
                 } else {
+                    // 错误弹窗只截取尾部；候选是否已创建必须检查完整输出，
+                    // 否则长转换/多条警告会把重试依据截掉。
+                    if case .onboardX86(let source, let id) = action,
+                       output.contains("候选配置已生成：") {
+                        self.retryCandidate = (id, source)
+                    }
                     let label = action.displayCommand
-                    let message = GuiMessages.failureMessage(
-                        action: label, exitCode: finished.terminationStatus, output: output)
+                    let message = action.preservesRawOutputOnFailure
+                        ? output
+                        : GuiMessages.failureMessage(
+                            action: label, exitCode: finished.terminationStatus, output: output)
                     completion(.failure(message))
                 }
             }
@@ -1119,6 +1315,11 @@ final class GuiModel: ObservableObject {
         do {
             try process.run()
         } catch {
+            if let directory = importDirectory {
+                try? FileManager.default.removeItem(at: directory)
+                activeImportControl = nil
+                importCanCancel = false
+            }
             let message = "无法启动内置 CLI：\(error.localizedDescription)\n（\(cliPath)）"
             appendLog(message)
             completion(.failure(message))
@@ -1391,6 +1592,8 @@ struct ContentView: View {
                 Text(model.state.progressText).font(.caption)
             }
             if model.state.phase == .importing {
+                Button("取消当前导入") { model.cancelCurrentImport() }
+                    .disabled(!model.importCanCancel)
                 Button("停止后续导入") { model.stopRemainingImports() }
                     .disabled(model.stopImportQueueRequested)
             }
@@ -1779,10 +1982,63 @@ struct ContentView: View {
         .cornerRadius(6)
     }
 
+    /// 内容包摘要：节点、资源需求、本机冲突预览与验收声明边界。
+    /// 数据全部来自 `dist verify --json` 的只读报告；导入决定仍由 CLI 在安装时做出。
+    @ViewBuilder
+    private var packSummary: some View {
+        if let pack = model.state.report?.pack {
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 8) {
+                    Image(systemName: "shippingbox.fill").foregroundStyle(.teal)
+                    Text("\(pack.name)（\(pack.id) v\(pack.version)）").font(.headline)
+                    Spacer()
+                    if let satisfied = pack.runnerSatisfied, !satisfied {
+                        Text("要求运行器 \(pack.requiresRunner)，当前不满足")
+                            .font(.caption).foregroundStyle(.red)
+                    }
+                }
+                ForEach(pack.nodes, id: \.profile) { node in
+                    HStack(alignment: .firstTextBaseline, spacing: 6) {
+                        Text(node.name ?? node.profile).font(.callout)
+                        let resources = Self.packNodeResources(node)
+                        if resources.isEmpty {
+                            Text(node.profile).font(.caption).foregroundStyle(.secondary)
+                        } else {
+                            Text(resources).font(.caption).foregroundStyle(.secondary)
+                        }
+                        let packSha = model.state.report?.entries.first {
+                            $0.file == "\(node.profile).yaml"
+                        }?.expectedSha256
+                        if let note = DistImportGate.conflictNote(local: node.local,
+                                                                  profilePackSha256: packSha) {
+                            let color: Color = note.contains("内置") ? .red
+                                : (note.contains("一致") ? .secondary : .orange)
+                            Text(note).font(.caption).foregroundStyle(color)
+                        }
+                        Spacer()
+                    }
+                }
+                if let docs = pack.docs, !docs.isEmpty {
+                    Text("说明文件：\(docs.joined(separator: "、"))（导入后随状态目录保存）")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                if let claims = pack.claims, !claims.isEmpty {
+                    Text(pack.claimsNote ?? "包内验收声明仅供参考，导入不代表本机已验收。")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+            }
+            .padding(8)
+            .background(Color.teal.opacity(0.08))
+            .cornerRadius(6)
+        }
+    }
+
     /// 成套分发校验结果：仅在已校验（有行）时出现；普通文件夹不占位。
     @ViewBuilder
     private var verifyTable: some View {
         if !model.verifyRows.isEmpty {
+            VStack(spacing: 8) {
+                packSummary
                 Table(model.verifyRows) {
                     TableColumn("文件") { row in
                         Text(row.file).textSelection(.enabled)
@@ -1799,6 +2055,7 @@ struct ContentView: View {
                     }
                 }
                 .frame(minHeight: 180)
+            }
         }
     }
 
@@ -1829,6 +2086,15 @@ struct ContentView: View {
         formatter.countStyle = .file
         return formatter.string(fromByteCount: bytes)
     }
+
+    static func packNodeResources(_ node: PackNode) -> String {
+        var parts: [String] = []
+        if let arch = node.architecture { parts.append(arch) }
+        if let firmware = node.firmware { parts.append(firmware.uppercased()) }
+        if let memory = node.memoryMb { parts.append("\(memory) MiB") }
+        if let cpus = node.cpus { parts.append("\(cpus) vCPU") }
+        return parts.joined(separator: " · ")
+    }
 }
 
 /// 未知 x86_64 镜像的引导式接入界面。只展示 CLI 的白名单候选和证据，不提供任意 QEMU 参数输入。
@@ -1849,9 +2115,19 @@ private struct ImageOnboardingSheet: View {
             }
             HStack {
                 Button("重新选择…") { model.chooseX86Image() }
+                    .disabled(model.state.phase.isBusy)
                 Button("只读识别") { model.inspectOnboardingImage() }
                     .disabled(model.onboardingSourcePath.isEmpty || model.state.phase.isBusy)
                 if model.state.phase.isBusy { ProgressView().controlSize(.small) }
+            }
+
+            // 模态向导遮住主窗口，导入控制必须在当前窗口内可达。
+            if model.state.phase.isBusy {
+                Text(model.state.progressText).font(.callout).textSelection(.enabled)
+                if model.state.phase == .importing {
+                    Button("取消当前导入") { model.cancelCurrentImport() }
+                        .disabled(!model.importCanCancel)
+                }
             }
 
             if let report = model.onboardingReport {
@@ -1884,8 +2160,9 @@ private struct ImageOnboardingSheet: View {
                     Text("配置 ID")
                     TextField("例如 old-vulnbox", text: $model.onboardingProfileID)
                         .frame(width: 250)
+                        .disabled(model.state.phase.isBusy)
                     Spacer()
-                    Button("创建候选并导入") { model.importOnboardingCandidate() }
+                    Button(model.canRetryOnboarding ? "重试候选导入" : "创建候选并导入") { model.importOnboardingCandidate() }
                         .disabled(report.candidate.architecture != "x86_64"
                                   || !ImageOnboardingRules.validProfileID(model.onboardingProfileID)
                                   || model.state.phase.isBusy)
@@ -1900,8 +2177,20 @@ private struct ImageOnboardingSheet: View {
                         .disabled(model.state.phase.isBusy)
                     Button("运行受控回退矩阵") { model.probeOnboardingCandidate(matrix: true) }
                         .disabled(model.state.phase.isBusy)
+                    if let reportPath = model.onboardingMatrixReportPath {
+                        if let screenshot = model.onboardingMatrixScreenshotPath {
+                            Button("打开启动截图") {
+                                NSWorkspace.shared.open(URL(fileURLWithPath: screenshot))
+                            }
+                        }
+                        Button("查看报告与截图") {
+                            NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: reportPath)])
+                        }
+                        Button(model.onboardingMatrixReviewAttempt != nil ? "我已查看截图，保存候选…" : "确认保存命中参数") { model.showMatrixApplyConfirmation = true }
+                            .disabled(model.state.phase.isBusy)
+                    }
                 }
-                Text("矩阵仅尝试 BIOS/UEFI 与 SCSI、IDE、SATA、VirtIO 白名单组合；命中结果不会自动写回配置。")
+                Text("矩阵仅尝试 BIOS/UEFI 与 SCSI、IDE、SATA、VirtIO 白名单组合；不会自动写回。人工确认保存时会先备份原 profile，且仍保持 candidate/未验收状态。")
                     .font(.caption).foregroundStyle(.secondary)
             }
 
@@ -1916,6 +2205,16 @@ private struct ImageOnboardingSheet: View {
         .padding(20)
         .frame(minHeight: 430)
         .frame(width: 760)
+        .confirmationDialog(
+            "确认截图中系统正常引导，并保存候选硬件参数？",
+            isPresented: $model.showMatrixApplyConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button("保存候选参数") { model.applyOnboardingMatrixCandidate() }
+            Button("取消", role: .cancel) {}
+        } message: {
+            Text("UEFI Shell、PXE 或报错画面请取消。只保存白名单固件、磁盘总线和控制器；会复核报告、截图及镜像，备份原配置。保存后仍是未验收候选，不代表登录或服务可用。")
+        }
     }
 
     @ViewBuilder
