@@ -7,7 +7,7 @@
 | 对象 | 当前入口 | 边界 |
 |---|---|---|
 | 源码工作区 | `/Users/pufei/Downloads/ctf-lab` | 保留现有未提交修改；不是新的已发布 App |
-| 已发布软件 | 镜像库 `03-软件` 中 0.1.1-preview ZIP | Apple Silicon、macOS 26+，ad-hoc、未公证；版本证据见发布说明 |
+| 已发布软件 | 镜像库 `03-软件/CTFLab-0.1.1-preview.20261012` 中 App/ZIP | GitHub 预发布 v0.1.1-preview.20261012；Apple Silicon、macOS 26+，ad-hoc、未公证；旧包保留 |
 | 可迁移镜像库 | `/Users/pufei/Downloads/CTFLab-Library` | `01-待处理` 保存原始输入；`02-已处理` 保存三节点包及独立 Acfun 本地适配包；不含运行进度 |
 
 旧 worktree、历史 build/e2e 目录不再是使用入口。保留历史文档里的路径只用于追溯，清理后的文件不能继续按旧命令调用。
@@ -225,3 +225,13 @@ Acfun 分发包 `/Users/pufei/Downloads/CTFLab-Library/02-已处理/Acfun-202610
 本次推送前完整回归通过：683 项总数，673 通过、10 条件跳过；Python 语法与 Git 差异格式检查通过。没有启动桌面或用户虚拟机，软件 App/ZIP 内容未改写；许可证组件映射待办仍保留，源码推送不等于正式软件发布。
 
 接续语：继续 CTFLab，正式目录 `/Users/pufei/Downloads/ctf-lab`。先读 AGENTS.md、当前状态第 19 节及最终验收记录，核对 Git 本地与 origin 分支、交付 ZIP 哈希和实际实例。用户已授权本次源码提交推送；本地 App/ZIP 仍未正式发布。保留资产与失败现场，不自动操作用户虚拟机或创建软件 Release。
+
+## 20. 当前交接：GitHub 预发布与软件库归档（2026-10-12）
+
+用户本轮明确授权创建 Release、清理这两天的中间文件、将最终 App 放入 CTFLab-Library，撤销历史对此次发布及中间产物清理的禁止。已发布 [v0.1.1-preview.20261012](https://github.com/zhangpu1211/ctf-lab/releases/tag/v0.1.1-preview.20261012)，含 ZIP/SHA-256/许可证溯源附件，来源提交 3375408；旧 Release 未覆盖。
+
+当前 App：`/Users/pufei/Downloads/CTFLab-Library/03-软件/CTFLab-0.1.1-preview.20261012/CTFLab.app`；同目录 ZIP 与说明。发布整理恢复逐库 SBOM 和 55 个许可证目录、重新签名；运行实现与已验收 app-r4 一致。新树摘要 3ed94af7…，ZIP 7678b62c…；旧 app-r4/旧本地 ZIP 的 bdba1732…/5aaa76d3… 只用于历史。三份副本校验通过，软件库索引与 SHA256SUMS 更新；原镜像基盘未改动。详情见 [发布记录](release-v0.1.1-preview-20261012.md)。
+
+160 项旧 App、独立测试磁盘/NVRAM/旧 ZIP 已可恢复移入废纸篓，未清空；日志、截图、脚本、JSON 与元数据快照保留。恢复清单 `/Users/pufei/Downloads/ctflab-release-20261012/cleanup-result.json`，历史状态不能再按磁盘路径直接运行。原始/已处理资产和 20261010 源运行时证据保留，现场无相关实例。没有操作桌面或用户虚拟机，没有合并主分支。
+
+后续先读取本节、发布记录并现场核验软件库与 Git，不沿用旧 PID。未验证跨 Mac、外接屏、睡眠、长时负载等范围不变；预发布不升级为这些项目已通过。
