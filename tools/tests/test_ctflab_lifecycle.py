@@ -66,6 +66,48 @@ class GracefulStopTests(unittest.TestCase):
             self.assertEqual(alive["pid"], 4242)
             self.assertTrue(manager.runtime_state_path("kali-arm64").exists())
 
+    def test_profile_shutdown_uses_ctrl_alt_delete_and_bound_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = LabManager(Path(directory))
+            pid = 4242
+            qmp = manager.runtime_dir / "kioptrix" / "qmp.sock"
+            qmp.parent.mkdir(parents=True, exist_ok=True)
+            qmp.touch()
+            write_json(manager.runtime_state_path("kioptrix"), {
+                "schema": 1, "profile_id": "kioptrix", "pid": pid,
+                "qmp_path": str(qmp), "shutdown": {
+                    "method": "ctrl-alt-delete", "timeout_seconds": 2},
+            })
+            alive = {"value": True}
+            commands = []
+
+            def fake_qmp(path, command, arguments=None):
+                commands.append((command, arguments))
+                alive["value"] = False
+
+            with mock.patch.object(ctflab, "bool_pid_alive", side_effect=lambda value: alive["value"] if value == pid else False), \
+                    mock.patch.object(ctflab, "qmp_command", side_effect=fake_qmp), \
+                    mock.patch.object(ctflab, "FORCED_SHUTDOWN_TIMEOUT_SECONDS", 0.01):
+                self.assertEqual(manager.stop(["kioptrix"], graceful=True), ["kioptrix"])
+            self.assertEqual(commands, [("human-monitor-command", {
+                "command-line": "sendkey ctrl-alt-delete"})])
+            self.assertFalse(manager.runtime_state_path("kioptrix").exists())
+
+    def test_shutdown_profile_rejects_unknown_method_and_timeout(self) -> None:
+        profile = {
+            "schema": 1, "id": "example", "name": "Example",
+            "guest": {"architecture": "x86_64", "firmware": "bios", "machine": "pc",
+                      "memory_mb": 512, "cpus": 1},
+            "disk": {"bus": "ide"},
+            "network": {"adapter": "pcnet", "mac": "52:54:00:24:00:57"},
+        }
+        for shutdown in ({"method": "qmp", "timeout_seconds": 120},
+                         {"method": "acpi", "timeout_seconds": True},
+                         {"method": "acpi", "timeout_seconds": 301}):
+            with self.subTest(shutdown=shutdown):
+                with self.assertRaises(CTFLabError):
+                    ctflab.validate_profile({**profile, "shutdown": shutdown}, Path("example.yaml"))
+
     def test_graceful_stop_continues_after_one_instance_is_preserved(self) -> None:
         # kali 不响应 ACPI（保留），smoke 的 QEMU 已经退出（清态）——两种结果要同时汇报
         alive = {"kali": 4242}
@@ -196,6 +238,10 @@ class SpiceClientStopOrderTests(unittest.TestCase):
             log.parent.mkdir(parents=True, exist_ok=True)
             log.write_text("boot\n", encoding="utf-8")
             self._write_runtime(manager, alive["qemu"], alive["client"], log)
+            runtime_path = manager.runtime_state_path("kali-arm64")
+            runtime = ctflab.read_json(runtime_path)
+            runtime["shutdown"] = {"method": "acpi", "timeout_seconds": 120}
+            write_json(runtime_path, runtime)
             with mock.patch.object(ctflab, "bool_pid_alive", side_effect=fake_alive), \
                     mock.patch.object(ctflab.os, "kill", side_effect=fake_kill), \
                     mock.patch.object(ctflab, "qmp_command", side_effect=guest_ignores_acpi), \

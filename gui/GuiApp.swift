@@ -58,6 +58,9 @@ final class GuiModel: ObservableObject {
     /// 左侧列表当前选中的文件夹镜像（与节点选择互斥）。
     @Published var selectedFilePath: String?
     @Published var showNodeResetConfirmation = false
+    @Published var scenarioReports: [ScenarioReport] = []
+    @Published var scenarioBusy = false
+    @Published var showScenarioStopConfirmation = false
     @Published var nodeResetTarget: String?
     @Published var showImageRemoveConfirmation = false
     @Published var imageRemoveTarget: String?
@@ -1215,6 +1218,54 @@ final class GuiModel: ObservableObject {
         }
     }
 
+    // MARK: Wintermute 场景（独立状态根；不动单机 profile）
+
+    func refreshScenario() {
+        guard !scenarioBusy else { return }
+        scenarioBusy = true
+        run(.scenarioStatus) { [weak self] outcome in
+            guard let self else { return }
+            self.scenarioBusy = false
+            switch outcome {
+            case .success(let text):
+                // 无实例时 CLI 输出提示文本而非 JSON；按空场景处理。
+                self.scenarioReports = ScenarioReport.decode(text) ?? []
+            case .failure(let message):
+                self.state.lastError = message
+            }
+        }
+    }
+
+    func stopScenario() {
+        guard !scenarioBusy else { return }
+        scenarioBusy = true
+        state.progressText = "正在按日志身份核验并请求正常停止；超时不强杀…"
+        run(.scenarioStop) { [weak self] outcome in
+            guard let self else { return }
+            self.scenarioBusy = false
+            self.state.progressText = ""
+            switch outcome {
+            case .success:
+                break
+            case .failure(let message):
+                // 停止未全部完成（退出码 1）也给出输出，便于查看待停止成员。
+                self.state.lastError = message
+            }
+            self.refreshScenario()
+        }
+    }
+
+    func recoverScenario(closeReset: Bool, releaseOrphan: Bool) {
+        guard !scenarioBusy else { return }
+        scenarioBusy = true
+        run(.scenarioRecover(closeReset: closeReset, releaseOrphan: releaseOrphan)) { [weak self] outcome in
+            guard let self else { return }
+            self.scenarioBusy = false
+            if case .failure(let message) = outcome { self.state.lastError = message }
+            self.refreshScenario()
+        }
+    }
+
     // MARK: CLI 调用
 
     private func run(_ action: CliAction, completion: @escaping (CliOutcome) -> Void) {
@@ -1345,6 +1396,57 @@ final class GuiModel: ObservableObject {
 }
 
 // MARK: - 界面
+
+/// Wintermute 场景面板：只读状态 + 身份核验停止/显式恢复；不把进程存活称为题目可用。
+struct ScenarioSection: View {
+    @ObservedObject var model: GuiModel
+
+    var body: some View {
+        GroupBox("Wintermute 场景（三节点双隔离网；独立于单机节点）") {
+            VStack(alignment: .leading, spacing: 8) {
+                if model.scenarioReports.isEmpty {
+                    Text(model.scenarioBusy ? "正在读取场景状态…" : "状态根下没有场景实例；用 CLI `scenario prepare` 创建。")
+                        .foregroundStyle(.secondary)
+                        .font(.callout)
+                }
+                ForEach(model.scenarioReports, id: \.instance_uuid) { report in
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack {
+                            Text(report.summaryState).bold()
+                            Text(report.instance_uuid).font(.caption).foregroundStyle(.secondary)
+                                .textSelection(.enabled)
+                        }
+                        Text(report.stateDetail).font(.caption).foregroundStyle(.secondary)
+                        ForEach(report.next ?? [], id: \.self) { hint in
+                            Text("下一步：\(hint)").font(.caption).foregroundStyle(.secondary)
+                                .textSelection(.enabled)
+                        }
+                    }
+                    .padding(.vertical, 2)
+                }
+                HStack {
+                    Button("刷新状态") { model.refreshScenario() }
+                        .disabled(model.scenarioBusy)
+                    Button("请求正常停止…") { model.showScenarioStopConfirmation = true }
+                        .disabled(model.scenarioBusy || model.scenarioReports.isEmpty)
+                    Button("收口重置事务") {
+                        model.recoverScenario(closeReset: true, releaseOrphan: false)
+                    }
+                    .disabled(model.scenarioBusy || model.scenarioReports.isEmpty)
+                    Button("释放接续孤儿预约") {
+                        model.recoverScenario(closeReset: false, releaseOrphan: true)
+                    }
+                    .disabled(model.scenarioBusy || model.scenarioReports.isEmpty)
+                }
+                Text("准备/启动/重置需用 CLI scenario 子命令；进程与 QMP 已核验不代表来宾地址、题目或隔离已验收。")
+                    .font(.caption2).foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(4)
+        }
+        .onAppear { model.refreshScenario() }
+    }
+}
 
 struct RecoverySheet: View {
     @ObservedObject var model: GuiModel
@@ -1490,6 +1592,7 @@ struct ContentView: View {
                 errorBanner(error)
             }
             verifyTable
+            ScenarioSection(model: model)
             mainSplit
             logPanel
         }
@@ -1500,6 +1603,12 @@ struct ContentView: View {
             Button(GuiMessages.resetConfirmButton, role: .destructive) { model.confirmReset() }
         } message: {
             Text(GuiMessages.resetConfirmationBody)
+        }
+        .alert("停止 Wintermute 场景？", isPresented: $model.showScenarioStopConfirmation) {
+            Button(GuiMessages.resetCancelButton, role: .cancel) {}
+            Button("请求正常停止", role: .destructive) { model.stopScenario() }
+        } message: {
+            Text("会按日志身份核验后向节点请求 ACPI 关机、再停止双网服务；超时会保留待停止状态，不会强杀或删除任何资产。")
         }
         .alert("确认重置节点？", isPresented: $model.showNodeResetConfirmation) {
             Button(GuiMessages.resetCancelButton, role: .cancel) {}

@@ -776,6 +776,9 @@ public enum CliAction: Equatable {
     case reviewMatrixCandidate(profileID: String, reportPath: String, attempt: Int)
     case snapshot(profileID: String, operation: String, name: String? = nil)
     case backupReset(profileID: String, name: String = RecoveryRules.checkpointName())
+    case scenarioStatus
+    case scenarioStop
+    case scenarioRecover(closeReset: Bool, releaseOrphan: Bool)
 
     /// 参数数组：不做 shell 拼接，路径（含空格）保持为单个参数。
     public func arguments(stateDir: String? = nil) -> [String] {
@@ -868,6 +871,15 @@ public enum CliAction: Equatable {
         case .reviewMatrixCandidate(let profileID, let reportPath, let attempt):
             args += ["probe", profileID, "--apply-matrix-report", reportPath,
                      "--review-attempt", String(attempt), "--confirm-apply"]
+        case .scenarioStatus:
+            // 场景状态与单机 profile 状态分属不同入口：独立状态根，只读查询。
+            args += ["scenario", "status", "--json"]
+        case .scenarioStop:
+            args += ["scenario", "stop"]
+        case .scenarioRecover(let closeReset, let releaseOrphan):
+            args += ["scenario", "recover"]
+            if closeReset { args.append("--close-reset") }
+            if releaseOrphan { args.append("--release-orphan") }
         }
         return args
     }
@@ -1128,5 +1140,76 @@ public enum ResetGate {
         return LabNode.orderedProfileIDs(state.configuredProfileIDs).map {
             .resetProfile(profileID: $0)
         }
+    }
+}
+
+
+// MARK: - Wintermute 场景状态（独立状态根；不并入单机 profile 状态机）
+
+/// `ctflab scenario status --json` 的报告数组元素。
+/// 字段与 CLI 输出一一对应；state 文案不把进程存活说成题目可用。
+public struct ScenarioReport: Codable, Equatable {
+    public struct ActiveGeneration: Codable, Equatable {
+        public let generation: Int
+        public let descriptor: String
+    }
+
+    public struct ResetState: Codable, Equatable {
+        public let state: String
+        public let generation: Int?
+        public let problem: String?
+    }
+
+    public struct RecoverySection: Codable, Equatable {
+        public let state: String
+        public let live: [String]?
+        public let absent: [String]?
+        public let unknown: [String]?
+        public let problem: String?
+    }
+
+    public let instance_uuid: String
+    public let state_root: String
+    public let active: ActiveGeneration?
+    public let reset: ResetState?
+    public let services: RecoverySection?
+    public let nodes: RecoverySection?
+    public let reservations: [ReservationInfo]?
+    public let next: [String]?
+
+    public struct ReservationInfo: Codable, Equatable {
+        public let token: String
+        public let generation: Int
+        public let ports: [Int]
+    }
+
+    public static func decode(_ text: String) -> [ScenarioReport]? {
+        guard let data = text.data(using: .utf8) else { return nil }
+        return try? JSONDecoder().decode([ScenarioReport].self, from: data)
+    }
+
+    /// 单一实例的诚实概括：待恢复 > 仍存活 > 已停止 > 未初始化。
+    public var summaryState: String {
+        let sections = [services, nodes].compactMap { $0 }
+        if sections.contains(where: { $0.state == "recovery-required" }) { return "待恢复" }
+        if sections.contains(where: { !($0.live ?? []).isEmpty }) { return "仍存活（进程已核验）" }
+        if sections.contains(where: { $0.state == "recovery-required" }) { return "待恢复" }
+        if !sections.isEmpty && sections.allSatisfy({ $0.state == "stopped-observed" }) { return "已停止" }
+        if active != nil { return "已准备" }
+        return "未初始化"
+    }
+
+    public var stateDetail: String {
+        var parts: [String] = []
+        if let active {
+            parts.append("代次 \(active.generation)（\(active.descriptor)）")
+        } else {
+            parts.append("活动代次未初始化")
+        }
+        if let services { parts.append("双网：\(services.state)") }
+        if let nodes { parts.append("节点：\(nodes.state)") }
+        if let unknown = services?.unknown, !unknown.isEmpty { parts.append("服务不明：\(unknown.joined(separator: ", "))") }
+        if let unknown = nodes?.unknown, !unknown.isEmpty { parts.append("节点不明：\(unknown.joined(separator: ", "))") }
+        return parts.joined(separator: "；")
     }
 }

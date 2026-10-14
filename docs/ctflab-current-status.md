@@ -235,3 +235,347 @@ Acfun 分发包 `/Users/pufei/Downloads/CTFLab-Library/02-已处理/Acfun-202610
 160 项旧 App、独立测试磁盘/NVRAM/旧 ZIP 已可恢复移入废纸篓，未清空；日志、截图、脚本、JSON 与元数据快照保留。恢复清单 `/Users/pufei/Downloads/ctflab-release-20261012/cleanup-result.json`，历史状态不能再按磁盘路径直接运行。原始/已处理资产和 20261010 源运行时证据保留，现场无相关实例。没有操作桌面或用户虚拟机，没有合并主分支。
 
 后续先读取本节、发布记录并现场核验软件库与 Git，不沿用旧 PID。未验证跨 Mac、外接屏、睡眠、长时负载等范围不变；预发布不升级为这些项目已通过。
+
+## 21. 当前交接：待处理镜像逐台适配（2026-10-13）
+
+本轮18个原始OVA核对完成：Acfun来源与既有适配包一致，复用未重启；其余新增17个自包含内容包，16个完成启动/网络/初始服务验收，NoPort因原盘缺少 /etc/iptables/rules.v4 单列兼容候选，挑战完整性待确认。新增包位于 `/Users/pufei/Downloads/CTFLab-Library/02-已处理` 独立子目录，具体清单/地址/服务见库内 `已适配镜像目录-20261013.md`。在App中选择具体子目录导入，不递归安装整库。
+
+每个新包两轮真实QEMU冷启动、登录提示截图、隔离实验网服务和正常关机再启动；制作后全新接收方安装再冷启动/正常停止，共51轮正式生命周期。逐项查看真实画面、逐包dist verify通过；18个原始OVA前后完整SHA一致。NoPort兼容部分同样完成上述流程，但不升级为完整可用。Smoke OVA与旧基盘虚拟内容不同，另存Smoke-OVA .56；派生副本补原名称hosts缓存才使原SmokePing主页HTTP200，外部监测未验证，访问端需映射smoke.dsz。Watcher Web入口为 .55:5000/login。
+
+证据根 `/Users/pufei/Downloads/ctflab-image-adaptation-20261013`，事实索引 acceptance-summary.json、originals-final-hashes.json、逐台lifecycle/recipient-lifecycle日志/截图/绑定。详情见 [本轮验证记录](verification-image-adaptation-2026-10-13.md)。本轮只修正派生网络接口/Smoke名称缓存和受控硬件配置，不改账号、应用代码、漏洞或挑战内容。没有认证登录、解题、全站功能、长时负载、多节点同时运行、跨Mac结论；没有新增GUI点击或Kali桌面登录验收。
+
+软件仍为库内已发布 v0.1.1-preview.20261012，包内app verify再次通过；本轮未修改运行实现或软件包。分支 codex/release-0.1.1-preview-20261010、HEAD 941db31114dbe811abadf46729295a72ec4bb30c。工作区只改.gitignore白名单、当前状态与新增验证记录，未提交/推送/发布。既有三节点清单/磁盘/NVRAM、旧Acfun和原OVA不改动；用户现有VM未操作，网络只在回环实验网。
+
+空间紧张时，本轮scratch RAW和已停止状态基盘作可恢复压缩归档（虚拟内容compare/字节SHA通过后回收原表示）；恢复入口 scratch-archives/restore-index.json 与 closed-state-archives/restore-index.json。原盘/交付包/日志/截图/元数据全保留；历史测试状态需先恢复磁盘再使用，建议新状态安装内容包。用户随后明确确认NoPort保留原样并注明原盘问题，不补规则或改变挑战设计。用户授权永久删除上轮cleanup-result.json列出的160项，随后报告已手动清空废纸篓；本助手未执行删除，受macOS隐私限制未独立复核废纸篓。上轮160项的废纸篓恢复入口已失效，无需继续删除；本轮证据根内的可恢复压缩归档为独立资产。记录见 ctflab-release-20261012/permanent-cleanup-check-20261013.json。
+
+本轮文档守卫94项=89通过+5条件跳过，git diff --check通过；库清单949项路径/大小核对无缺件。测试已正常结束，收口现场 final-process-snapshot.json 确认相关进程和本轮run.json均为空；后续操作需重新核验，不沿用旧PID。继续入口：先读AGENTS.md、本节与本轮验证记录，核对Git/软件/内容包清单，NoPort按用户确认保留原盘问题的候选状态；只有后续明确要求恢复挑战完整性时才补充来源资料。所有镜像功能边界仍以实际记录为准。
+
+接续语：继续CTFLab，正式目录 `/Users/pufei/Downloads/ctf-lab`。先读AGENTS.md、当前状态第21节及 docs/verification-image-adaptation-2026-10-13.md，核对Git和实例；17个新单节点内容包在库内02-已处理，16个初始服务通过、NoPort原规则缺件候选、Acfun复用。证据根 ctflab-image-adaptation-20261013；部分历史测试磁盘已可恢复压缩归档。保留原盘/资产/已有改动，不自动提交、发布、删除或操作用户VM。
+
+## 22. 当前交接：镜像说明与服务入口完善（2026-10-13）
+
+用户选择完善镜像使用说明与服务入口。已更新17个新内容包的独立使用说明、包README、说明条目哈希/大小和SHA256SUMS；磁盘/profile/claims未变。补既有Acfun使用说明并更正其BIOS无NVRAM的旧模板提示；旧schema1清单/磁盘不变。新增库内 `02-已处理/镜像使用与服务入口.md`，汇总实际Web地址、节点ID、隔离网访问和单包说明链接；同步库README、目录索引、文件清单/SHA以及项目学生教程，更正旧文档“导入优化未打包”说法，当前软件是已发布0.1.1-preview.20261012。
+
+使用路径：App选具体子目录导入，手动启动靶机和同状态Kali，从Kali浏览器访问。新包不含宿主端口映射，Mac不能直接访问这些实验网IP。Smoke-OVA .56需Kali内smoke.dsz映射，附curl --resolve临时GET与撤销说明；Watcher用 .55:5000/login；NoPort按用户选择保留原规则缺件候选；Acfun只引用历史SSH证据，不推测Web入口。未提供口令或解题步骤。
+
+本轮证据根 `/Users/pufei/Downloads/ctflab-image-guides-20261013`：before保存原说明/清单；changes.json、verification-results.json、逐包verify日志。17包dist verify和旧Acfun分发verify通过；说明修改前后的磁盘/profile条目及claims逐项一致，文档相对链接可访问。库清单957项路径/大小无缺件；本轮没有启动虚拟机、操作桌面、修改App或重打软件。历史51轮验收仍属于上阶段，不能当成本轮新增。
+
+正式目录 `/Users/pufei/Downloads/ctf-lab`，分支 codex/release-0.1.1-preview-20261010、HEAD 941db31114dbe811abadf46729295a72ec4bb30c；保留前阶段.gitignore/状态/验收记录改动，并新增学生教程修改，未提交/推送/发布。NoPort完整性、认证登录、全站功能、长时负载、跨Mac范围未升级。本轮结束实例状态以 image-guides证据根process-snapshot.json现场读数为准，后续操作重新核验。
+
+继续入口：先读AGENTS.md、本节与学生教程，再看库内服务入口表；按用户下一项明确任务推进，不自动启动用户VM、提交、发布或清理资产。
+
+本阶段最终检查：文档守卫94项=89通过+5条件跳过，git diff --check通过，收口实际可执行文件核验无相关GUI/QEMU/显示/网络进程；没有新建测试实例。说明修改已更新本地清单，不表示GitHub软件或资产有新发布。
+
+## 23. 当前交接：旧三节点结构、Smoke 同源与 NoPort 渗透复核（2026-10-13）
+
+旧 Kali/Smoke/Basic 平铺在 `02-已处理` 是 schema 1 历史分发清单所决定；17 个新单靶机在独立目录是 schema 2 自包含内容包。没有迁移或改写旧分发。旧 `smoke` 与新 `smoke-ova` 的磁盘虚拟内容并非逐字节相同，但离线读取的 SmokePing 配置、Apache 配置、入口脚本、hosts 与 fstab 的 SHA-256 一致；同一服务的不同交付/profile，不应作为两道不同靶题。新盘仅对派生根分区副本回放 ext4 日志，原盘不动。详情见 [独立验证记录](verification-noport-smoke-2026-10-13.md)。
+
+NoPort 在本轮全新独立状态 `ctflab-clarify-20261013/noport-state` 中实际启动；仅经回环实验网对 `.50` 受控访问，验证预存 `/1.php` 无认证命令执行，返回 `uid=101(apache)`，取得 Web 服务用户权限；源基盘与适配盘的虚拟内容 `qemu-img compare` 相同。没有证明 root、flag、预期解题链或原防火墙规则缺件对挑战难度的影响，因此仍按用户要求保留原盘问题和“兼容候选”定位。本轮 NoPort 已正常停止，`run.json` 清除，结束时原 QEMU PID 不在；后续重新核验实例绑定，不沿用该 PID。
+
+证据根 `/Users/pufei/Downloads/ctflab-clarify-20261013`，含 Smoke 文件哈希对照、NoPort HTTP 响应、脱敏源码摘要与关机现场核验。正式项目目录、分支、HEAD 和已发布 App 仍为第 22 节所列；工作区保留既有未提交改动，只新增本验证记录与 `.gitignore` 文档白名单；未提交、推送、重打包、发布或改镜像库。后续若需判定 NoPort 完整通关，应明确验收目标，再在独立实例核验并保留原防火墙缺件说明。
+
+接续语：继续 CTFLab，正式目录 `/Users/pufei/Downloads/ctf-lab`。先读 AGENTS.md、当前状态第 23 节及 docs/verification-noport-smoke-2026-10-13.md，现场核对 Git 和实例。旧三节点保持 schema 1 根目录分发；Smoke-OVA 与旧 Smoke 服务文件同源但分发配置不同；NoPort 已动态证实 apache 权限的无认证命令执行，整题通关未证实且原盘防火墙规则缺件。保留资产和已有改动，不自动操作用户虚拟机、提交、推送、发布或删除。
+
+## 24. 当前交接：新三组原始镜像的受限适配（2026-10-13）
+
+`01-待处理` 新增的三组目录实际包含四台机：Kioptrix Level 1、Stapler、Wintermute Straylight 与 Neuromancer。四份原始磁盘/OVA 已记录 SHA；Wintermute 两个 VMDK 转换后的 QCOW2 经 `qemu-img check`、与来源虚拟内容 compare 通过。只用已发布 0.1.1-preview.20261012 的包内 CLI 和新建状态；没有修改原始输入、已发布 App 或用户现有 VM。详情及原件哈希见 [本轮验证记录](verification-new-images-2026-10-13.md)，证据根 `/Users/pufei/Downloads/ctflab-new-three-20261013`。
+
+**Stapler**：原 OVF 为 SATA/AHCI、PCNet32，来宾 DHCP 绑旧接口 `ens33`，导致初始登录画面虽出现却 ARP 不通。仅在派生盘将两个 `ens33` 改为 `eth0 `，原 VMDK 不动；修正后两次独立启动均到登录画面，FTP 21、SSH 22 TCP 与 HTTP 80（根路径 404）有真实协议响应。已做 schema 2 自包含包 `CTFLab-Library/02-已处理/Stapler-候选-20261013`，`dist verify` 与全新状态 `dist install`/启动/服务复验通过。第一次 `stop --graceful` 超时，接收实例第二次成功，关机稳定性未闭环，因此保留**候选**，不能作为已完整适配的课堂交付。
+
+**Kioptrix**：原盘停在 `Starting sendmail`；派生盘只恢复 `/etc/hosts` 的 localhost 行后到 `kioptrix login:`，取得 DHCP ACK，但隔离探针 ARP 仍失败，正常关机超时；服务未证实，不制作内容包。**Wintermute**：Straylight 到 Debian 9 登录提示、Neuromancer 到 Ubuntu 16.04 登录提示且独立正常关机；单网卡状态均未得固定实验 IP。原题明确要求 Straylight 双网卡连接两个隔离网、Neuromancer 只在第二网、Kali 只在第一网；当前单实验网不能保持跳转设计，两盘仅留可复用转换候选，不交付为已适配内容包。没有认证登录、解题、长时负载或跨 Mac 验收。
+
+同日库内 `01-待处理` 布局变为 `2.zip` 与三组提取目录；旧清单登记的18个散放 OVA 路径均已不存在。`2.zip` 含原 `1/basic_pentesting_2.ova`，该条目已流式读完并通过 ZIP CRC，SHA-256 为 `145a164df4c78dcecff670a13e9c8d07dd91237797c1a4b42017aefa4cca2661`；当前 `basic-pentesting-2-base.qcow2` 仍在 `02-已处理`。按现存文件重建本地库根清单与 SHA256SUMS，旧清单备份于本轮证据根；没有将缺失旧路径冒称仍在。镜像库说明与服务入口已标出 Stapler 候选、Kioptrix/Wintermute 未交付。
+
+正式项目目录仍为 `/Users/pufei/Downloads/ctf-lab`；分支与已发布 App 沿用第 22 节，本轮未修改运行器代码或重打 App，未提交、推送、发布。保留前阶段未提交改动。本轮四份源哈希前后相同，库根 958 项校验通过，相关 QEMU 与 `run.json` 均为零；Stapler 接收状态已校验压缩归档，Kioptrix 两个停止测试状态仍保留，详情见验证记录与 `final-check.json`。后续不可沿用旧 PID。下一阶段优先定位 Kioptrix 的 sendmail/网络阻塞、确认 Stapler 正常关机稳定性；Wintermute 要在正式支持双隔离网并完整核验跳转后才可交付。
+
+接续语：继续 CTFLab，正式目录 `/Users/pufei/Downloads/ctf-lab`。先读 AGENTS.md、当前状态第 24 节及 docs/verification-new-images-2026-10-13.md，核对 Git、镜像库和实例。Stapler 仅为兼容候选包；Kioptrix 服务未就绪；Wintermute 缺双网段，暂不发学生。原 Basic OVA 在 `01-待处理/2.zip` 内。保留原件、已有改动和证据，不自动停止用户 VM、删除、提交或发布。
+
+## 25. 当前交接：Kioptrix 新候选与 Stapler 重启复验（2026-10-13）
+
+本节覆盖第 24 节中“Kioptrix 未制包”的旧状态。详见 [新增镜像续验记录](verification-new-images-2026-10-13.md) 的“同日续验”与证据根 `/Users/pufei/Downloads/ctflab-new-three-20261013/followup`。正式项目目录 `/Users/pufei/Downloads/ctf-lab`，原盘、已发布 0.1.1-preview.20261012 App 与用户现有 VM 未修改。
+
+Kioptrix 问题不是网卡驱动缺失：离线日志确认 PCNet/eth0；原来宾 DHCP 缓存仍写 `192.168.1.104`，造成交换机 ACK `.57` 而来宾 ARP 不可达。新派生盘在前轮 localhost 行修复基础上只删除两份旧 DHCP 租约；`qemu-img check/compare` 通过。制作状态两次、全新内容包接收状态一次真实冷启动均到 `kioptrix login:`，实验网 ARP、SSH 22、HTTP 80 的 Red Hat Apache 默认页 200、139/443 TCP 端口复现。现有 **兼容候选包** `CTFLab-Library/02-已处理/Kioptrix-候选-20261013` 已 `dist verify`、`dist install` 与接收状态真启动；尚未认证登录或解题。ACPI 请求 30 秒超时且接收状态 120 秒仍未自然退出，普通停止仅用于绑定核对后的独立测试实例，故不能标完整可用。
+
+Stapler 的候选包另在全新状态两次冷启动到 `red login:`，ARP、FTP 220、SSH 标识与 HTTP 404 均复现。两次正常关机在运行器的 30 秒门槛超时，但来宾关机画面可见，第二次请求后 94.31 秒 QEMU 自然退出；旧轮一次 30 秒内成功。运行器尚未针对慢关机调整，用户仍会看到超时，因此包继续标**候选**。包内声明和说明已据实更新，基盘未改，`dist verify` 通过。Wintermute 原双网段跳转限制不变，未交付完整内容包。
+
+本轮只修改候选包元数据、库说明索引及项目记录，没有运行器源码变更或新版 App 打包；不提交、推送、发布。库根 964 项 SHA256SUMS 全通过，四份原始输入 SHA 前后相同，相关 QEMU 与 `run.json` 均为零；两份当前候选包最终版在第三份独立状态真安装，未启动该状态。验收记录和 `followup/final-check.json` 为本轮证据，后续仍须现场复核。下一步若要把两包升为完整课堂交付，先解决 Kioptrix 关机与认证/题目功能验收，以及 Stapler 慢关机在 App 中的处理和业务内容验收；Wintermute 须支持原题两个隔离网。
+
+接续语：继续 CTFLab，正式目录 `/Users/pufei/Downloads/ctf-lab`。先读 AGENTS.md、当前状态第 25 节及 docs/verification-new-images-2026-10-13.md 的续验部分，核对 Git、库根清单和实例。Kioptrix/Stapler 均是候选内容包，前者 ACPI 关机不响应，后者约 95 秒自然关机超过 App 30 秒门槛；Wintermute 仍缺双网段。保留原件、已有改动和证据，不自动停止用户 VM、删除、提交或发布。
+
+## 26. 关机候选工作区复核（2026-10-14）
+
+现场仍为正式目录 `/Users/pufei/Downloads/ctf-lab`、分支 `codex/release-0.1.1-preview-20261010`、HEAD `941db31`。保留全部原有未提交改动。库里已有 `Kioptrix-关机候选-20261013` 与 `Stapler-慢关机候选-20261013` 两份新增候选：profile 分别声明 Ctrl+Alt+Del/120 秒与 ACPI/120 秒；两包当前工作区 CLI 的 `dist verify --json` 均返回 `ok=true`。这些目录晚于第 25 节，尚未进入那一节的真实来宾验收结论；Kioptrix 包内说明记载先前独立测试，但本轮尚未重新验证其证据与启动路径。
+
+工作区 `tools/ctflab.py` 已有逐镜像关机策略实现。本轮修复一处等待范围问题：`shutdown.timeout_seconds` 仅用于 `stop --graceful`；普通 `stop` 仍按全局短等待后回收，避免候选包的 120 秒配置使人工回收无端等待。对应生命周期测试加入长等待配置下的普通停止用例，并修正 CLI 帮助文字。
+
+两包各在本轮独立新状态用工作区 CLI 完成 `dist install`、真实 QEMU `run`、`stop --graceful`；Kioptrix 的 Ctrl+Alt+Del 与 Stapler 的 ACPI 均返回正常停止，原 PID 消失、状态无运行实例或遗留登记。测试状态和派生盘保留在 `/Users/pufei/Downloads/ctflab-shutdown-20261014`。生命周期 12 项通过，完整本地回归退出码 0，`git diff --check` 通过。详见 [独立续验记录](verification-shutdown-candidates-2026-10-14.md)。未重打 App，因此已发布的 `0.1.1-preview.20261012` 不具备新策略；工作区版本 `0.1.2` 仍为未发布候选。Kioptrix/Stapler 继续标候选，认证登录、题目功能、长时稳定性和正式 App 包内验收仍待完成。未提交、推送或发布；原始输入与既有测试证据未修改。
+
+接续语：继续 CTFLab，正式目录 `/Users/pufei/Downloads/ctf-lab`。先读 AGENTS.md、当前状态第 26 节和 `docs/verification-shutdown-candidates-2026-10-14.md`，现场核对 Git、镜像库与实例。两份 0.1.2 关机候选已在工作区 CLI 的独立状态完成一次真实正常停止，仍未完成认证/题目与 App 包内验收；保留原件、已有改动、测试状态和证据，不自动停止用户 VM、删除、提交或发布。
+
+## 27. 第二次冷启动与 Stapler 显示误判修复（2026-10-14）
+
+沿用第 26 节两份独立测试状态，Kioptrix、Stapler 各第二次真实冷启动并再次正常停止。Kioptrix 在 90 秒探测时 DHCP `.57` 已就绪但画面仍在 sendmail 阶段，稍后独立截图人工确认 `kioptrix login:`。Stapler 的 DHCP `.58` 和 `red login:` 画面均已取得；原探测因黑白画面只有两种颜色而错误报告无显示活动、退出码 1。工作区 `ppm_display_activity` 将颜色门槛从 4 调到 2，保留非黑像素比例门槛；对同一运行实例重测返回 `network_and_display_candidate`、退出码 0。屏幕专项 16 项通过，两机第二次 `stop --graceful` 均成功。详情及原失败/修复后证据见 [关机候选续验](verification-shutdown-candidates-2026-10-14.md) 的同日续验与 `/Users/pufei/Downloads/ctflab-shutdown-20261014`。
+
+这是工作区 CLI 的测试，未重打或发布 App；两包仍是候选。本轮未重测 FTP/SSH/HTTP、认证登录、解题、长时稳定性或跨 Mac。Git 分支、HEAD 与原有未提交改动沿用第 26 节，本轮只追加显示判定代码、回归测试和状态/验证记录。结束时现场复核两份测试状态均无 `run.json`，相关 QEMU 进程均不存在；测试状态和派生盘仍保留，不能以后沿用本轮 PID。下一阶段可对候选包做独立服务与题目功能验收，或先将工作区实现做包内 App 验证；均不应将旧版 0.1.1 当成支持新关机策略。
+
+接续语：继续 CTFLab，正式目录 `/Users/pufei/Downloads/ctf-lab`。先读 AGENTS.md、当前状态第 27 节及关机候选续验记录，现场核对 Git、镜像库和实例。两包在工作区 CLI 的独立状态均两次正常停止；Stapler 黑白登录画面的显示误判已修复并重测。保留原件、已有改动和证据，不自动操作用户 VM、删除、提交或发布。
+
+## 28. Kioptrix、Stapler 本地运行兼容分发（2026-10-14）
+
+完成两份 schema 2 内容包 `CTFLab-Library/02-已处理/Kioptrix-可分发-20261014`、`Stapler-可分发-20261014`，要求 >=0.1.2；配套 App/ZIP 位于 `03-软件/CTFLab-0.1.2-local-20261014`。旧软件、旧候选及原件保留，未变更外部发布渠道。基盘和运行 YAML 与既有关机候选逐字节相同，更新分发说明及独立验收记录，不再为修改历史验收字段触发同名配置冲突。
+
+新构建 App 包内 CLI 在全新独立状态各完成两轮服务探测、正常停止和停止后冷启动。Kioptrix 两轮 SSH/HTTP 200/139/443 TCP；Stapler 两轮 FTP/SSH/HTTP 404。正常停止分别为 16.63/15.80 秒、94.72/16.42 秒。第一轮均人工核对 QMP 登录画面；第二轮 Kioptrix 截图仍为欢迎信息、Stapler 截图为空白，不以第二轮截图宣称登录通过。两份最终分发包另在独立配置/状态完成 verify/install；最终包安装状态未另外启动。
+
+App 与交付副本 verify 通过，许可证完整，ad-hoc 未公证；专项 98 项通过，完整回归 687 项通过、跳过 10，退出 0。两份原 VMDK 哈希重算一致。仍未验证认证登录、完整解题、长时、跨 Mac、人工 GUI 或连续运行热重启；仅交付运行兼容，不标完整课堂业务验收。详见 [本轮分发验收](verification-distributable-images-2026-10-14.md)。
+
+正式目录、分支和 HEAD 沿用第 27 节，已有改动保留，本轮只追加项目记录及本地库交付物；未提交、推送或外部发布。证据根 `/Users/pufei/Downloads/ctflab-distributable-20261014`；结束核对两份运行测试状态均无 run.json、四个测试 PID 均不存在；状态、派生盘和证据保留。后续不得沿用 PID。
+
+接续语：继续 CTFLab，正式目录 `/Users/pufei/Downloads/ctf-lab`，先读 AGENTS.md、当前状态第 28 节和分发验收记录。Kioptrix/Stapler 已有要求 0.1.2 的本地运行兼容包及配套 App；两轮服务和正常停止通过，完整题目、第二轮登录显示、跨 Mac 和人工 GUI 尚未全验。保留原件、候选、既有改动与测试证据，不自动操作用户 VM、删除、提交或发布。本次目标：____。
+
+第 28 节最终补充：ZIP 解压后的 app verify 通过。验收脚本直接调用包内 Python 曾改写三个已有缓存并生成 115 个额外缓存；已按原归档/清单恢复原字节，额外文件移至证据目录保留，补齐旁车 SHA 后重打 ZIP，完整签名及清单复核通过。库根最终 1801 项由一次完整检查的未变部分与新软件 813 项最终重验共同覆盖，首次检查退出 1 的修复现场保留，不冒称单次全库通过。
+
+## 29. Wintermute 双隔离网静态设计（2026-10-14）
+
+完成 [场景设计](ctflab-wintermute-scenario-design.md)，同步总体设计 Phase 5：三节点/双二层网清单契约、独立实例与 NIC 顺序、候选 DHCP 地址、无来宾管理 NIC/NAT/hostfwd 的策略、应通/禁通矩阵、场景锁和所有权、部分失败/停止超时恢复、整场景 generation 原子重置与分阶段实施门槛。Wintermute 是一台内部靶机的先导，不代替 Phase 5 的入口机加两台内部主机验收。
+
+现场读取原 Wintermute-Lab-Setup.txt，确认原题双网卡/跳转关系；原说明允许 Kali 可选 NAT，本设计选离线。现场确认两份原 OVA 与 staging 候选基盘路径存在；未重算镜像哈希、解包、导入或启动。按当前源码确认单网固定 DHCP、附加管理网卡和 Kali 默认 NAT 的差距，未修改实现。原件、候选盘及既有改动保留。第 28 节的本地 0.1.2 App 与外部发布 0.1.1-preview 状态沿用历史记录，本轮没有软件验收或重新打包。
+
+验证入口：`PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tools/tests -p '*doc*' -q` 与 `git diff --check`。首次文档守卫 94 项、跳过 5 项，因上一阶段分发验收记录缺少历史快照声明失败；仅补声明，不改验收事实，修正后结果见本节收口补记。未运行完整回归、合成多网测试或真实 VM；方案、地址及超时均未标为运行验证事实。
+
+正式目录 `/Users/pufei/Downloads/ctf-lab`，分支 `codex/release-0.1.1-preview-20261010`，HEAD `941db31`；本轮新增设计文档与白名单、追加本节、同步 Phase 5，并补历史记录声明。未提交、推送、发布、删除或操作用户 VM。本轮没有创建测试实例/状态目录/进程，不查询或接管用户实例；既有实例是否运行未核验，不将旧轮零进程结论当作当前结论。
+
+下一步最小切片：实现场景清单校验与纯参数生成，覆盖独立命名空间、多 NIC 顺序及禁止管理网/NAT/映射的策略；暂不启动网络或 VM。其后再推进参数化 DHCP 与生命周期。真实 Wintermute 启动、停止、重置与解题验收需新阶段明确授权，不能沿用旧实例 PID。
+
+接续语：继续 `/Users/pufei/Downloads/ctf-lab`，先读 AGENTS.md、当前状态第 29 节和 `docs/ctflab-wintermute-scenario-design.md`，核对 Git 并保留已有改动。本次目标：实现场景清单校验和纯 QEMU 参数生成及对应静态测试；不启动网络/VM，不操作用户实例、不删除、不提交或发布。双网 DHCP、生命周期和 Wintermute 实机尚未实现或验收。
+
+第 29 节收口补记：修正后文档守卫 94 项运行，OK、跳过 5 项，退出 0；`git diff --check` 通过。测试使用禁写字节码模式；没有运行虚拟机或修改镜像。所有设计仍为待实现/待实测。
+
+## 30. Wintermute 场景清单与纯参数静态切片（2026-10-14）
+
+完成 `tools/ctflab_scenario.py`：独立 schema 1、严格 JSON/字段/能力校验、三节点双网拓扑与 NIC PCI 顺序、资源上限、地址/租约/依赖校验、UUID 命名空间及稳定 MAC、独立 overlay/NVRAM 与 QMP/SPICE 参数。默认能力空即拒绝；必需能力集合仅描述契约，不宣称当前运行器支持编排。参数强制关闭默认网络，仅清单 NIC，无 NAT/hostfwd/管理 NIC/共享；SPICE 仅 UNIX 并关闭剪贴板、文件传输。未接入 CLI/GUI/内容包，保留单机实现及已有改动。
+
+接口、白名单、合成清单与可信调用方责任见 [设计第 6 节](ctflab-wintermute-scenario-design.md)。资产哈希/硬件标记仅结构校验，不是 Wintermute 验证事实；checks 暂为空。实际目录权限/符号链接、固件和基盘核验、端口所有权及宿主路由检查留给后续准备入口。双网 DHCP、生命周期、事务重置、真实 QEMU 参数兼容性与隔离尚未实现/验收。
+
+验证（2026-10-14）：`PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=tools:tools/tests python3 -m unittest test_ctflab_scenario test_ctflab_installer.InstallerCommandTests.test_clipboard_is_scoped_to_graphical_kali test_ctflab_installer.InstallerCommandTests.test_arm64_command_uses_hvf_pflash_and_input_devices test_ctflab_installer.InstallerCommandTests.test_kali_defaults_to_internet_but_targets_remain_isolated test_ctflab_status_docs.SpiceDisplayCliTests.test_default_command_stays_cocoa_without_spice -v`，10 项通过（6 项场景测试含多组负测，4 项现有单机静态兼容测试）。文档守卫、语法与 diff 检查见收口补记；未跑完整回归、合成网络或实机测试。
+
+正式目录 `/Users/pufei/Downloads/ctf-lab`，分支 `codex/release-0.1.1-preview-20261010`、HEAD `941db31`。新增模块/测试、追加设计和状态，源码白名单新增模块；其余先前改动保留。未重新打包、删除用户资产、提交、推送或发布。本地 0.1.2 App/外部 0.1.1-preview 为第 28–29 节历史状态，本轮不验证或更新。本轮未创建网络/VM/测试运行状态，不查询或控制用户实例，既有 VM 状态未核验；测试仅合成数据和临时静态测试目录。
+
+下一步：在新阶段明确范围后实现参数化双网 DHCP 与端点资源分配，先合成验证，再推进编排；真实 VM 测试需另行明确授权。
+
+接续语：继续 `/Users/pufei/Downloads/ctf-lab`，读取 AGENTS.md、当前状态第 30 节、Wintermute 设计第 6 节和 `tools/ctflab_scenario.py`，核对 Git 并保留已有改动。静态清单/参数切片已完成，未接启动入口；本次目标：____。不要自动启动网络/VM、操作用户实例、删除资产、提交或发布。
+
+第 30 节收口补记：文档守卫 `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tools/tests -p '*doc*' -q` 运行 94 项，OK、跳过 5 项；新增模块和测试以 `ast.parse` 检查语法通过（不生成字节码）；`git diff --check` 通过。结束时 Git 分支/HEAD 与阶段开始一致，新增模块/测试仍未跟踪，已有改动未提交。未创建任何网络或 VM 进程；没有查询既有实例 PID，不能据此认定宿主零实例。
+
+## 31. 双网 DHCP 参数化与合成验证（2026-10-14）
+
+完成 `tools/ctflab_network.py` 的实例级 DHCP 配置，按 subnet 生成掩码/广播/server ID，限定地址池、预约与登记客户端；保留单机默认网段和允许动态客户端的行为。动态池耗尽不越界，非法/错网请求不生成错误租约。场景模块新增纯 `network_server_specs`，将 UUID/NIC 派生 MAC 与逻辑预约变为 outer/inner 独立配置、server MAC 和代次状态路径；不启动或预约资源。服务循环使用可合成调用的 `dhcp_response`。网络状态新增 subnet/pool/登记策略与实例/网段/代次字段，继承监听 FD 仍限回环 IPv4 TCP。接口、协议限制及实际边界见 [设计第 7 节](ctflab-wintermute-scenario-design.md)。
+
+验证入口（2026-10-14）：`PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=tools:tools/tests python3 -m unittest test_ctflab_scenario_dhcp test_ctflab_network test_ctflab_scenario test_ctflab_network_report test_ctflab_installer.InstallerCommandTests.test_clipboard_is_scoped_to_graphical_kali test_ctflab_installer.InstallerCommandTests.test_arm64_command_uses_hvf_pflash_and_input_devices test_ctflab_installer.InstallerCommandTests.test_kali_defaults_to_internet_but_targets_remain_isolated test_ctflab_status_docs.SpiceDisplayCliTests.test_default_command_stays_cocoa_without_spice -q`，33 项通过。新增 11 项双网/地址/异常帧/服务循环/端口与 FD 测试，含多组子测试；其余为现有网络、清单、网络报告和单机静态兼容检查。初次扩大验证 33 项中 FD 测试 2 项因本机 `SO_ACCEPTCONN` 查询返回协议不可用失败；去掉该不可移植查询、保留 TCP/端点校验并调整负测后重跑全部通过。失败测试进程已结束，重跑 FD 测试关闭全部 socket。
+
+本轮没有启动 VM、网络子进程或接触用户实例。端口竞争测试只在当前测试进程临时绑定回环随机端口，FD 测试无服务等待循环；模拟客户端测试用 mock 替代 socket/select/send 和状态写入。既有网络测试使用临时文件及 socketpair。结束后没有本轮持久运行实例、状态目录或进程；用户既有实例状态未查询，不能据此认定宿主零实例。未修改磁盘、原件、用户状态或凭据。
+
+正式目录 `/Users/pufei/Downloads/ctf-lab`；分支 `codex/release-0.1.1-preview-20261010`、HEAD `941db31`，保留此前所有改动。本轮修改网络模块/场景模块，新增 `tools/tests/test_ctflab_scenario_dhcp.py`，追加设计/状态文档；未删除用户资产、提交、推送、打包或发布。第 28–30 节本地 0.1.2 App/外部 0.1.1-preview 状态为历史沿用，本轮未更新或验证。
+
+未完成：真实双交换机/QEMU 抓包隔离矩阵、场景端点资源分配与所有权/宿主路由校验、编排/恢复/事务重置、GUI/CLI 场景入口、Wintermute 实机与跨 Mac 验收。DHCP 协议暂未实现 NAK/DECLINE/RELEASE/租约到期；场景固定预约不依赖动态回收。下一阶段先实现资源准备及网络就绪的合成故障验证，再推进生命周期；真实 VM 启停需另行明确授权。
+
+接续语：继续 `/Users/pufei/Downloads/ctf-lab`，读取 AGENTS.md、当前状态第 31 节、Wintermute 设计第 6–7 节及场景/网络模块，现场核对 Git，保留已有改动。清单、纯 QEMU 参数和参数化 DHCP 合成验证已完成，场景运行入口未接入。本次目标：____；不要自动启动 VM、操作用户实例、删除资产、提交或发布。
+
+第 31 节收口补记：文档守卫 `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tools/tests -p '*doc*' -q` 运行 94 项，OK、跳过 5 项；网络模块、场景模块和新增测试通过 `ast.parse` 语法检查，无字节码生成；`git diff --check` 通过。结束时再次核对分支/HEAD 仍为上述值；没有本轮后台服务或 VM，受控 socket 全部由测试关闭，既有实例未查询/操作。完整本地回归、真实来宾、跨 Mac 和发布验收未运行。
+
+## 32. 场景网络资源准备与就绪合成故障验证（2026-10-14）
+
+新增 `tools/ctflab_scenario_resources.py`：明确路由快照校验、私有目录/链接/归属检查、非阻塞资源锁、既有记录拒绝覆盖、双回环监听 FD 持有与失败释放；增加双网就绪门槛，严格核对实例/代次/端点/DHCP 配置并依赖可信进程身份核验，单网成功不放行，超时保留现场。网络状态增加 server_mac/static_leases。接口与限制见 [设计第 8 节](ctflab-wintermute-scenario-design.md)。保留此前改动，未接入单机入口或生命周期。
+
+验证（2026-10-14）：`PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=tools:tools/tests python3 -m unittest test_ctflab_scenario_resources test_ctflab_scenario_dhcp test_ctflab_network test_ctflab_scenario test_ctflab_network_report -q`，36 项通过。新增 7 项合成准备/故障测试，包含多组负测、真实回环端口竞争、第二监听器失败释放、锁竞争、单网超时保留、真实 DHCPServer 状态写入。首轮 30 项中新增 6 项因临时目录经过 macOS /var 符号链接被拒绝而失败；夹具改为规范真实路径，原拒绝策略保留，重跑通过。测试仅使用自身临时目录/FD（退出清理自身夹具），不访问或删除用户资产。
+
+正式目录 `/Users/pufei/Downloads/ctf-lab`，分支 `codex/release-0.1.1-preview-20261010`、HEAD `941db31`；本轮未启动 VM/网络子进程、操作用户实例、提交、推送、打包或发布，既有 App 版本沿用第 28–31 节历史信息，本轮未核验。没有本轮后台实例；测试 FD 均关闭，用户既有实例未查询，不能宣称宿主零实例。
+
+未完成：完整资产/固件/overlay/NVRAM/socket 准备、路由现场采集与新鲜度、进程身份生产核验、全局锁到场景锁交接、跨实例 MAC 资源登记、生命周期/恢复/事务重置、真实双交换机和 Wintermute 验收。当前锁持有至显式 close，不能直接用于长时间编排等待；路径检查尚无同 UID 恶意并发替换防护。下一阶段优先完善可信准备调用链及锁交接，再实施服务生命周期合成故障验证；实机操作需要明确授权。
+
+接续语：继续 `/Users/pufei/Downloads/ctf-lab`，先读 AGENTS.md、状态第 32 节和 Wintermute 设计第 8 节，核对 Git，保留已有改动。下一阶段完善资产准备、可信路由/进程绑定与锁交接及合成故障验证；不要自动启动 VM、操作用户实例、删除资产、提交或发布。
+
+第 32 节收口补记：文档守卫 `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tools/tests -p '*doc*' -q` 运行 94 项，通过、跳过 5 项；本轮网络模块、资源模块和新增测试经 `ast.parse` 语法检查通过，`git diff --check` 通过。结束核对分支/HEAD 未变；完整本地回归、真实来宾、跨设备、发布验收未运行。没有本轮持久后台资源；未查询或操作用户既有实例。
+
+## 33. 场景资产准备、可信绑定与锁交接（2026-10-14）
+
+在第 32 节独立模块上新增 `prepare_scenario_resources`：显式基盘/UEFI code/vars 路径与哈希核验、独立 QCOW2 检查、准备空间门槛、三节点 overlay/backing 校验、私有 NVRAM/socket 目录及代次 `prepared.json` 绑定记录。原始资产只读；全部节点现场预检，现存目录拒绝覆盖；部分失败保留派生现场，只释放本次 FD/锁。目录逐层核对私有权限。完成后保留实例场景锁并释放全局资源锁，不在双网就绪等待期间占用全局锁。现有网络单独准备接口仍保留原锁行为，未接入单机或场景启动入口。
+
+新增本机数字 IPv4 路由只读采集、严格缩写解析与单调时钟新鲜度门槛；资产准备前后各核对一次，新增冲突闭锁。`OwnedNetworkProcesses` 绑定可信调用方持有的实际启动对象/argv，通过所属代次记录的新鲜读取及 `poll()` 支撑双网门槛；不以状态文件 PID 授权控制，不提供重开后的恢复。详细契约及限制见 [Wintermute 设计第 8.1 节](ctflab-wintermute-scenario-design.md)。
+
+验证（2026-10-14）：`PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=tools:tools/tests python3 -m unittest test_ctflab_scenario_resources test_ctflab_scenario_dhcp test_ctflab_network test_ctflab_scenario test_ctflab_network_report -q`，44 项通过。新增资产/路由/进程/锁交接与故障覆盖；真实 `qemu-img` 对三份 1 MiB 合成基盘创建 overlay 并 `check` 通过，基盘保持 0400，仅验证派生格式，不验证来宾启动。路由采集在本机只读执行，新鲜度校验通过（75 条，不在文档保存具体宿主路由）。文档守卫 `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tools/tests -p '*doc*' -q`：94 项通过、跳过 5 项。首轮新增夹具超 UNIX socket 长度而失败，改为短临时目录后通过；拆分测试类时一次遗漏夹具方法导致失败，补齐后通过。
+
+正式目录 `/Users/pufei/Downloads/ctf-lab`，分支 `codex/release-0.1.1-preview-20261010`、HEAD `941db31`；已有改动保留。本轮仅新增/完善场景资源模块、对应测试与设计/状态文档，没有 VM 或网络服务子进程，没有查询/操作用户实例、删除用户资产、提交、推送、打包或发布。`qemu-img` 和只读 netstat 子进程均已结束；临时测试夹具/FD 由测试自身清理，没有本轮后台资源。App 版本沿用第 28–32 节历史信息，本轮未核验，不能宣称宿主零实例。
+
+未完成：GUI/CLI 与服务 argv/继承 FD 的正式启动链、跨实例显式 MAC 登记、硬件/来源许可验证、同 UID 恶意并发路径替换防护、journal/进程重开恢复、停止/事务重置、真实双交换机/隔离矩阵与 Wintermute 来宾验收。空间检查不等于磁盘容量预约；路由快照不等于持续隔离；`prepared.json` 不等于网络运行或可用内容包。下一步在不启动 VM 的范围实现跨实例资源登记与服务生命周期/恢复的合成验证；任何真实 VM/用户实例操作需新阶段授权。
+
+接续语：继续 `/Users/pufei/Downloads/ctf-lab`，先读 AGENTS.md、状态第 33 节和 Wintermute 设计第 8.1 节，核对 Git 并保留已有改动。资产准备、可信观察与全局锁到场景锁交接已有独立接口和合成验证；下一步完善跨实例资源登记及服务生命周期/恢复的合成验证。不要自动启动 VM、操作用户实例、删除资产、提交或发布。
+
+第 33 节收口核验：最终目录逐层校验改动及文档更新后，相关 44 项与文档守卫 94 项（跳过 5）再次通过；资源模块和测试经 `ast.parse` 通过，`git diff --check` 通过。分支/HEAD 未变。完整全仓回归、真实来宾、人工桌面、跨设备和发布验收未运行。
+
+## 34. 跨实例资源登记与服务生命周期/恢复合成验证（2026-10-14）
+
+完成本阶段剩余实现：新增 `ctflab_scenario_registry`，在完整准备的全局→场景锁内登记六个 MAC、两端口和状态/socket 路径；冲突、未释放预约、损坏/半行记录与旧未登记场景现场闭锁。部分准备失败保留预约；显式观察全部三节点/双网停止后，按全局→场景锁追加释放历史，不删除资产。`prepared.json` 增加预约操作身份。旧低层网络准备仍不登记，不能直接当作发布入口。
+
+新增 `ctflab_scenario_services`：从白名单配置生成服务 argv/pass_fds；显式注入启动器/身份观察器，outer→inner 启动及总截止时间、双网就绪、健康失败降级、节点停止前置条件、inner→outer 正常停止、超时保留且只继续等待。spawn/stop 意图先写私有追加日志，日志失败、不明启动窗口或归属变化不自动继续。只读恢复核对完整预约资源、准备摘要/代次、PID/argv/启动身份，并在观察结束重读记录；PID 复用或记录变化拒绝恢复结果，不接管/补启/发信号。
+
+验证（2026-10-14）：相关 60 项通过，含新增 16 项登记/生命周期/恢复合成故障验证及既有真实 qemu-img 合成派生盘检查；文档守卫 94 项通过、跳过 5 项；5 个相关文件 `ast.parse` 通过，`git diff --check` 通过。实际命令、故障过程、范围和限制见 [本轮验证记录](verification-scenario-services-2026-10-14.md)，接口见 [Wintermute 设计第 8.2 节](ctflab-wintermute-scenario-design.md)。
+
+正式目录 `/Users/pufei/Downloads/ctf-lab`，分支 `codex/release-0.1.1-preview-20261010`、HEAD `941db31`；保留既有改动，本轮未启动 VM/真实网络服务、操作/查询用户实例、删除用户资产、提交、推送、打包或发布。新增 `.gitignore` 仅放行两个源码模块和本轮验证文档。服务及恢复进程观察全部使用合成对象；本轮 qemu-img 子进程已结束、临时 FD/夹具由测试清理，没有本轮后台实例或持久测试资源。App 版本沿用历史记录，本轮未核验；不宣称宿主零实例。
+
+未完成：GUI/CLI 接线、生产启动身份/停止证明/恢复 inspect、真实服务 FD 继承、锁下恢复接管、VM 生命周期与 QMP、整场景事务重置、跨状态根/单机资源协调、同 UID 恶意并发路径替换防护、真实双网隔离与 Wintermute 业务/跨 Mac 验收。观察等级不等于来宾停止或场景可用；没有默认真实 spawn，也没有自动解除异常预约。完整全仓回归与发布验收未运行。下一阶段可先完善节点生命周期与整场景重置事务的合成验证；真实服务/VM 启停和用户实例操作需另行明确授权。
+
+接续语：继续 `/Users/pufei/Downloads/ctf-lab`，读取 AGENTS.md、状态第 34 节、Wintermute 设计第 8.2 节及本轮服务验证记录，核对 Git 并保留已有改动。资源登记和双网服务生命周期/只读恢复已有独立合成验证；下一步完善节点生命周期与整场景重置事务的合成验证。不要自动启动 VM、操作用户实例、删除资产、提交或发布。
+
+第 34 节收口核验：新增验证文档首次触发历史快照标记守卫，补齐标记后文档守卫重跑 94 项通过、跳过 5 项；相关实现最终 60 项通过。5 个相关 Python 文件语法与最终 `git diff --check` 通过；新增源码/测试/验证文档未被 Git 忽略。结束核对分支/HEAD 未变；无本轮真实服务或 VM，未操作用户实例，未提交、打包或发布。
+
+## 35. 三节点生命周期与派生资产重置事务合成验证（2026-10-14）
+
+新增节点会话：双网就绪后 Neuromancer→Straylight→Kali 顺序创建，白名单 argv、实际启动对象/身份和 QMP/overlay 绑定；失败/失联仅降级、保留 pending 窗口与双网。关机按 Kali→Straylight→Neuromancer，逐节点截止时间，超时不继续停止后续节点/网络、不强杀，重试只等待；日志先于请求写入。提供只读节点身份恢复审计。全部启动、QMP/关机/身份接口明确注入，没有默认真实 VM 控制。
+
+新增停止态资产重置事务：显式初始活动代次，来源哈希/独立 QCOW2/空间/backing/check 验证；新代次三盘与 NVRAM、完整性清单、空网络目录准备完成后单次原子切换 active-generation 指针。提交前失败保留旧活动代次；提交后日志中断以指针和完整性核验为准。可显式补记提交或记 aborted 后另选新代次；旧/部分失败资产不删除。资源登记识别已提交/放弃的资产历史，旧代次与未接续重置资产的准备入口闭锁。
+
+验证（2026-10-14）：相关 83 项通过，含本轮新增 23 项合成/派生格式验证；文档守卫 94 项通过、跳过 5 项；5 个相关 Python 文件 ast.parse、diff 空白和新增文件白名单检查通过。真实 qemu-img 仅操作三份 1 MiB 合成基盘，重置后 overlay check 通过，基盘 0400/哈希不变。详情见 [本轮验证记录](verification-scenario-nodes-reset-2026-10-14.md)及 [Wintermute 设计第 8.3 节](ctflab-wintermute-scenario-design.md)。
+
+正式目录 `/Users/pufei/Downloads/ctf-lab`，分支 `codex/release-0.1.1-preview-20261010`、HEAD `941db31`；保留既有改动。未启动真实 VM/网络服务、查询或控制用户实例、删除用户资产、提交、推送、打包或发布。合成进程不是宿主进程；本轮 qemu-img 子进程已结束、临时夹具与 FD 自行清理，没有本轮后台资源。实际 App 版本未复核，不能声称宿主零实例。
+
+重要未完成：重置的 `reset-assets-ready` 尚未接入新的网络/socket/运行预约及启动链；旧预约保留，不能称正式可启动的整场景重置已完成。下一阶段优先实现“停止旧预约→重新预约新代次→复用完整性已核验资产→服务/节点启动”的接续链及合成故障验证，禁止绕过活动指针。生产 QMP/启动身份/停止证明、恢复接管、GUI/CLI、真实 FD 继承和持续隔离、Wintermute 业务/跨 Mac/发布验收继续未完成；完整全仓回归未运行。
+
+接续语：继续 `/Users/pufei/Downloads/ctf-lab`，先读 AGENTS.md、状态第 35 节、Wintermute 设计第 8.3 节和节点/重置验证记录，核对 Git 并保留已有改动。完善 reset-ready 资产到新代次网络/socket/运行预约及服务/节点启动的接续链与合成故障验证。不要自动启动真实 VM/服务、操作用户实例、删除资产、提交或发布。
+
+## 36. 重置接续链、生产运行时与场景 CLI/GUI 入口（2026-10-14）
+
+完成第 35 节遗留的接续链：`resume_reset_resources` 把已提交 reset-ready 资产接入"停止旧预约→新代次预约→复用已核验资产→服务/节点启动"，并覆盖"指针已切换但服务未启动"的崩溃重接；孤儿预约由 `recover_reset_continuation` 显式释放。服务会话新增活动指针门槛，孤儿准备记录不能绕过激活启动；registry 拆出锁内核供接续链复用。新增 `ctflab_scenario_runtime`：只读 ps 身份采集（包装脚本前缀、僵尸、`(进程名)` 瞬时退化、稳定窗）、QMP 查询/ACPI 关机、停止证明（指针切换后按代次记录自洽校验）、`stop_recovered_nodes/services` 锁内接管正常停止（意图先写日志、不重复发送、超时 stop-pending、stopping 可重试）。CLI 新增 `scenario` 六个子命令（独立状态根、/tmp 短 socket 根）；`start` 以新会话启动子进程并落盘身份后退出，"节点就绪"仅指进程与 QMP 已核验。GUI 增加场景面板（状态解码、确认后正常停止、显式收口/释放孤儿），不提供准备/启动/重置。设计文档新增 8.4 节与第 9/10 节（独立实机与交付验收方案，仅方案未执行）。
+
+验证（2026-10-14）：场景相关 10 模块 115 项连续 3 轮通过（接续链 13、运行时 13、CLI 端到端 5 项为真实 main() + 合成 qemu 桩 + 真实 DHCP 服务子进程 + 真实 ps/QMP 身份链）；完整本地回归 790 项通过、跳过 10；GUI 核心 217 项检查、`swiftc -typecheck` 通过；12 个相关 Python 文件 ast.parse、`git diff --check`、文档守卫见收口补记。故障过程见 [本轮验证记录](verification-scenario-resume-runtime-2026-10-14.md)，接口契约见 [Wintermute 设计 8.4](ctflab-wintermute-scenario-design.md)。
+
+正式目录 `/Users/pufei/Downloads/ctf-lab`，分支 `codex/release-0.1.1-preview-20261010`，HEAD `941db31`；保留既有改动。新增 `ctflab_scenario_runtime.py` 与 3 个测试模块并加入白名单；未提交、推送、打包或发布。本地 0.1.2 工作区与外部 0.1.1-preview 为历史状态，本轮未重新打包。本轮没有真实 VM/真实网络服务：CLI 端到端的子进程是测试自身的合成桩与 DHCP 服务（继承测试自身回环 FD），结束前按日志记录 PID 兜底终止；未查询或操作用户既有实例，不宣称宿主零实例。
+
+重要未完成：Wintermute 真实基盘从未启动——`scenario prepare/start` 生产路径只在合成资产上验证；真实来宾地址、目标服务、应通/禁通矩阵、跳转解题、两轮冷启动与跨 Mac/内容包/发布验收全部未做（方案见设计第 9/10 节，执行需新授权）。进程身份存在信号发送前 TOCTOU 窗口；停止证明不能排除未记录进程；GUI 不覆盖准备/启动/重置。完整功能仍不可称为"可启动的 Wintermute 靶场"。
+
+接续语：继续 `/Users/pufei/Downloads/ctf-lab`，先读 AGENTS.md、当前状态第 36 节、Wintermute 设计 8.4 与第 9 节、本轮验证记录，核对 Git 并保留已有改动。合成链路已闭环；下一步需要明确授权后按设计第 9 节做 Wintermute 独立实机验收（独立状态根与派生盘，不接管用户 Kali），或先做 GUI/CLI 细节打磨。不要自动启动真实 VM/网络服务、操作用户实例、删除资产、提交或发布。
+
+第 36 节收口补记：文档守卫 94 项通过、跳过 5 项；`git diff --check` 通过；12 个相关 Python 文件 ast.parse 无字节码；GUI 核心检查 217 项与 `swiftc -typecheck` 通过。结束核对分支 `codex/release-0.1.1-preview-20261010`、HEAD `941db31` 未变；工作区改动与新增文件未提交。测试遗留的 6 个合成 DHCP 子进程（本轮调试产生，状态路径均在本轮 /var/folders 临时目录下）已按 PID 清理并复核为零；未查询或操作用户既有实例，未删除用户资产。
+
+## 37. Wintermute 实机验收只读预检与入口细节修复（2026-10-14）
+
+按设计第 9 节完成只读预检（未启动任何 VM/服务、未解包 OVA、未修改镜像、未创建场景状态根、未操作用户实例）：现场重算两份 Wintermute 候选基盘、两份原 OVA、原题说明、库内 Kali aarch64 候选与 vars、`edk2-aarch64-code.fd` 的 SHA-256；`qemu-img info` 确认三份基盘均为独立 QCOW2；OVF 只读提取 NIC 证据——Straylight 双卡 82543GC+82540EM 与原题一致，Neuromancer OVF 含 NAT slot0（不得采用）与 host-only slot1，清单只挂 inner 单卡时来宾能否起址列为执行时门槛；当前宿主路由与 192.168.243/244 零冲突；QEMU 11.1.0 工具链在位；发现数据卷仅剩约 7.0 GiB 的空间风险（执行时须监控或另指定状态根）。全部数字见 [预检记录](verification-wintermute-acceptance-preflight-2026-10-14.md)，设计第 9 节已补预检补记。场景清单仍未物化，实机验收待当次明确授权。
+
+入口打磨：发现并修复场景根推导 bug——scenario 子解析器给 `--state-root` 预设默认值，压过全局 `--state-dir` 推导，GUI 覆盖状态目录时场景命令会找错状态根；改为子解析器默认 None、由 `scenario_state_roots` 统一推导。新增两项测试：场景状态根/socket 根随 `--state-dir` 且与单机 profile/images 子树互不包含（命名空间隔离防绕过），以及 `--instance` 显式选择与未知实例报错。
+
+验证（2026-10-14）：CLI 场景测试 7 项通过（含新增 2 项）；完整本地回归 792 项通过、跳过 10（既有保留项）；无真实 VM/网络服务，无新增持久进程。
+
+正式目录 `/Users/pufei/Downloads/ctf-lab`，分支 `codex/release-0.1.1-preview-20261010`，HEAD `941db31`；保留既有改动，未提交、推送、打包或发布。本轮新增预检记录文档并加入白名单，修改 ctflab.py 场景参数默认与场景 CLI 测试；哈希重算的 shasum、qemu-img info、tar -xOf 子进程均已结束。
+
+重要未完成与上节一致：实机验收执行（两轮冷启动、显示、地址、服务、矩阵、跳转、重置、重开恢复）、场景清单物化、Neuromancer 单卡起址确认、e1000 模型映射确认、空间问题解决；GUI 仍不覆盖准备/启动/重置；停止后同代次重启（保留来宾状态的 restart）未实现，当前停止后再运行走 reset 新代次路径（教学场景每次重置本就是主流程，restart 作为后续可选项）。实机验收必须由用户明确授权后按设计第 9 节与预检记录执行。
+
+接续语：继续 `/Users/pufei/Downloads/ctf-lab`，先读 AGENTS.md、当前状态第 37 节、设计第 9 节及预检补记、预检记录文档，核对 Git 并保留已有改动。预检已就绪；本次目标：____（如"授权执行第 9 节实机验收"或"继续入口/文档打磨"）；不要自动启动真实 VM/网络服务、操作用户实例、删除资产、提交、推送、打包或发布；执行实机验收需在本次消息中明确授权并确认状态根位置与空间。
+
+## 38. 证据根瘦身维护与 Wintermute 候选清单提案（2026-10-14）
+
+用户授权的三轮清理（均删除前核对引用与打开句柄，删除后复核资产完好）：① 本轮测试/调试中间件——临时状态根、stub 调试图、GUI 测试二进制、`__pycache__`、`.DS_Store`；② 无引用派生中间件——clarify 轮 smoke raw/root ×4（比对结论已录 `smoke-file-comparison.json`，与该轮 `archive-index.json` 自身的"哈希入档后删派生件"惯例一致）、new-three followup 的 kioptrix raw/分区 img ×8（文档零引用，结论在 JSON）；③ 适配证据根磁盘副本——17 台机器的 adapted/distribution/state/recipient 全部磁盘副本（删除前对 17/17 台做 `distribution.qcow2`↔`02-已处理/-base.qcow2` 逐字节比较全部一致，pane1 state 副本另经 `qemu-img compare` 内容级确认 identical）。保留：`noport/source-state` 与 `smoke-ova/source-state`（源 OVA 已在库整理中消失，此为原始源盘最后现存副本，作溯源）、`scratch-archives/` 与 `closed-state-archives/`（归档证据本体）、全部 JSON/日志/说明/截图、库与 staging 资产、App Support 用户数据。适配证据根 126 GB→44 GB，数据卷可用 13→103 GiB，预检记录的 7 GiB 空间风险解除。被删文件的历史验收结论不受影响（其文档记录与 JSON 均在）；仅 state/recipient 现场原件不再留存，后续如需复核只能按库内包重新安装验证。
+
+入口/文档打磨：Wintermute 候选清单已物化为提案——用预检真实哈希起草、通过 `parse_manifest` 严格校验，嵌入 [Wintermute 设计 9.1 节](ctflab-wintermute-scenario-design.md)（含执行命令序列；`hardware_verified=false`，NIC `e1000` 对 82540EM 精确、对 82543GC 为最近似，冷启动以来宾命名确认前不得宣称原卡型复现）。新增防腐化测试：从设计文档提取内嵌 JSON 逐块跑当前 schema 校验，文档随实现演进而失配会直接红。
+
+验证（2026-10-14）：`test_ctflab_scenario` 7 项通过（含新守卫）；清理三轮各自删除前后做了引用 grep、句柄检查与资产哈希抽查（Wintermute staging 哈希与预检记录一致、库内盘完好）；文档守卫与空白检查见收口补记。
+
+正式目录 `/Users/pufei/Downloads/ctf-lab`，分支 `codex/release-0.1.1-preview-20261010`，HEAD `941db31`；保留既有改动，未提交、推送、打包或发布。本轮修改设计文档（9.1 节）与场景测试文件，未改任何生产代码。清理只动 Downloads 下证据根与临时目录，未触碰项目工作区、库资产、staging、App Support。
+
+重要未完成与第 37 节一致：实机验收执行（两轮冷启动、显示、地址、服务、矩阵、跳转、重置、重开恢复）待当次明确授权与状态根指定；Neuromancer 单卡起址、e1000 卡型映射按 9.1 节执行时确认；GUI 不覆盖准备/启动/重置；同代次 restart 未实现。
+
+接续语：继续 `/Users/pufei/Downloads/ctf-lab`，先读 AGENTS.md、当前状态第 38 节、Wintermute 设计 9/9.1 节与预检记录，核对 Git 并保留已有改动。候选清单与预检均就绪；本次目标：____。若授权执行第 9 节实机验收，请在本次消息明确授权、按 9.1 节命令序列指定状态根并确认不接管用户 Kali；否则继续入口/文档打磨。不要自动启动真实 VM/网络服务、操作用户实例、删除资产、提交、推送、打包或发布。
+
+## 39. Wintermute 实机验收第一轮（2026-10-14，用户授权执行）
+
+用户当次明确授权后，按设计第 9 节完成 Wintermute 三节点双隔离网的首轮实机验收。证据根 `/Users/pufei/Downloads/ctflab-wintermute-acceptance-20261014`（状态根在其 `scenario-state/`，实例 `59fcf32b-f9f4-4729-9300-91df15654328`，gen1→2→3），Kali 用库内副本派生，未接管用户实例；代理 fake-IP 路由由用户关闭后解除路由门阻塞。
+
+**真机达成**：三台真实 VM 两轮冷启动与 ACPI 正常停止全部一次通过（Kali hvf + Straylight/Neuromancer TCG，进程与 QMP 核验后 `nodes-ready`；停止序列 Kali→Straylight→Neuromancer 后双网 SIGTERM，进程归零）；显示证据：Kali GUI 登录界面、`straylight login:`（Debian 9）、`neuromancer login:`（Ubuntu 16.04），主机名自证；Kali 两轮均经 DHCP 预约获得 `192.168.243.10`（实例 MAC 稳定，代次租约全新——重置语义实证）；结构性隔离核验：接线为 Kali 仅 outer、Neuromancer 仅 inner、Straylight 双宿，argv 无 hostfwd/user/tap，L2 学习表 outer 仅 Kali、inner 为空；整场景重置两次提交、旧代次保留；恢复/接管路径真实执行 3 次（含首次失败后对孤儿 DHCP 服务的 SIGTERM 接管）。
+
+**过程中发现并修复**：① 默认 socket 根 `/tmp` 符号链接被状态路径守卫拒绝（解析真实路径修复；失败 prepare 会留下未登记空实例目录，已确认后清除）；② 本机全部可用 QEMU 中 x86_64 仅 App 运行时带 SPICE、aarch64 全部无 SPICE → 新增 `scenario start` SPICE 预检与 headless 模式（Kali headless + QMP 截图作为记录在案的显示偏差）；③ `audit_reset` 不识别"提交后已接续"（指针 reset-ready→同代次 prepared）误报 recovery-required（补 committed-observed 分支 + 守卫测试）。
+
+**门槛结果**：两轮冷启动/停止 ✅、显示/登录 ✅（含 headless 偏差）、整场景重置 ✅、重开恢复 ✅；来宾地址 ⚠️（Kali ✅，x86 双机网卡启动未激活，控制台登录凭据未提供而阻塞）；目标服务/应通禁通来宾级探测/跳转解题 ⛔（依赖 x86 起址）；结构性矩阵证据 ✅。完整明细见证据根 `evidence/README.md` 与全部日志/截图。
+
+**未完成**：来宾内验证链（x86 起址→服务→矩阵→e1000 卡型确认→跳转解题）待来宾控制台凭据；跨 Mac、内容包、发布未做。Wintermute 距"可交付"仍差来宾内验证与解题确认，不能宣称整题适配通过。
+
+验证（2026-10-14）：完整本地回归 794 项通过、跳过 10；场景组 65 项通过（含本轮新增 headless/审计守卫）；文档守卫与空白检查见收口补记。本轮生产修复：ctflab.py（socket 根解析、SPICE 预检、headless 传递）、ctflab_scenario.py（include_spice）、ctflab_scenario_nodes.py（headless_architectures）、ctflab_scenario_reset.py（审计分支）；均已入工作区未提交。
+
+正式目录 `/Users/pufei/Downloads/ctf-lab`，分支与 HEAD 未变；未提交、推送、打包或发布。状态根保留供复核；结束时段无任何 qemu/服务进程。
+
+接续语：继续 `/Users/pufei/Downloads/ctf-lab`，先读 AGENTS.md、当前状态第 39 节、`/Users/pufei/Downloads/ctflab-wintermute-acceptance-20261014/evidence/README.md`，核对 Git 并保留改动。真机骨架验证已完成；本次目标：____（如提供 Straylight/Neuromancer 控制台凭据以完成来宾内验证，或继续其他模块）。凭据仅用于 QMP 键入，不入任何文档；不要自动启动 VM、操作用户实例、删除资产、提交或发布。
+
+## 40. Wintermute 实机验收第二轮：来宾起址门槛通过（2026-10-14 续）
+
+用户再次授权执行后，完成来宾起址门槛：公开检索证实 Wintermute 无公开控制台口令（原题入口为 Straylight Tomcat admin:admin 利用链），转走设计允许的"配置调整仅写派生盘/基盘副本并记录差异"路径。离线读取派生盘定位根因——BIOS+pc 机型下 Debian 9/Ubuntu 16.04 将网卡命名为 **ens5/ens8**（内核日志 `ens8: renamed from eth1` 实证），而盘内 `/etc/network/interfaces` 写 `enp0s3`/`enp0s8`，名称错位致接口全部未激活。修复：两份 staging 基盘**副本**做等长字节替换（`enp0s3→"ens5  "`、`enp0s8→"ens8  "`，配置行上下文过滤 + 含日志/历史副本，before/after SHA 入 `base-ens-patch.json`；原始基盘未动；e2fsprogs 位图校验和告警经对照证实为原始 base 既有状态、内核两轮容忍启动）。中途一次在 v2 代次 overlay 上补丁被重置完整性清单正确拦截（SHA 不匹配），促使修复进基盘谱系——与 Kioptrix/Stapler 同型。
+
+**结果**：v3 实例 `d5505db2-6531-4027-ac84-35598b2fd4c5` 四块网卡全部按清单预约起址（Kali outer=.10、Straylight outer=.20/inner=.20、Neuromancer inner=.30；MAC/网段/地址程序化全匹配）；QMP `info network` 接线核验一致；`scenario stop` 一次通过、进程归零。至此两轮冷启动/停止、显示或登录、来宾地址、结构性矩阵、整场景重置、重开恢复六项门槛完成；目标服务探测、来宾级应通/禁通正负测、跳转解题待后续（Kali 控制台口令不在档；可经 SPICE 连接 x86 双机人工进行）。v2 现场保留作守卫拦截证据；两个状态根的预约处于活跃登记，销毁环境前需显式 release（CLI 尚无 release 子命令，已知缺口）。
+
+生产修复（本轮新增，未提交）：scenario 默认 socket 根解析 `/tmp` 符号链接；`scenario start` 新增 SPICE 预检与 headless 模式（`qemu_command include_spice` + 会话 `headless_architectures`，严格布尔校验）；`audit_reset` 识别"提交后已接续"分支。全部带测试（场景组 65 项+完整回归 794 项通过；文档守卫/空白/语法见收口补记）。
+
+正式目录 `/Users/pufei/Downloads/ctf-lab`，分支 `codex/release-0.1.1-preview-20261010`、HEAD `941db31`；未提交、推送、打包或发布。验收证据根 `/Users/pufei/Downloads/ctflab-wintermute-acceptance-20261014`（README 含两轮全程、v3 为当前有效实例）；三个状态根（主/v2/v3）与基盘副本均保留；结束时段无任何 qemu/服务进程；原始 staging 基盘与库资产未动。
+
+接续语：继续 `/Users/pufei/Downloads/ctf-lab`，先读 AGENTS.md、当前状态第 40 节、`/Users/pufei/Downloads/ctflab-wintermute-acceptance-20261014/evidence/README.md`，核对 Git 并保留改动。来宾起址已通；本次目标：____（如提供 Kali 口令做来宾级矩阵与目标服务探测，或经 SPICE 人工登录 x86 双机，或收口清理验收环境）。不要自动启动 VM、操作用户实例、删除资产、提交、推送、打包或发布。
+
+## 41. Wintermute 实机验收第三轮：目标服务与隔离矩阵通过（2026-10-14 续）
+
+用户继续授权后完成剩余可自动化门槛。复用 Kioptrix/Stapler 同款用户态 L2 探针（参数化源 IP 与目标网段守卫后为 `probe_v3.py`），在 v3 gen2（重置后新代次，四卡再次全部按清单起址，基盘补丁跨重置持续生效）执行：**目标服务**——Kali→Straylight outer :80 得 `HTTP/1.1 200 OK`、探针→Neuromancer inner :8080 得 `HTTP/1.1 200`（Secure Remote Access 门户）、→Kali :22 得 `SSH-2.0-OpenSSH_10.3p1`，四路同网段 ARP 全部解析到正确 MAC，服务拓扑与公开 writeup 一致；**禁通负测**——outer 交换机对 inner 网段目标 ARP 零响应（隔离核心证据）、不存在地址无冒充应答；三层证据（接线 argv + L2 学习表 + 负测）一致证明 Kali 与 Neuromancer 无共享路径。结束时段三台 VM 于 gen2 正常停止（本轮第三次 ACPI 成功），进程归零，截图/租约/探针 JSON 落档。
+
+至此 Wintermute 场景全部可自动化实机门槛通过（两轮冷启动停止/显示/四卡起址/目标服务/隔离矩阵/整场景重置/重开恢复）。剩余为人工任务与交付阶段：跳转解题验证（原题利用链 Tomcat admin:admin→提权→pivot，不属自动化范围）、跨 Mac、内容包化、发布，各需对应授权。当前现场：`v3/scenario-state` gen2 已停止、预约活跃登记；`v2` 保留守卫拦截证据；销毁验收环境前需显式 release（CLI 缺 release 子命令为已知缺口，可作下一迭代项）。
+
+本轮无生产代码变更（探针为证据根内验收脚本）；验证命令与结果全部记录于验收证据根 `/Users/pufei/Downloads/ctflab-wintermute-acceptance-20261014/evidence/README.md`（项目外路径，不入库）。正式目录 `/Users/pufei/Downloads/ctf-lab`，分支 `codex/release-0.1.1-preview-20261010`、HEAD `941db31`；未提交、推送、打包或发布；原始 staging 基盘与库资产未动；结束时段无任何 qemu/服务进程。
+
+接续语：继续 `/Users/pufei/Downloads/ctf-lab`，先读 AGENTS.md、当前状态第 41 节、`/Users/pufei/Downloads/ctflab-wintermute-acceptance-20261014/evidence/README.md`，核对 Git 并保留改动。全部可自动化实机门槛已通过；本次目标：____（如：设计并实现 scenario release 子命令后清理验收环境；或人工跳转解题验证；或进入跨 Mac/内容包交付阶段）。不要自动启动 VM、操作用户实例、删除资产（含验收状态根与补丁基盘副本）、提交、推送、打包或发布。
+
+## 42. scenario release 显式释放入口实现（2026-10-14 续，纯代码切片）
+
+按第 41 节接续语的候选目标一实施其可执行部分：设计并实现 `scenario release` 子命令，补齐"停止不释放预约、销毁验收状态根前缺显式释放入口"的已知缺口。**本轮未在任何真实状态根上执行 release，未启动任何 VM/服务，未删除任何资产**——对验收现场（`v3/scenario-state` gen2 已停止、预约活跃；`v2` 守卫证据保留）的 release 执行与环境清理属后续独立授权。
+
+实现（复用既有内核，无新底层语义）：`cmd_scenario_release`（tools/ctflab.py）解析状态根与实例后读取活跃预约——无活跃预约幂等成功（exit 0）；同一实例多项活跃预约（正常流程不可能）拒绝并引导恢复；恰一项时经 `release_reservation`（登记层既有内核）以生产 `stopped_observer` 现场停止证明（三节点+双网络全部 stopped，非持久化字样）为门槛追加 release 事件。运行中释放被停止证明拒绝（exit 2，引导 stop/status）；登记只追加历史，不删除资产、日志或活动指针；释放后代次进登记历史，`reset --new-generation`/重新 `prepare` 可开新周期（含"旧预约已释放"的接续分支）；只 prepare 未 start 的实例按"从未启动"证明释放。`scenario status` 在观测全停且预约活跃时新增 release 建议入口；GUI 面板不覆盖 release（走 CLI，维持既有边界）。设计文档同步：新增 8.5 节、8.4 节子命令列表补 release、9.1 节执行序列补"stop → release → 用户显式处置状态根"销毁顺序与证据归档提醒。
+
+验证（2026-10-14，全部合成，无真实 VM/网络服务）：`test_ctflab_scenario_cli.py` 新增 3 项——运行中被停止证明拒绝且预约保持活跃、停止后释放并核对幂等/资产与指针保留/status 建议；释放→reset→start→stop 跨代次闭环；未启动实例释放后重新 prepare。场景组 `python3 -m unittest discover -s tools/tests -p "test_ctflab_scenario*.py"` 110 项通过；完整回归 `python3 -m unittest discover -s tools/tests` 797 项通过、跳过 10（既有保留项，上轮 794+3）；`python3 -m py_compile` 覆盖改动文件通过。
+
+正式目录 `/Users/pufei/Downloads/ctf-lab`，分支 `codex/release-0.1.1-preview-20261010`，HEAD `941db31`；本轮改动：`tools/ctflab.py`（release 命令/子解析器/status 建议）、`tools/tests/test_ctflab_scenario_cli.py`、`docs/ctflab-wintermute-scenario-design.md`，叠加此前全部未提交改动一并保留；未提交、推送、打包或发布。验收证据根与三个状态根（主/v2/v3）、staging 基盘与补丁基盘副本均未触碰；结束时段无任何 qemu/服务进程（本轮未创建）。
+
+未完成与下一步：① 验收环境处置待授权——`v3` 先 `scenario stop`（若再启动过）再 `scenario release`（幂等可复核），随后归档/删除状态根需用户显式授权与确认（v2 作为守卫拦截证据的去留由用户决定）；② 人工跳转解题验证（需启动 VM 与登录授权）；③ 跨 Mac、内容包化与发布验收（需打包/发布授权）。release 的生产路径仅在合成链路验证，未在真实状态根执行过。
+
+接续语：继续 `/Users/pufei/Downloads/ctf-lab`，先读 AGENTS.md、当前状态第 42 节、设计 8.5/9.1 节、`/Users/pufei/Downloads/ctflab-wintermute-acceptance-20261014/evidence/README.md`，核对 Git 并保留改动。release 子命令已实现并合成验证；本次目标：____（候选：授权在验收状态根执行 scenario release 并清理验收环境；人工跳转解题验证；进入跨 Mac/内容包交付阶段）。不要自动启动 VM、操作用户实例、删除资产（含验收状态根与补丁基盘副本）、提交、推送、打包或发布；执行 release 与环境清理需在本次消息明确授权。
+
+## 43. 验收状态根 release 执行完成（2026-10-14 续，用户授权执行）
+
+用户在三个候选目标中明确选择"授权执行 release（仅释放预约）"。用第 42 节实现的 `scenario release` 对验收证据根三个状态根完成首次生产执行并程序化复核：主 `scenario-state`（59fcf32b/gen3）、`v3`（d5505db2/gen2）、`v2`（25e2e7b3/gen1，从未启动即释放）各释放一项预约（token 分别 380d98c9…/a471d846…/ebb2423a…，各 6 MAC、2 端口、8 路径）；三根活跃预约归零，代次目录与活动指针完整保留，三份登记账本均为完整 reserve→release 配对（8/6/4 事件），未删除任何文件、未产生任何进程。v2 的 reset"资产 SHA-256 不匹配"守卫证据现场不受影响。执行记录与证据见验收根 `evidence/README.md` 第四轮小节及 `release-*.log`、`status-after-release.json`（项目外路径，不入库）。
+
+过程中发现并修正一处提示瑕疵：`--state-root` 传相对路径被场景路径守卫拒绝（要求绝对路径，属既有防线），但 release 的错误包装把该失败误导为"先 stop 核验停止状态"——已改为中性的"可先 scenario status 核验状态"（tools/ctflab.py 一行）；CLI 测试组 10 项复跑通过。
+
+验收环境至此满足销毁前置（预约全释放）。**未完成与下一步**：① 删除性清理待单独授权——三个状态根的归档/删除（v2 守卫证据现场去留由用户决定）、补丁基盘副本处置；② 人工跳转解题验证（需 VM 启动授权；注意三个根现已无活跃预约，解题前需 `scenario reset --new-generation N` 重新准备代次或恢复现场另议）；③ 跨 Mac、内容包化与发布验收（需打包/发布授权）。
+
+验证（2026-10-14）：release 执行与复核如上（真实状态根，用户授权范围内）；`python3 -m unittest discover -s tools/tests -p "test_ctflab_scenario_cli.py"` 10 项通过。release 功能仍在工作区未提交、未打包，验收根用它执行的记录已注明此事实。
+
+正式目录 `/Users/pufei/Downloads/ctf-lab`，分支 `codex/release-0.1.1-preview-20261010`，HEAD `941db31`；本轮改动仅 `tools/ctflab.py` 一行提示措辞与 `docs/ctflab-current-status.md` 本节，叠加既有未提交改动保留；未提交、推送、打包或发布。验收证据根三状态根与补丁基盘副本全部保留；结束时段无任何 qemu/服务进程（release 不启动进程）。
+
+接续语：继续 `/Users/pufei/Downloads/ctf-lab`，先读 AGENTS.md、当前状态第 43 节、`/Users/pufei/Downloads/ctflab-wintermute-acceptance-20261014/evidence/README.md` 第四轮小节，核对 Git 并保留改动。三个验收状态根预约已全部释放、现场完整保留；本次目标：____（候选：授权清理验收环境——删除/归档状态根与补丁基盘副本；人工跳转解题验证——需 VM 启动与重新准备代次授权；进入跨 Mac/内容包交付阶段）。不要自动启动 VM、操作用户实例、删除资产（含验收状态根与补丁基盘副本）、提交、推送、打包或发布；清理与新阶段各需本次消息明确授权。
+
+## 44. 场景内容包 schema 3：make/verify/install 全链路（2026-10-14 续，交付阶段准备切片）
+
+用户指示"继续"后推进交付阶段中无需授权的部分（清理与跳转解题仍各需单独授权）：按设计第 10 节③实现 Wintermute 场景的内容包承载——新增 **schema 3 场景内容包**（schema 2 保持 profile 包语义不变，两种角色白名单互不混用，旧运行器按白名单拒绝）。本轮全部合成验证：未构建真实 Wintermute 包，未打包、发布、启动 VM 或触碰任何既有资产/状态根。
+
+实现：`ctflab_dist.py` 新增 `parse_scenario_pack`（场景清单全文严格校验 + 交叉校验：`scenario_id` 与 `pack.scenario.id` 一致；**随包基盘登记 SHA-256 必须与场景清单声明一致**；固件 vars 只能挂 UEFI 节点；claims 只能挂场景 id）、`make_scenario_pack`（清单必带、基盘/固件/说明按需随包；引用式分发合法）、`_scenario_pack_summary` 与场景包 README；`parse_pack` 与 schema 3 共用元数据/条目名校验（消息不变）。`ctflab.py` 新增 `dist make-scenario-pack` 子命令（免状态目录快路径）、`dist verify` 场景摘要输出、`dist install` 场景分支与 `LabManager._install_scenario_pack`：整体校验通过后复制场景文件到 `content-packs/<id>/scenario/`（只读、同名不同哈希拒绝、重装幂等、回滚只删本轮创建），写 schema 3 安装记录，输出可直接粘贴的 `scenario prepare` 命令（随包项给绝对路径，未随包资产与 edk2 code 固件给占位符）；不创建 profile、不注册镜像、不自动准备场景。GUI 未改动（场景包摘要对 GUI 保持 `nodes: []` 形状兼容）。取舍：跨 Mac 基盘为多 GB 文件，安装复制使状态目录占用翻倍（与 schema 2"导入后不依赖原包路径"同边界）。
+
+验证（2026-10-14，全部合成，字节级基盘/vars 模板）：新增 `tools/tests/test_ctflab_scenario_pack.py` 8 项——制作/校验往返与摘要、随包基盘哈希不匹配拒绝、清单外资产/非 UEFI 节点拒绝、引用式包未随包资产提示、篡改/缺失文件检出、解析层负测（角色混用/嵌套路径/场景 id 不一致/claims 越界/运行器版本约束）、CLI 端到端（make→verify→install→幂等重装含 prepare 命令断言）、篡改包与安装目录冲突拒绝。既有内容包 33 项、分发 18 项通过（`parse_pack` 重构无回归）；完整回归 `python3 -m unittest discover -s tools/tests` **805 项通过、跳过 10**（上轮 797+8）；py_compile 覆盖改动文件；文档守卫随全量回归通过。
+
+正式目录 `/Users/pufei/Downloads/ctf-lab`，分支 `codex/release-0.1.1-preview-20261010`，HEAD `941db31`；本轮改动：`tools/ctflab_dist.py`、`tools/ctflab.py`、新增 `tools/tests/test_ctflab_scenario_pack.py`、设计文档 10.1 节与本文档；叠加既有未提交改动保留；未提交、推送、打包或发布。三个验收状态根（已释放预约）与补丁基盘副本未触碰；无新增运行进程。
+
+未完成与下一步：① 真实 Wintermute 场景包构建（三基盘+vars，需当次授权与许可等级确认；引用式包可先行试制）；② 跨 Mac 实测（第二台 Mac 的 app + 内容包 + 最低版本声明全链路）；③ 交付阶段其余项（GUI 全流程验收、最低软件版本门槛、发布）；④ 验收环境清理与人工跳转解题仍各需单独授权。
+
+接续语：继续 `/Users/pufei/Downloads/ctf-lab`，先读 AGENTS.md、当前状态第 44 节、设计 10.1 节，核对 Git（分支 codex/release-0.1.1-preview-20261010、HEAD 941db31）并保留全部未提交改动。schema 3 场景内容包已实现并合成验证；本次目标：____（候选：构建真实 Wintermute 场景包并本机 dist install 验证；跨 Mac 交付实测；验收环境清理或人工跳转解题——后两者各需对应授权）。不要自动启动 VM、操作用户实例、删除资产（含验收状态根与补丁基盘副本）、提交、推送、打包或发布；构建真实包、清理与跳转解题各需本次消息明确授权。
+
+## 45. 真实 Wintermute 场景包构建/安装验证；VM 实测被代理路由阻塞（2026-10-14 续）
+
+用户当次授权"启动 VM 后测试无误就发包、提交、推送、发布、打包"。本轮完成：**发包**——真实场景内容包已构建进库 `CTFLab-Library/02-已处理/Wintermute-可分发-20261014`（pack-id `wintermute-lab` v1.0.0；wintermute.json + kali 7.54 GB/straylight 2.68 GB/neuromancer 2.84 GB + kali vars 64 MB，共约 13.1 GB；资产哈希与验收记录逐项核对：kali=库内基盘 974a319f…，x86 双机=验收根 v3 enspatched 副本 4d8fdb4d…/915ab98b…）；**安装验证**——全新状态目录 `ctflab-wintermute-pack-20261014/app-state` 的 `dist install` 整体校验+复制+schema 3 记录+prepare 命令输出全部通过。发布渠道预检：origin GitHub `zhangpu1211/ctf-lab`、gh 已登录、现有 Latest=v0.1.1-preview.20261010、工作区版本 0.1.2、App 运行时与 edk2 固件双源可用。
+
+**阻塞**：`scenario prepare`（资产用安装副本、固件 code 用 App 运行时 edk2）被路由门拒绝——宿主代理 fake-IP 路由 `128.0/1 → 198.18.0.1（utun4）`覆盖 192.168.243/244，与实机验收第一轮同根因，需用户关闭代理（曾发询问与约 3 分钟路由复查未解除）。失败发生在任何状态写入之前，零残留。按用户前置条件"测试无误"，**提交、推送、打包、发布本轮均未执行**；用户未确认前不得把包级验证冒充 VM 实测通过。详见 [本轮验证记录](verification-wintermute-pack-20261014.md)。
+
+验证（2026-10-14）：包构建/安装链路如上（真实资产，实测）；VM 未启动（路由门拦截属设计行为）；无生产代码变更（本轮仅使用第 44 节实现）。
+
+正式目录 `/Users/pufei/Downloads/ctf-lab`，分支 `codex/release-0.1.1-preview-20261010`，HEAD `941db31`，未提交改动 40 项（第 44 节后新增本验证记录）；未提交、推送、打包或发布。内容包在库内（自用分发，未公开上传）；安装副本 13 GB 保留在 `ctflab-wintermute-pack-20261014/app-state` 供下轮复用；验收状态根与补丁基盘副本未触碰；无运行进程；数据卷剩约 54 GiB。
+
+未完成与下一步：① **等用户关闭代理后继续 VM 实测**（prepare→start→status→stop→release，命令见验证记录"复现/继续入口"），无误后按既有授权执行提交→推送→打包（`app build --version 0.1.2` + zip + sha256）→gh 发布（tag 建议 `v0.1.2-preview.20261014`，Pre-release，附 zip 资产与说明）；② 跨 Mac 实测；③ 验收环境清理与人工跳转解题各需单独授权。
+
+接续语：继续 `/Users/pufei/Downloads/ctf-lab`，先读 AGENTS.md、当前状态第 45 节、`docs/verification-wintermute-pack-20261014.md`，核对 Git 并保留全部未提交改动。真实场景包已进库、安装链路已验证；本次目标：____（默认：代理已关闭，继续 VM 实测 prepare→start→stop→release，无误后执行提交/推送/打包/发布；或其他目标）。若 VM 实测仍被路由门拦截，先请用户关闭代理；不要操作用户实例、删除资产、或在前置条件未满足时提交/推送/发布。

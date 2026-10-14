@@ -138,7 +138,7 @@ class PackFormatTests(unittest.TestCase):
         manifest = ctflab_dist.load_manifest(pack_dir)
         self.assertEqual(manifest["schema"], 2)
         self.assertEqual(manifest["pack"]["id"], "my-pack")
-        parsed = ctflab_dist.parse_pack(manifest, runner_version="0.1.1")
+        parsed = ctflab_dist.parse_pack(manifest, runner_version=ctflab.CTFLAB_VERSION)
         self.assertIn("pack-node", parsed["profiles"])
         self.assertEqual(parsed["claims"]["pack-node"], VALID_PROFILE["verification"])
         report = ctflab_dist.verify_distribution(pack_dir)
@@ -147,6 +147,14 @@ class PackFormatTests(unittest.TestCase):
         self.assertIn("ctflab dist install", (pack_dir / "README.md").read_text(encoding="utf-8"))
         sums = (pack_dir / ctflab_dist.SUMS_NAME).read_text(encoding="utf-8").splitlines()
         self.assertEqual(len(sums), 3)
+
+    def test_shutdown_policy_is_validated_in_pack_profile(self) -> None:
+        profile = {**VALID_PROFILE, "shutdown": {
+            "method": "ctrl-alt-delete", "timeout_seconds": 120}}
+        ctflab.validate_pack_profile(profile, pathlib.Path("pack-node.yaml"))
+        with self.assertRaises(ctflab.CTFLabError):
+            ctflab.validate_pack_profile({**profile, "shutdown": {
+                "method": "quit", "timeout_seconds": 120}}, pathlib.Path("pack-node.yaml"))
 
     def test_schema1_verify_has_no_pack_section(self) -> None:
         dist_dir = self.root / "dist"

@@ -15,9 +15,13 @@
 !/docs/verification-content-pack-fix-2026-10-12.md
 !/docs/verification-content-pack-recheck-2026-10-12.md
 !/docs/verification-content-pack-final-20261012.md
+!/docs/verification-image-adaptation-2026-10-13.md
+!/docs/verification-noport-smoke-2026-10-13.md
+!/docs/verification-new-images-2026-10-13.md
 !/docs/ctflab-documentation-review-2026-10-11.md
 !/docs/verification-import-review-2026-10-11.md
 !/docs/ctflab-mac-mvp-implementation-plan.md
+!/docs/ctflab-wintermute-scenario-design.md
 !/docs/ctflab-ux-2026-10-08.md
 !/docs/ctflab-phase1-quickstart.md
 !/docs/ctflab-dynamic-resolution-design.md
@@ -136,3 +140,22 @@ probes/
 !docs/verification-followup-acfun-2026-10-11.md
 
 !docs/verification-acfun-continuation-2026-10-12.md
+!docs/verification-shutdown-candidates-2026-10-14.md
+
+!docs/verification-distributable-images-2026-10-14.md
+
+!/tools/ctflab_scenario.py
+!/tools/ctflab_scenario_resources.py
+!/tools/ctflab_scenario_registry.py
+!/tools/ctflab_scenario_services.py
+!/docs/verification-scenario-services-2026-10-14.md
+!/tools/ctflab_scenario_nodes.py
+!/tools/ctflab_scenario_reset.py
+!/docs/verification-scenario-nodes-reset-2026-10-14.md
+!/tools/ctflab_scenario_runtime.py
+!/tools/tests/test_ctflab_scenario_continuation.py
+!/tools/tests/test_ctflab_scenario_runtime.py
+!/tools/tests/test_ctflab_scenario_cli.py
+!/docs/verification-scenario-resume-runtime-2026-10-14.md
+!/docs/verification-wintermute-acceptance-preflight-2026-10-14.md
+!/docs/verification-wintermute-pack-20261014.md

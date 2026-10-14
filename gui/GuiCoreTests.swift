@@ -664,6 +664,39 @@ check(!AppLayout.cliRelativePath.hasPrefix("/"), "CLI 相对路径不得以 / �
     check(CliAction.updateRollback.arguments() == ["update", "rollback"], "回退不混入停止或重置命令")
     let failedPreflight = PreflightReport.decode("启动失败\n{\"ok\":false,\"checks\":[{\"name\":\"disk\",\"ok\":false,\"detail\":\"旧基盘\",\"hint\":\"先备份\"}]}")
     check(failedPreflight?.guidance.contains("先备份") == true, "错误包装后的预检提示可读")
+
+    // --- Wintermute 场景入口：动作参数与状态解码 ---
+    check(CliAction.scenarioStatus.arguments() == ["scenario", "status", "--json"], "场景状态走独立子命令并请求 JSON")
+    check(CliAction.scenarioStop.arguments() == ["scenario", "stop"], "场景停止不携带强杀参数")
+    check(CliAction.scenarioRecover(closeReset: true, releaseOrphan: false).arguments()
+          == ["scenario", "recover", "--close-reset"], "收口重置事务参数逐项传递")
+    check(CliAction.scenarioRecover(closeReset: false, releaseOrphan: true).arguments()
+          == ["scenario", "recover", "--release-orphan"], "释放孤儿预约参数逐项传递")
+    let scenarioStopped = """
+    [{"instance_uuid":"12345678-1234-4234-8234-123456789abc","state_root":"/s",
+      "active":{"generation":1,"descriptor":"prepared.json"},
+      "reset":{"state":"active-observed","generation":1,"problem":null},
+      "services":{"state":"stopped-observed","live":[],"absent":["inner","outer"],"unknown":[],"problem":null},
+      "nodes":{"state":"stopped-observed","live":[],"absent":["kali","neuromancer","straylight"],"unknown":[],"problem":null},
+      "reservations":[{"token":"t","generation":1,"ports":[50701,50702]}],
+      "next":["scenario reset --new-generation 2"]}]
+    """
+    let stoppedReports = ScenarioReport.decode(scenarioStopped)
+    check(stoppedReports?.count == 1, "场景状态 JSON 数组可解码")
+    check(stoppedReports?.first?.summaryState == "已停止", "全部停止时如实显示已停止")
+    check(stoppedReports?.first?.stateDetail.contains("prepared.json") == true, "细节包含活动指针描述")
+    let scenarioUnknown = """
+    [{"instance_uuid":"12345678-1234-4234-8234-123456789abc","state_root":"/s",
+      "active":{"generation":1,"descriptor":"prepared.json"},"reset":null,
+      "services":{"state":"recovery-required","live":["outer"],"absent":[],"unknown":["inner"],"problem":null},
+      "nodes":{"state":"recovery-required","live":[],"absent":[],"unknown":["kali"],"problem":"身份失配"},
+      "reservations":null,"next":["scenario stop"]}]
+    """
+    let unknownReports = ScenarioReport.decode(scenarioUnknown)
+    check(unknownReports?.first?.summaryState == "待恢复", "不明归属显示待恢复而非运行")
+    check(unknownReports?.first?.stateDetail.contains("inner") == true
+          && unknownReports?.first?.stateDetail.contains("kali") == true, "待恢复细节列出不明成员")
+    check(ScenarioReport.decode("not json") == nil, "坏输出不解码为报告")
     print("---")
     print("共 \(checkCount) 项检查，失败 \(failureCount) 项")
     exit(failureCount == 0 ? 0 : 1)

@@ -80,7 +80,7 @@ BUILTIN_PROFILE_DIR = PROJECT_ROOT / "tools" / "ctflab_profiles"
 PROFILE_DIR = BUILTIN_PROFILE_DIR
 DEFAULT_STATE_DIR = Path.home() / "Library" / "Application Support" / "CTFLab"
 # 版本是打包（Task 6.1）、内容包版本门禁与 SBOM 的单一来源。
-CTFLAB_VERSION = "0.1.1"
+CTFLAB_VERSION = "0.1.2"
 # 最低 Python 版本（与 tools/ctflab_package.py 的 MIN_PYTHON 一致；doctor 实际校验）。
 MIN_PYTHON = (3, 10)
 QEMU_X86_NAMES = ("qemu-system-x86_64",)
@@ -677,6 +677,15 @@ def validate_profile(data: dict[str, Any], path: Path) -> None:
         raise CTFLabError(f"内存和 CPU 必须是整数：{path}") from exc
     if not 256 <= memory_mb <= 65536 or not 1 <= cpus <= 16:
         raise CTFLabError(f"资源配置超出允许范围：{path}：memory={memory_mb}MB cpus={cpus}")
+    shutdown = data.get("shutdown")
+    if shutdown is not None:
+        if not isinstance(shutdown, dict) or set(shutdown) != {"method", "timeout_seconds"}:
+            raise CTFLabError(f"shutdown 只允许 method/timeout_seconds 且两者必填：{path}")
+        if shutdown["method"] not in {"acpi", "ctrl-alt-delete"}:
+            raise CTFLabError(f"不支持的关机方法：{path}：{shutdown['method']!r}")
+        timeout = shutdown["timeout_seconds"]
+        if isinstance(timeout, bool) or not isinstance(timeout, int) or not 1 <= timeout <= 300:
+            raise CTFLabError(f"shutdown.timeout_seconds 必须是 1–300 的整数：{path}")
     if disk.get("bus") not in {"ide", "sata", "scsi", "virtio", "virtio-blk"}:
         raise CTFLabError(f"不支持的磁盘总线：{path}：{disk.get('bus')}")
     allowed_controllers = {None, "lsi53c895a", "ich9-ahci"}
@@ -925,7 +934,8 @@ def ppm_display_activity(path: Path) -> dict[str, Any]:
     nonblack = sum(1 for red, green, blue in sample if max(red, green, blue) > 16)
     ratio = nonblack / max(1, len(sample))
     unique_colors = len(set(sample))
-    active = ratio >= 0.002 and unique_colors >= 4
+    # 旧系统的黑底白字登录画面可能只有两种颜色；仍须达到非黑像素门槛。
+    active = ratio >= 0.002 and unique_colors >= 2
     return {
         "active": active,
         "width": width,
@@ -1663,6 +1673,13 @@ class LabManager:
                     pack_dir, profile_status=self.content_pack_profile_status,
                     runner_version=CTFLAB_VERSION)
                 manifest = ctflab_dist.load_manifest(pack_dir)
+                if int(manifest.get("schema", 1)) == ctflab_dist.SCENARIO_PACK_SCHEMA:
+                    parsed = ctflab_dist.parse_scenario_pack(
+                        pack_dir, manifest, runner_version=CTFLAB_VERSION)
+                    if not report["ok"]:
+                        raise CTFLabError("内容包校验失败，未做任何导入：\n"
+                                          + "\n".join(f"  - {problem}" for problem in report["problems"]))
+                    return self._install_scenario_pack(pack_dir, parsed, report)
                 parsed = ctflab_dist.parse_pack(manifest, runner_version=CTFLAB_VERSION)
             except ctflab_dist.DistError as exc:
                 raise CTFLabError(str(exc)) from exc
@@ -1828,6 +1845,102 @@ class LabManager:
                 "docs": docs_copied,
                 "record": str(record_path),
             }
+
+    def _install_scenario_pack(self, pack_dir: Path, parsed: dict[str, Any],
+                               report: dict[str, Any]) -> dict[str, Any]:
+        """安装 schema 3 场景内容包：整体校验后复制场景文件进状态目录并给出 prepare 命令。
+
+        不创建 profile、不注册镜像、不自动准备场景；同名不同哈希一律拒绝。
+        回滚只删除本轮创建的文件，既有包记录永不删除。
+        """
+        import ctflab_dist  # noqa: PLC0415
+
+        pack_id = parsed["id"]
+        scenario = parsed["scenario"]
+        target_dir = self.content_packs_dir / pack_id / "scenario"
+        record_path = self.content_packs_dir / pack_id / "pack.json"
+        planned: dict[str, tuple[str, str]] = {
+            "manifest": (scenario["manifest_file"],
+                         sha256_file(ctflab_dist.resolve_pack_file(pack_dir, scenario["manifest_file"])))}
+        for asset, entry in scenario["bases"].items():
+            planned[f"asset:{asset}"] = (str(entry["file"]), str(entry["sha256"]))
+        for node, entry in scenario["firmware_vars"].items():
+            planned[f"vars:{node}"] = (str(entry["file"]), str(entry["sha256"]))
+        record_existed = record_path.exists()
+        created: list[Path] = []
+        try:
+            target_dir.mkdir(parents=True, exist_ok=True)
+            installed_files: dict[str, str] = {}
+            for label in sorted(planned):
+                name, expected_hash = planned[label]
+                source = ctflab_dist.resolve_pack_file(pack_dir, name)
+                target = target_dir / name
+                if target.exists():
+                    if sha256_file(target) != expected_hash:
+                        raise CTFLabError(
+                            f"状态目录已有同名但内容不同的场景文件，拒绝覆盖：{target}")
+                else:
+                    temporary = target_dir / f".{name}.partial-{os.getpid()}"
+                    try:
+                        shutil.copy2(source, temporary)
+                        os.replace(temporary, target)
+                    except OSError as exc:
+                        raise CTFLabError(f"复制场景文件失败：{target}（{exc}）") from exc
+                    finally:
+                        temporary.unlink(missing_ok=True)
+                    target.chmod(0o444)  # 原始镜像保持只读；overlay 由 scenario prepare 派生。
+                    created.append(target)
+                installed_files[label] = str(target)
+            record = {
+                "schema": 3,
+                "pack": {"id": pack_id, "name": parsed["name"], "version": parsed["version"],
+                         "requires_runner": parsed["requires_runner"]},
+                "scenario": {"id": scenario["id"], "files": installed_files},
+                "scenario_manifest_sha256": planned["manifest"][1],
+                "installed_at": now_iso(),
+                "imported_from": str(pack_dir),
+            }
+            if record_existed:
+                previous = read_json(record_path)
+                if not isinstance(previous, dict) or previous.get("schema") != 3 \
+                        or (previous.get("scenario") or {}).get("files") != installed_files:
+                    raise CTFLabError(f"同名内容包记录与本次安装不一致，拒绝覆盖：{record_path}")
+            self.content_packs_dir.mkdir(parents=True, exist_ok=True)
+            write_json(record_path, record)
+        except Exception as exc:
+            for path in created:
+                path.unlink(missing_ok=True)
+            if target_dir.exists() and not any(target_dir.iterdir()):
+                target_dir.rmdir()
+            if isinstance(exc, CTFLabError):
+                raise CTFLabError(f"{exc}\n场景文件未安装成功；原内容包未被修改，可修复后重试。") from exc
+            raise
+        # prepare 命令模板：随包资产与 vars 给绝对路径；缺项给占位符（code 固件由本机 QEMU 提供）。
+        assets_args: list[str] = []
+        missing: list[str] = []
+        for asset_id in sorted(scenario["manifest"]["assets"]):
+            label = f"asset:{asset_id}"
+            if label in installed_files:
+                assets_args.append(f"--asset {asset_id}={installed_files[label]}")
+            else:
+                missing.append(asset_id)
+                assets_args.append(f"--asset {asset_id}=<{asset_id} 基盘路径>")
+        firmware_args = [f"--firmware {node}=<{node} 的 edk2 code 固件路径>,"
+                         f"{installed_files[f'vars:{node}']}"
+                         for node in sorted(scenario["firmware_vars"])]
+        prepare = ("ctflab scenario prepare"
+                   f" --manifest {installed_files['manifest']}"
+                   + "".join(f" {item}" for item in assets_args)
+                   + "".join(f" {item}" for item in firmware_args)
+                   + f" --state-root {self.state_dir / 'scenario-state'}")
+        return {
+            "pack": report.get("pack"),
+            "scenario": {"id": scenario["id"], "dir": str(target_dir),
+                         "files": installed_files, "missing_assets": missing,
+                         "prepare_command": prepare},
+            "installed": [], "skipped_identical": [], "imported": [], "docs": [],
+            "record": str(record_path),
+        }
 
     def pack_records(self) -> list[dict[str, Any]]:
         """状态目录中已安装内容包的登记（按安装时间排序）。"""
@@ -2866,6 +2979,8 @@ class LabManager:
                 "host_forwards": host_forwards,
                 "pcap_path": network_state.get("pcap_path"),
                 "started_at": now_iso(),
+                # 关机策略在启动时绑定到实例，避免运行期间配置被更换后改变停止行为。
+                "shutdown": profile.get("shutdown"),
                 "boot_override": {k: v for k, v in {
                     "firmware": profile.get("guest", {}).get("firmware"),
                     "bus": profile.get("disk", {}).get("bus"),
@@ -3034,10 +3149,19 @@ class LabManager:
                     client_pid = 0
                 try:
                     if qmp_path.exists():
-                        qmp_command(qmp_path, "system_powerdown")
+                        shutdown = state.get("shutdown") or {}
+                        if shutdown.get("method") == "ctrl-alt-delete":
+                            qmp_command(qmp_path, "human-monitor-command",
+                                        {"command-line": "sendkey ctrl-alt-delete"})
+                        else:
+                            qmp_command(qmp_path, "system_powerdown")
                 except (OSError, CTFLabError):
                     pass
-                deadline = time.monotonic() + (GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS if graceful else FORCED_SHUTDOWN_TIMEOUT_SECONDS)
+                shutdown = state.get("shutdown") or {}
+                timeout = shutdown.get("timeout_seconds")
+                wait_seconds = (timeout if timeout is not None else GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS) \
+                    if graceful else FORCED_SHUTDOWN_TIMEOUT_SECONDS
+                deadline = time.monotonic() + wait_seconds
                 while bool_pid_alive(pid) and time.monotonic() < deadline:
                     time.sleep(0.25)
                 if graceful and bool_pid_alive(pid):
@@ -4208,6 +4332,17 @@ def cmd_dist_verify(_manager: LabManager, args: argparse.Namespace) -> int:
         if pack:
             print(f"内容包：{pack['name']}（{pack['id']} v{pack['version']}；"
                   f"要求运行器 {pack['requires_runner']}）")
+            scenario = pack.get("scenario")
+            if scenario:
+                print(f"  场景：{scenario['id']}（清单 {scenario['manifest']}）")
+                for asset in scenario["assets"]:
+                    if asset["shipped"]:
+                        detail = f"随包（{ctflab_dist.human_size(int(asset['size']))}）"
+                    else:
+                        detail = "未随包；按清单哈希自备"
+                    print(f"    资产 {asset['asset']}：{detail}，sha256 {asset['sha256'][:12]}…")
+                for item in scenario["firmware_vars"]:
+                    print(f"    固件 vars：节点 {item['node']}（{item['file']}）")
             for node in pack["nodes"]:
                 local = node.get("local") or {}
                 conflict = {"builtin": "与内置同名（拒绝导入）",
@@ -4227,7 +4362,7 @@ def cmd_dist_verify(_manager: LabManager, args: argparse.Namespace) -> int:
 
 
 def cmd_dist_install(manager: LabManager, args: argparse.Namespace) -> int:
-    """校验并安装目录式内容包：配置、基盘、固件与说明一并登记到状态目录。"""
+    """校验并安装目录式内容包（schema 2 profile 包 / schema 3 场景包）。"""
     result = manager.install_content_pack(args.dir)
     if getattr(args, "json", False):
         print(json.dumps({"ok": True, **result}, ensure_ascii=False, indent=2))
@@ -4235,6 +4370,16 @@ def cmd_dist_install(manager: LabManager, args: argparse.Namespace) -> int:
     pack = result.get("pack") or {}
     if pack:
         print(f"内容包：{pack.get('name')}（{pack.get('id')} v{pack.get('version')}）")
+    scenario = result.get("scenario")
+    if scenario:
+        print(f"已安装场景文件：{scenario['dir']}")
+        for label, path in scenario["files"].items():
+            print(f"  {label}：{path}")
+        if scenario["missing_assets"]:
+            print("  未随包资产（按场景清单 SHA-256 自备并替换命令中的占位路径）："
+                  + ", ".join(scenario["missing_assets"]))
+        print(f"下一步（不自动准备场景）：\n  {scenario['prepare_command']}")
+        return 0
     if result["installed"]:
         print(f"已安装配置：{', '.join(result['installed'])}")
     if result["skipped_identical"]:
@@ -4281,6 +4426,38 @@ def cmd_dist_make_pack(_manager: LabManager, args: argparse.Namespace) -> int:
         print(f"  {entry['file']}（{entry['role']}，{ctflab_dist.human_size(int(entry['size']))}，"
               f"sha256 {entry['sha256'][:12]}…）")
     print("导入：ctflab dist install --dir <内容包目录>（先整体校验，不自动启动）")
+    return 0
+
+
+def cmd_dist_make_scenario_pack(_manager: LabManager | None, args: argparse.Namespace) -> int:
+    """制作 schema 3 场景内容包：完整校验场景清单后复制文件并生成清单。"""
+    import ctflab_dist  # noqa: PLC0415
+
+    bases: dict[str, Path] = {}
+    for item in args.asset or []:
+        asset, _, path = item.partition("=")
+        if not path:
+            raise CTFLabError(f"--asset 需要 资产id=路径 形式：{item}")
+        bases[asset] = Path(path).expanduser()
+    firmware_vars: dict[str, Path] = {}
+    for item in args.firmware_vars or []:
+        node, _, path = item.partition("=")
+        if not path:
+            raise CTFLabError(f"--firmware-vars 需要 节点=路径 形式：{item}")
+        firmware_vars[node] = Path(path).expanduser()
+    try:
+        result = ctflab_dist.make_scenario_pack(
+            args.out, pack_id=args.pack_id, scenario_manifest=Path(args.manifest).expanduser(),
+            bases=bases, firmware_vars=firmware_vars,
+            docs=[Path(item).expanduser() for item in args.doc or []],
+            name=args.name, version=args.version, requires_runner=args.requires_runner)
+    except ctflab_dist.DistError as exc:
+        raise CTFLabError(str(exc)) from exc
+    print(f"场景内容包已生成：{result['dir']}（场景 {result['scenario_id']}）")
+    for entry in result["entries"]:
+        print(f"  {entry['file']}（{entry['role']}，{ctflab_dist.human_size(int(entry['size']))}，"
+              f"sha256 {entry['sha256'][:12]}…）")
+    print("安装：ctflab dist install --dir <内容包目录>（先整体校验；不自动准备场景）")
     return 0
 
 
@@ -4442,6 +4619,522 @@ def cmd_app_verify(_manager: LabManager, args: argparse.Namespace) -> int:
     print(f"许可证文本完整性：{report['license_texts_complete']}")
     for blocker in report["distribution_blockers"]:
         print(f"分发阻塞：{blocker}")
+    return 0
+
+
+def scenario_state_roots(args: argparse.Namespace) -> tuple[Path, Path]:
+    """场景状态根与 socket 根；状态在应用状态目录，socket 走短临时路径。
+
+    UNIX socket 路径上限 104 字节：实例 UUID + 代次 + 节点 + qmp.sock 固定
+    占约 60 字节，因此默认 socket 根放在 /tmp（运行期产物，不持久化），
+    状态与记录仍在应用状态目录。
+    """
+    base = Path(args.state_dir) if getattr(args, "state_dir", None) else DEFAULT_STATE_DIR
+    state_root = Path(args.state_root) if getattr(args, "state_root", None) else base / "scenario-state"
+    default_sockets = Path("/tmp").resolve() / f"ctflab-sc-{os.getuid()}"
+    socket_root = Path(args.socket_root) if getattr(args, "socket_root", None) else default_sockets
+    return state_root, socket_root
+
+
+def scenario_service_script() -> str:
+    return str(Path(__file__).resolve().parent / "ctflab_network.py")
+
+
+def scenario_image_run():
+    """qemu-img 执行器；默认真实 subprocess.run，测试可注入合成执行器。"""
+    return None
+
+
+def scenario_capabilities() -> frozenset[str]:
+    import ctflab_scenario
+    return ctflab_scenario.REQUIRED_CAPABILITIES
+
+
+def scenario_stop_proof(state_root: Path):
+    """生产停止证明：逐代次核对已记录进程身份与 QMP 端点。"""
+    import ctflab_scenario_runtime as scenario_runtime
+
+    def observe(binding: dict[str, Any]) -> dict[str, Any]:
+        return scenario_runtime.stopped_observer(state_root, binding["instance_uuid"],
+                                                 binding["generation"])
+
+    return observe
+
+
+def scenario_resolve_instance(state_root: Path, args: argparse.Namespace) -> str:
+    instance = getattr(args, "instance", None)
+    scenarios = state_root / "scenarios"
+    found = sorted(item.name for item in scenarios.iterdir() if item.is_dir()) if scenarios.is_dir() else []
+    if instance:
+        if instance not in found:
+            raise CTFLabError(f"状态根下没有场景实例 {instance}。现有：{', '.join(found) or '无'}")
+        return instance
+    if len(found) == 1:
+        return found[0]
+    if not found:
+        raise CTFLabError("状态根下没有场景实例；先运行 `scenario prepare`")
+    raise CTFLabError("状态根下有多个场景实例；请用 --instance 指定其一：" + ", ".join(found))
+
+
+def _scenario_pointer(state_root: Path, instance: str) -> dict[str, Any] | None:
+    path = state_root / "scenarios" / instance / "active-generation.json"
+    if not path.exists():
+        return None
+    try:
+        return read_json(path)
+    except (OSError, ValueError) as exc:
+        raise CTFLabError(f"活动指针无法读取：{exc}") from exc
+
+
+def scenario_status_report(state_root: Path, instance: str) -> dict[str, Any]:
+    """只读状态报告：明确区分已停止、仍存活、不明归属与失败阶段。"""
+    import ctflab_scenario_nodes as scenario_nodes
+    import ctflab_scenario_registry as scenario_registry
+    import ctflab_scenario_reset as scenario_reset
+    import ctflab_scenario_runtime as scenario_runtime
+    import ctflab_scenario_services as scenario_services
+    from ctflab_scenario import ScenarioError
+
+    caps = scenario_capabilities()
+    report: dict[str, Any] = {"instance_uuid": instance, "state_root": str(state_root)}
+    pointer = _scenario_pointer(state_root, instance)
+    generation = None
+    if pointer:
+        generation = pointer.get("generation")
+        report["active"] = {"generation": generation, "descriptor": pointer.get("descriptor")}
+    else:
+        report["active"] = None
+    try:
+        active = scenario_registry.active_reservations(state_root)
+        report["reservations"] = [
+            {"token": token, "generation": item["generation"], "ports": item["ports"]}
+            for token, item in sorted(active.items()) if item["instance_uuid"] == instance]
+    except ScenarioError as exc:
+        report["reservations"] = None
+        report["reservations_problem"] = str(exc)
+    if generation is not None:
+        try:
+            report["reset"] = scenario_reset.audit_reset(state_root, instance, available_capabilities=caps)
+        except (ScenarioError, OSError, ValueError) as exc:
+            report["reset"] = {"state": "recovery-required", "problem": str(exc)}
+        try:
+            report["services"] = scenario_services.recover_network_services(
+                state_root, instance, generation=generation, available_capabilities=caps,
+                inspect=scenario_runtime.build_inspect())
+        except (ScenarioError, OSError, ValueError) as exc:
+            report["services"] = {"state": "recovery-required", "problem": str(exc)}
+        binding_path = state_root / "scenarios" / instance / "generations" / str(generation) / "prepared.json"
+        try:
+            bindings = scenario_services._read_binding(binding_path)
+
+            class _BindingView:
+                closed = False
+
+                def __init__(self, path: Path, value: dict[str, Any]) -> None:
+                    self.binding_path, self.bindings = path, value
+
+            report["nodes"] = scenario_nodes.recover_scenario_nodes(
+                _BindingView(binding_path, bindings), inspect=scenario_runtime.build_inspect())
+        except (ScenarioError, OSError, ValueError) as exc:
+            report["nodes"] = {"state": "recovery-required", "problem": str(exc)}
+        try:
+            report["stop_evidence"] = scenario_runtime.stopped_observer(state_root, instance, generation)
+        except Exception as exc:  # 状态报告不因内部诊断失败而崩溃。
+            report["stop_evidence"] = {"state": "recovery-required", "problem": str(exc)}
+    advice: list[str] = []
+    reset_state = (report.get("reset") or {}).get("state")
+    services_state = (report.get("services") or {}).get("state")
+    nodes_state = (report.get("nodes") or {}).get("state")
+    if reset_state == "old-active-preserved" and pointer and pointer.get("descriptor") != "reset-ready.json":
+        advice.append("scenario recover --close-reset  # 收口中断的重置事务")
+    if pointer and pointer.get("descriptor") == "reset-ready.json":
+        advice.append("scenario start  # 接续已提交的重置资产")
+        advice.append("scenario recover --release-orphan  # 若接续中断遗留孤儿预约")
+    if services_state == "recovery-required" or nodes_state == "recovery-required":
+        advice.append("scenario stop  # 按日志身份核验后接管停止；不明归属不会自动强杀")
+    if reset_state == "committed-observed" and services_state == "stopped-observed" \
+            and nodes_state == "stopped-observed":
+        advice.append(f"scenario reset --new-generation {generation + 1}  # 整场景重置到新代次")
+        advice.append("scenario start  # 或再次启动当前代次")
+    if report.get("reservations") and nodes_state in (None, "stopped-observed") \
+            and services_state in (None, "stopped-observed") and reset_state != "recovery-required":
+        advice.append("scenario release  # 显式释放活跃预约（销毁状态根前必走；不删除资产）")
+    if not advice:
+        advice.append("scenario prepare/--help  # 查看可用操作")
+    report["next"] = advice
+    return report
+
+
+def cmd_scenario_status(_manager: LabManager | None, args: argparse.Namespace) -> int:
+    state_root, _socket_root = scenario_state_roots(args)
+    scenarios = state_root / "scenarios"
+    instances = sorted(item.name for item in scenarios.iterdir() if item.is_dir()) if scenarios.is_dir() else []
+    if args.instance:
+        instances = [args.instance] if args.instance in instances else []
+        if not instances:
+            raise CTFLabError(f"状态根下没有场景实例 {args.instance}")
+    if not instances:
+        print("没有场景实例；使用 `scenario prepare` 创建。")
+        return 0
+    reports = [scenario_status_report(state_root, instance) for instance in instances]
+    if getattr(args, "json", False):
+        print(json.dumps(reports, ensure_ascii=False, indent=2))
+        return 0
+    for report in reports:
+        active = report.get("active")
+        print(f"实例 {report['instance_uuid']}")
+        print(f"  活动代次：{active['generation'] if active else '未初始化'}"
+              f"（{active['descriptor'] if active else '需先 start 或 recover'}）")
+        for section, labels in (("reset", "重置事务"), ("services", "双网服务"), ("nodes", "三节点")):
+            value = report.get(section) or {}
+            state = value.get("state", "未知")
+            detail = f"；存活 {value['live']}" if value.get("live") else ""
+            detail += f"；缺失 {value['absent']}" if value.get("absent") else ""
+            detail += f"；不明 {value['unknown']}" if value.get("unknown") else ""
+            detail += f"；问题：{value['problem']}" if value.get("problem") else ""
+            print(f"  {labels}：{state}{detail}")
+        reservations = report.get("reservations")
+        if reservations is None:
+            print("  资源登记：无法读取（需要恢复核验）")
+        else:
+            print(f"  资源登记：{len(reservations)} 项活跃" if reservations else "  资源登记：无活跃预约")
+        for suggestion in report.get("next", []):
+            print(f"  下一步：{suggestion}")
+    return 0
+
+
+def cmd_scenario_prepare(_manager: LabManager | None, args: argparse.Namespace) -> int:
+    import ctflab_scenario
+    import ctflab_scenario_resources as scenario_resources
+    state_root, socket_root = scenario_state_roots(args)
+    instance = args.instance or str(uuid.uuid4())
+    caps = scenario_capabilities()
+    try:
+        manifest = ctflab_scenario.parse_manifest(
+            args.manifest.read_text(encoding="utf-8"), available_capabilities=caps)
+    except (OSError, ValueError) as exc:
+        raise CTFLabError(f"清单无法读取或校验失败：{exc}") from exc
+    assets: dict[str, str] = {}
+    for item in args.asset or []:
+        asset_id, _, path = item.partition("=")
+        if not path:
+            raise CTFLabError(f"--asset 需要 id=路径 形式：{item}")
+        assets[asset_id] = str(Path(path).expanduser().resolve())
+    firmware: dict[str, dict[str, Any]] = {}
+    for item in args.firmware or []:
+        node, _, pair = item.partition("=")
+        code, _, variables = pair.partition(",")
+        if not variables:
+            raise CTFLabError(f"--firmware 需要 节点=code路径,vars路径 形式：{item}")
+        firmware[node] = {"code": str(Path(code).expanduser().resolve()),
+                          "vars": str(Path(variables).expanduser().resolve())}
+    for key, spec in manifest["assets"].items():
+        if key not in assets:
+            raise CTFLabError(f"缺少基盘绑定：--asset {key}=<路径>")
+        _bind_asset_hash(assets[key], spec["sha256"])
+    for key in [node for node, node_spec in manifest["nodes"].items() if node_spec["firmware"] == "uefi"]:
+        if key not in firmware:
+            raise CTFLabError(f"UEFI 节点缺少固件绑定：--firmware {key}=<code路径>,<vars路径>")
+        for role in ("code", "vars"):
+            firmware[key][role + "_sha256"] = _bind_asset_hash(firmware[key][role], None)
+    qemu_img = resolve_tool("qemu-img")
+    if not qemu_img:
+        raise CTFLabError("未找到 qemu-img；安装 QEMU 或设置 CTFLAB_RUNTIME_ROOT")
+    prepared = scenario_resources.prepare_scenario_resources(
+        manifest, instance, generation=args.generation, state_root=str(state_root),
+        socket_root=str(socket_root), assets=assets, firmware=firmware, qemu_img=qemu_img,
+        run=scenario_image_run(),
+        collect_routes=scenario_resources.collect_macos_routes, available_capabilities=caps)
+    try:
+        print(f"场景资产已准备：实例 {instance} 代次 {args.generation}")
+        print(f"  预约 token：{prepared.reservation_token}")
+        print(f"  双网端口：{prepared.ports}")
+        print("下一步：scenario start（将初始化/接续活动代次并启动双网与三节点）")
+    finally:
+        prepared.close()
+    return 0
+
+
+def _bind_asset_hash(path: str, expected: str | None) -> str:
+    target = Path(path)
+    if not target.is_file():
+        raise CTFLabError(f"资产文件不存在：{path}")
+    digest = sha256_file(target)
+    if expected is not None and digest != expected:
+        raise CTFLabError(f"资产 SHA-256 与清单不一致：{path}")
+    return digest
+
+
+def scenario_probe_spice(qemu_binary: str) -> bool:
+    """探测 QEMU 是否编译了 SPICE：以最小参数启动并等 spice socket 出现。"""
+    import subprocess
+    import time as time_module
+    with tempfile.TemporaryDirectory(prefix="spice-probe-", dir=Path("/tmp").resolve()) as probe_dir:
+        spice_sock = Path(probe_dir) / "spice.sock"
+        process = subprocess.Popen(
+            [qemu_binary, "-nodefaults", "-S", "-display", "none",
+             "-spice", f"unix=on,addr={spice_sock},disable-ticketing=on"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True, stdin=subprocess.DEVNULL)
+        try:
+            for _ in range(20):
+                if spice_sock.exists():
+                    return True
+                if process.poll() is not None:
+                    return False
+                time_module.sleep(0.1)
+            return spice_sock.exists()
+        finally:
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+
+
+def scenario_spawn_factory(log_dir: Path):
+    import ctflab_scenario_runtime as scenario_runtime
+
+    def spawn(args: list[str], *, pass_fds: tuple[int, ...] = (), close_fds: bool = True):
+        name = "session"
+        if "-name" in args:
+            name = args[args.index("-name") + 1]
+        elif "--network-id" in args:
+            name = f"network-{args[args.index('--network-id') + 1]}"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        with open(log_dir / f"{name}.log", "ab") as handle:
+            return scenario_runtime.popen_spawn(args, pass_fds=pass_fds, close_fds=close_fds,
+                                                stdout=handle, stderr=handle)
+    return spawn
+
+
+def cmd_scenario_start(_manager: LabManager | None, args: argparse.Namespace) -> int:
+    import ctflab_scenario_nodes as scenario_nodes
+    import ctflab_scenario_registry as scenario_registry
+    import ctflab_scenario_reset as scenario_reset
+    import ctflab_scenario_resources as scenario_resources
+    import ctflab_scenario_runtime as scenario_runtime
+    import ctflab_scenario_services as scenario_services
+    from ctflab_scenario import ScenarioError, REQUIRED_CAPABILITIES
+
+    state_root, socket_root = scenario_state_roots(args)
+    instance = scenario_resolve_instance(state_root, args)
+    caps = set(scenario_capabilities())
+    observe = scenario_stop_proof(state_root)
+    scene = state_root / "scenarios" / instance
+    pointer = _scenario_pointer(state_root, instance)
+    qemu_binaries = {
+        "aarch64": resolve_tool("qemu-system-aarch64"),
+        "x86_64": resolve_tool("qemu-system-x86_64"),
+    }
+    missing = [name for name, path in qemu_binaries.items() if not path]
+    if missing:
+        raise CTFLabError("未找到 QEMU 二进制：" + ", ".join(missing))
+    headless_architectures = set()
+    for name, path in sorted(qemu_binaries.items()):
+        if not scenario_probe_spice(path):
+            # 该架构无 SPICE 运行时：节点以 headless 启动，显示证据改走 QMP screendump。
+            headless_architectures.add(name)
+            print(f"警告：{name} 的 QEMU 缺少 SPICE（{path}）；该架构节点 headless 启动，显示证据改用 QMP 截图。")
+    if pointer is None:
+        active = [item for item in scenario_registry.active_reservations(state_root).values()
+                  if item["instance_uuid"] == instance]
+        if len(active) != 1:
+            raise CTFLabError("需要恰好一个活跃预约才能初始化活动代次；先 scenario status 查看")
+        generation = active[0]["generation"]
+        prepared_path = scene / "generations" / str(generation) / "prepared.json"
+        if not prepared_path.exists():
+            raise CTFLabError(f"代次 {generation} 缺少准备记录；先 scenario prepare")
+        scenario_reset.initialize_active_generation(state_root, instance, generation=generation,
+                                                    available_capabilities=caps, observe_stopped=observe)
+        pointer = _scenario_pointer(state_root, instance)
+    generation = pointer["generation"]
+    generation_dir = scene / "generations" / str(generation)
+    journals = [name for name in ("network-lifecycle.jsonl", "node-lifecycle.jsonl")
+                if (generation_dir / name).exists()]
+    if journals:
+        raise CTFLabError(f"代次 {generation} 已有启动记录（{', '.join(journals)}）；"
+                          "先 scenario status 查看，需要停止时用 scenario stop")
+    prepared = scenario_reset.resume_reset_resources(
+        state_root, instance, available_capabilities=caps, observe_stopped=observe,
+        collect_routes=scenario_resources.collect_macos_routes, socket_root=str(socket_root))
+    try:
+        timeout = prepared.bindings["manifest"]["lifecycle"]["startup_timeout_seconds"]
+        networks = scenario_services.NetworkServiceSession(
+            prepared, spawn=scenario_spawn_factory(generation_dir),
+            identity=scenario_runtime.child_identity,
+            python_binary=sys.executable, service_script=scenario_service_script())
+        ports = networks.start(timeout=timeout)
+        session = scenario_nodes.ScenarioNodeSession(
+            networks, spawn=scenario_spawn_factory(generation_dir),
+            identity=scenario_runtime.child_identity,
+            observe=scenario_runtime.node_observer(prepared.bindings),
+            powerdown=runtime_node_powerdown(prepared.bindings),
+            qemu_binaries=qemu_binaries, available_capabilities=caps,
+            headless_architectures=headless_architectures)
+        try:
+            session.start(timeout=timeout)
+        finally:
+            session.close()
+        print(f"场景已启动：实例 {instance} 代次 {generation}")
+        print(f"  双网端口：{ports}")
+        print("  节点就绪（进程与 QMP 已核验）；不表示来宾地址、题目或隔离已验收。")
+        print("停止：scenario stop；状态：scenario status --instance " + instance)
+    finally:
+        prepared.close()
+    return 0
+
+
+def runtime_node_powerdown(binding: dict[str, Any]):
+    import ctflab_scenario_runtime as scenario_runtime
+    return scenario_runtime.node_powerdown(binding)
+
+
+def cmd_scenario_stop(_manager: LabManager | None, args: argparse.Namespace) -> int:
+    import ctflab_scenario_nodes as scenario_nodes
+    import ctflab_scenario_reset as scenario_reset
+    import ctflab_scenario_runtime as scenario_runtime
+    import ctflab_scenario_services as scenario_services
+    from ctflab_scenario import ScenarioError
+
+    state_root, _socket_root = scenario_state_roots(args)
+    instance = scenario_resolve_instance(state_root, args)
+    pointer = _scenario_pointer(state_root, instance)
+    if not pointer or pointer.get("descriptor") != "prepared.json":
+        raise CTFLabError("没有已启动的活动代次；scenario status 查看当前状态")
+    generation = pointer["generation"]
+    inspect = scenario_runtime.build_inspect()
+    _scene, binding = scenario_runtime._validated_binding(state_root, instance, generation)
+    nodes_state = "stopped"
+    try:
+        view_report = scenario_nodes.recover_scenario_nodes(
+            _ScenarioBindingView(state_root, instance, generation), inspect=inspect)
+        nodes_state = view_report["state"]
+        if view_report["live"] or view_report["unknown"]:
+            stopped = scenario_runtime.stop_recovered_nodes(
+                state_root, instance, generation=generation, inspect=inspect,
+                powerdown=scenario_runtime.node_powerdown(binding),
+                timeout_per_node=args.per_node_timeout)
+            nodes_state = "stopped" if stopped else "stop-pending"
+    except (ScenarioError, OSError, ValueError) as exc:
+        print(f"节点停止未完成：{exc}", file=sys.stderr)
+        nodes_state = "recovery-required"
+    services_state = "stopped"
+    try:
+        service_report = scenario_services.recover_network_services(
+            state_root, instance, generation=generation,
+            available_capabilities=scenario_capabilities(), inspect=inspect)
+        services_state = service_report["state"]
+        if service_report["live"] or service_report["unknown"]:
+            def nodes_all_stopped() -> bool:
+                evidence = scenario_runtime.stopped_observer(state_root, instance, generation)
+                return all(value == "stopped" for value in evidence["nodes"].values())
+            stopped = scenario_runtime.stop_recovered_services(
+                state_root, instance, generation=generation,
+                available_capabilities=scenario_capabilities(), inspect=inspect,
+                signal_process=None, nodes_stopped=nodes_all_stopped, timeout=args.service_timeout)
+            services_state = "stopped" if stopped else "stop-pending"
+    except (ScenarioError, OSError, ValueError) as exc:
+        print(f"服务停止未完成：{exc}", file=sys.stderr)
+        services_state = "recovery-required"
+    print(f"节点：{nodes_state}；服务：{services_state}")
+    if nodes_state == "stopped" and services_state == "stopped":
+        print("全部停止；重置：scenario reset --new-generation N；再次启动：scenario start")
+        return 0
+    print("存在待停止或不明成员：不自动强杀；稍后重试 scenario stop 或查看日志。")
+    return 1
+
+
+class _ScenarioBindingView:
+    """恢复审计的只读准备记录视图；不持有 FD 或锁。"""
+
+    closed = False
+
+    def __init__(self, state_root: Path, instance: str, generation: int) -> None:
+        import ctflab_scenario_services as scenario_services
+        self.binding_path = (state_root / "scenarios" / instance / "generations"
+                             / str(generation) / "prepared.json")
+        self.bindings = scenario_services._read_binding(self.binding_path)
+
+
+def cmd_scenario_reset(_manager: LabManager | None, args: argparse.Namespace) -> int:
+    import ctflab_scenario_reset as scenario_reset
+    state_root, _socket_root = scenario_state_roots(args)
+    instance = scenario_resolve_instance(state_root, args)
+    qemu_img = resolve_tool("qemu-img")
+    if not qemu_img:
+        raise CTFLabError("未找到 qemu-img；安装 QEMU 或设置 CTFLAB_RUNTIME_ROOT")
+    pointer = scenario_reset.reset_scenario_assets(
+        state_root, instance, new_generation=args.new_generation,
+        available_capabilities=scenario_capabilities(), observe_stopped=scenario_stop_proof(state_root),
+        qemu_img=qemu_img, run=scenario_image_run())
+    print(f"重置已提交：活动代次 {pointer['generation']}；旧代次资产保留为备份。")
+    print("下一步：scenario start（接续新代次并启动）")
+    return 0
+
+
+def cmd_scenario_recover(_manager: LabManager | None, args: argparse.Namespace) -> int:
+    import ctflab_scenario_reset as scenario_reset
+    state_root, _socket_root = scenario_state_roots(args)
+    instance = scenario_resolve_instance(state_root, args)
+    observe = scenario_stop_proof(state_root)
+    report: dict[str, Any] = {}
+    if args.close_reset:
+        report["reset"] = scenario_reset.recover_reset_transaction(
+            state_root, instance, available_capabilities=scenario_capabilities(), observe_stopped=observe)
+    if args.release_orphan:
+        report["continuation"] = scenario_reset.recover_reset_continuation(
+            state_root, instance, available_capabilities=scenario_capabilities(), observe_stopped=observe)
+    if not report:
+        return cmd_scenario_status(_manager, args)
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_scenario_release(_manager: LabManager | None, args: argparse.Namespace) -> int:
+    """显式释放实例活跃预约：以现场停止证明为门槛，只追加登记历史。
+
+    登记是追加式账本，本命令不删除资产、日志或活动指针；销毁/归档
+    状态根属用户显式操作。正常预约流程保证同一实例至多一项活跃预约。
+    """
+    import ctflab_scenario_registry as scenario_registry
+
+    state_root, _socket_root = scenario_state_roots(args)
+    instance = scenario_resolve_instance(state_root, args)
+    active = scenario_registry.active_reservations(state_root)
+    reservations = {token: item for token, item in sorted(active.items())
+                    if item["instance_uuid"] == instance}
+    if not reservations:
+        result = {"instance_uuid": instance, "released": []}
+        if args.json:
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+        else:
+            print(f"实例 {instance} 没有活跃预约；无需释放。")
+        return 0
+    if len(reservations) > 1:
+        raise CTFLabError(f"实例 {instance} 有 {len(reservations)} 项活跃预约（正常至多一项）；"
+                          "先 scenario status 核验，需要时按恢复入口处理")
+    token = next(iter(reservations))
+    try:
+        reservation = scenario_registry.release_reservation(
+            state_root, token, observe_stopped=scenario_stop_proof(state_root))
+    except ValueError as exc:
+        raise CTFLabError(f"预约未能释放：{exc}。可先 scenario status 核验状态") from exc
+    result = {"instance_uuid": instance, "released": [
+        {"token": token, "generation": reservation["generation"], "macs": reservation["macs"],
+         "ports": reservation["ports"], "paths": reservation["paths"]}]}
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0
+    print(f"预约已释放：实例 {instance} 代次 {reservation['generation']}")
+    print(f"  token：{token}")
+    print(f"  释放资源：{len(reservation['macs'])} 个 MAC、{len(reservation['ports'])} 个端口、"
+          f"{len(reservation['paths'])} 个路径")
+    print("  登记只追加历史；资产、生命周期日志与活动指针全部保留，未删除任何内容。")
+    print("下一步：scenario status 复核；需要复现时 scenario reset --new-generation N 开新周期；")
+    print("销毁或归档状态根是独立的显式操作，确认不再需要现场后再进行。")
     return 0
 
 
@@ -5475,9 +6168,9 @@ def build_parser() -> argparse.ArgumentParser:
     dist_verify.add_argument("--conflicts", action="store_true",
                              help="内容包冲突预览：标注与内置/用户同名配置（只读）")
     dist_install = dist_sub.add_parser(
-        "install", help="安装目录式内容包（schema 2）：校验→装配置→导基盘→复制说明；不自动启动")
+        "install", help="安装目录式内容包（schema 2 profile 包 / schema 3 场景包）：校验→复制/导入；不自动启动或准备")
     dist_install.add_argument("--dir", type=Path, required=True,
-                              help="内容包目录（含 schema 2 DISTRIBUTION.json）")
+                              help="内容包目录（含 DISTRIBUTION.json）")
     dist_install.add_argument("--json", action="store_true", help="输出机器可读结果")
     dist_make_pack = dist_sub.add_parser(
         "make-pack", help="制作目录式内容包：校验 profile 后复制文件并生成清单（不改动来源）")
@@ -5494,6 +6187,24 @@ def build_parser() -> argparse.ArgumentParser:
     dist_make_pack.add_argument("--nvram", type=Path, help="可选 UEFI NVRAM 模板（aarch64 推荐）")
     dist_make_pack.add_argument("--doc", type=Path, action="append",
                                 help="说明文件（md/txt/pdf/png/jpg），可多次给出")
+
+    dist_scenario_pack = dist_sub.add_parser(
+        "make-scenario-pack", help="制作场景内容包（schema 3）：场景清单必带，基盘/固件/说明按需随包")
+    dist_scenario_pack.add_argument("--out", type=Path, required=True,
+                                    help="内容包目录；目标已存在且非空时拒绝")
+    dist_scenario_pack.add_argument("--pack-id", required=True,
+                                    help="内容包 id（小写字母/数字/短横线；区别于场景 id）")
+    dist_scenario_pack.add_argument("--manifest", type=Path, required=True,
+                                    help="场景清单 JSON（按场景 schema 完整校验；文件名转为 <场景id>.json）")
+    dist_scenario_pack.add_argument("--asset", action="append", metavar="资产id=路径",
+                                    help="随包基盘，可重复；SHA-256 必须与场景清单声明一致")
+    dist_scenario_pack.add_argument("--firmware-vars", action="append", metavar="节点=路径",
+                                    help="UEFI vars 模板，可重复；只能绑定清单中的 UEFI 节点")
+    dist_scenario_pack.add_argument("--name", help="内容包显示名；默认用 pack-id")
+    dist_scenario_pack.add_argument("--version", default="1.0.0", help="内容包版本，默认 1.0.0")
+    dist_scenario_pack.add_argument("--requires-runner", help="最低运行器约束，默认 >=当前版本")
+    dist_scenario_pack.add_argument("--doc", type=Path, action="append",
+                                    help="说明文件（md/txt/pdf/png/jpg），可多次给出")
 
     install_parser = subparsers.add_parser("install", help="从 ARM64 安装 ISO 创建 Kali 基础镜像")
     install_parser.add_argument("profile", choices=profile_choices)
@@ -5543,7 +6254,7 @@ def build_parser() -> argparse.ArgumentParser:
                                help="输出机器可读状态（GUI 使用；含导入与运行信息）")
 
     stop_parser = subparsers.add_parser("stop", help="停止实例，默认超时会强制退出；桌面建议 --graceful")
-    stop_parser.add_argument("--graceful", action="store_true", help="只请求正常关机，30 秒超时后保留实例，不强制断电")
+    stop_parser.add_argument("--graceful", action="store_true", help="只请求正常关机，按配置等待（默认 30 秒）；超时保留实例，不强制断电")
     # 这里不在 argparse 层设置 choices，否则 Python 3.10 在“空位置参数 + --all”时
     # 会把空列表本身当成一个候选值；具体配置名在执行阶段校验。
     stop_parser.add_argument("profiles", nargs="*", metavar="PROFILE")
@@ -5680,6 +6391,63 @@ def build_parser() -> argparse.ArgumentParser:
     app_verify = app_sub.add_parser(
         "verify", help="校验 CTFLab.app：结构、清单哈希、运行时引用与签名分级")
     app_verify.add_argument("app", type=Path)
+
+    scenario_parser = subparsers.add_parser(
+        "scenario", help="Wintermute 三节点双隔离网场景编排（独立于单机 profile）")
+    scenario_sub = scenario_parser.add_subparsers(dest="scenario_command", required=True)
+
+    scenario_common = lambda parser: (  # noqa: E731
+        parser.add_argument("--instance", help="场景实例 UUID；单实例状态根可省略"),
+        parser.add_argument("--state-root", type=Path, default=None,
+                            help="场景状态根目录；默认随全局 --state-dir 的 scenario-state 子目录"),
+        parser.add_argument("--socket-root", type=Path, default=None,
+                            help="场景 UNIX socket 根目录；默认 /private/tmp/ctflab-sc-<uid>"
+                                 "（须满足 104 字节路径上限）"),
+    )
+    scenario_status = scenario_sub.add_parser("status", help="只读状态：已停止/仍存活/不明归属/失败阶段")
+    scenario_common(scenario_status)
+    scenario_status.add_argument("--json", action="store_true", help="输出 JSON 报告")
+
+    scenario_prepare = scenario_sub.add_parser(
+        "prepare", help="准备派生资产与双网预约；不启动任何进程")
+    scenario_common(scenario_prepare)
+    scenario_prepare.add_argument("--manifest", type=Path, required=True, help="场景清单 JSON 文件")
+    scenario_prepare.add_argument("--generation", type=int, default=1, help="初始代次（默认 1）")
+    scenario_prepare.add_argument("--asset", action="append", metavar="ID=路径",
+                                  help="基盘绑定，可重复；SHA-256 按清单校验")
+    scenario_prepare.add_argument("--firmware", action="append", metavar="节点=code路径,vars路径",
+                                  help="UEFI 固件绑定，可重复")
+
+    scenario_start = scenario_sub.add_parser(
+        "start", help="初始化/接续活动代次并启动双网与三节点；子进程独立于本命令存活")
+    scenario_common(scenario_start)
+
+    scenario_stop = scenario_sub.add_parser(
+        "stop", help="按日志身份核验后接管停止；超时不强杀")
+    scenario_common(scenario_stop)
+    scenario_stop.add_argument("--per-node-timeout", type=float, default=120.0,
+                               help="每节点正常关机截止秒数（默认 120）")
+    scenario_stop.add_argument("--service-timeout", type=float, default=60.0,
+                               help="双网服务停止截止秒数（默认 60）")
+
+    scenario_reset = scenario_sub.add_parser(
+        "reset", help="整场景停止态重置到新代次；原子切换活动指针")
+    scenario_common(scenario_reset)
+    scenario_reset.add_argument("--new-generation", type=int, required=True,
+                                help="目标代次；必须大于当前代次且无现场")
+
+    scenario_recover = scenario_sub.add_parser(
+        "recover", help="显式恢复：--close-reset 收口重置事务；--release-orphan 释放接续孤儿预约")
+    scenario_common(scenario_recover)
+    scenario_recover.add_argument("--close-reset", action="store_true",
+                                  help="按指针归属补记 committed 或 aborted")
+    scenario_recover.add_argument("--release-orphan", action="store_true",
+                                  help="释放接续中断遗留的新代次孤儿预约")
+
+    scenario_release = scenario_sub.add_parser(
+        "release", help="显式释放实例活跃预约；需现场停止证明，不删除任何资产或记录")
+    scenario_common(scenario_release)
+    scenario_release.add_argument("--json", action="store_true", help="输出 JSON 结果")
     return parser
 
 
@@ -5717,7 +6485,12 @@ def main(argv: list[str] | None = None) -> int:
                         "unpack": cmd_content_unpack}
     app_handlers = {"build": cmd_app_build, "verify": cmd_app_verify}
     dist_handlers = {"prepare": cmd_dist_prepare, "verify": cmd_dist_verify,
-                     "install": cmd_dist_install, "make-pack": cmd_dist_make_pack}
+                     "install": cmd_dist_install, "make-pack": cmd_dist_make_pack,
+                     "make-scenario-pack": cmd_dist_make_scenario_pack}
+    scenario_handlers = {"status": cmd_scenario_status, "prepare": cmd_scenario_prepare,
+                         "start": cmd_scenario_start, "stop": cmd_scenario_stop,
+                         "reset": cmd_scenario_reset, "recover": cmd_scenario_recover,
+                         "release": cmd_scenario_release}
     try:
         # 纯打包/校验命令不需要运行状态；避免仅执行 package/content 时在默认
         # 状态目录创建 locks/ 等运行时目录，保持该类操作的只读/构建边界。
@@ -5729,9 +6502,16 @@ def main(argv: list[str] | None = None) -> int:
             return app_handlers[args.app_command](None, args)  # type: ignore[arg-type]
         if args.command == "update":
             return cmd_update(None, args)  # type: ignore[arg-type]
-        if args.command == "dist" and args.dist_command in {"verify", "make-pack"}:
+        if args.command == "dist" and args.dist_command in {"verify", "make-pack", "make-scenario-pack"}:
             # verify/make-pack 不写运行状态；不要在默认状态目录创建 locks/。
             return dist_handlers[args.dist_command](None, args)  # type: ignore[arg-type]
+        if args.command == "scenario":
+            # 场景编排使用独立状态根，不创建单机 profile 运行状态。
+            from ctflab_scenario import ScenarioError
+            try:
+                return scenario_handlers[args.scenario_command](None, args)  # type: ignore[arg-type]
+            except ScenarioError as exc:
+                raise CTFLabError(str(exc)) from exc
         manager = LabManager(args.state_dir)
         if args.command == "stop" and not args.all and not args.profiles:
             parser.error("stop 需要提供配置名，或使用 --all")

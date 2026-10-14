@@ -149,6 +149,18 @@ class ProbeVerdictTests(unittest.TestCase):
 
 
 class ScreenshotOcrTests(unittest.TestCase):
+    def test_monochrome_login_screen_counts_as_display_activity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "login.ppm"
+            width, height = 100, 100
+            pixels = bytearray(width * height * 3)
+            for pixel in range(30):
+                pixels[pixel * 3:pixel * 3 + 3] = b"\xff\xff\xff"
+            path.write_bytes(f"P6\n{width} {height}\n255\n".encode() + pixels)
+            result = ctflab.ppm_display_activity(path)
+            self.assertTrue(result["active"])
+            self.assertEqual(result["unique_colors"], 2)
+
     @mock.patch("ctflab.shutil.which", return_value=None)
     def test_missing_tesseract_degrades_safely(self, _which: mock.Mock) -> None:
         result = classify_screenshot(Path("missing.png"))
