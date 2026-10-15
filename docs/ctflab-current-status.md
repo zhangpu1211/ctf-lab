@@ -579,3 +579,21 @@ App 与交付副本 verify 通过，许可证完整，ad-hoc 未公证；专项 
 未完成与下一步：① **等用户关闭代理后继续 VM 实测**（prepare→start→status→stop→release，命令见验证记录"复现/继续入口"），无误后按既有授权执行提交→推送→打包（`app build --version 0.1.2` + zip + sha256）→gh 发布（tag 建议 `v0.1.2-preview.20261014`，Pre-release，附 zip 资产与说明）；② 跨 Mac 实测；③ 验收环境清理与人工跳转解题各需单独授权。
 
 接续语：继续 `/Users/pufei/Downloads/ctf-lab`，先读 AGENTS.md、当前状态第 45 节、`docs/verification-wintermute-pack-20261014.md`，核对 Git 并保留全部未提交改动。真实场景包已进库、安装链路已验证；本次目标：____（默认：代理已关闭，继续 VM 实测 prepare→start→stop→release，无误后执行提交/推送/打包/发布；或其他目标）。若 VM 实测仍被路由门拦截，先请用户关闭代理；不要操作用户实例、删除资产、或在前置条件未满足时提交/推送/发布。
+
+## 46. VM 实测通过、提交与打包完成；网络中断后的发布链已于 2026-10-15 完成（原验收 2026-10-14）
+
+用户关闭代理后 VM 实测**全部通过**（详见 [验证记录](verification-wintermute-pack-20261014.md)）：安装副本作资产的 prepare→start 三节点就绪→四卡 DHCP 全部按清单起址→QMP 截图（straylight/neuromancer 登录提示）→服务探测（kali :22 SSH-2.0-OpenSSH_10.3p1、straylight :80 HTTP 200、neuromancer :8080 HTTP 200，与 v3 验收指纹一致；首轮探针失败系脚本默认网段外源 IP 被来宾过滤，改网段内源 IP 后全通，非缺陷）→跨网 ARP 负测零响应→stop 全停→release 释放、进程归零。实测状态根 `ctflab-wintermute-pack-20261014/app-state/scenario-state`（实例 3b5a03a1 gen1，预约已释放，现场保留）。
+
+发布链执行至打包：①发布门槛完整回归 805 项通过、跳过 10（一次文档守卫失败为验证记录缺"历史验收快照"头，补齐后复跑全绿）；②提交 `da0f963`（40 文件、+7845 行，工作区干净）；③**app 打包完成**——首轮构建 782 文件比上一构建少 23（全部为 spice-gtk 相关），补 `--spice-client /opt/homebrew/bin/spicy` 重建后 805 文件与上一构建一致，`app verify` 通过（许可完整、ad-hoc 签名、未公证）；ZIP `CTFLab-0.1.2-preview-macos-arm64.zip`（51 MB，sha256 `163fb08b9985961b1854db426baf757f1570ee640304c1d15a3b5b50d24505d5`）与 `.sha256` 在 `/Users/pufei/Downloads/ctflab-release-0.1.2-preview-20261014/`；④本地 tag `v0.1.2-preview.20261014` 已建在 `da0f963`。
+
+**2026-10-15 发布收口**：本轮先核对正式目录、Git 与上述验收记录，现场确认仅本节未提交；未重跑已完成的 VM 验收、完整回归及 App 构建。`git ls-remote` 探通后，分支由 `941db31` 推送至 `da0f963`，标签 `v0.1.2-preview.20261014` 同步推送且仍固定在 `da0f963`。此前网络失败已解除。
+
+GitHub [v0.1.2 预发布](https://github.com/zhangpu1211/ctf-lab/releases/tag/v0.1.2-preview.20261014) 已创建，标题为“CTFLab v0.1.2 预览版（Wintermute 场景运行器与场景内容包）”。通过 GitHub API 复核 `draft=false`、`prerelease=true`；仅附 ZIP（53,753,388 字节）及 `.sha256`（164 字节）两个资产，均为 uploaded。服务端 ZIP digest、本地构建文件、镜像库副本均为 `163fb08b9985961b1854db426baf757f1570ee640304c1d15a3b5b50d24505d5`。发布说明明确 Wintermute 实机验收与内容包实测通过，以及跨 Mac、GUI 场景面板人工验收、公证未做；13.1 GB 内容包没有上传公开渠道。
+
+镜像库 `/Users/pufei/Downloads/CTFLab-Library/03-软件/` 已按现有根目录 ZIP 惯例新增 `CTFLab-0.1.2-preview-macos-arm64.zip` 与原始 `.sha256`，更新 `最新版.md` 指向本次预发布，并保留旧版。校验文件保留原构建目录的绝对路径，入口文档给出在库内直接计算哈希的命令，避免误将原路径当作库内副本。
+
+本轮验证：`git ls-remote` 复核分支/标签；`shasum -a 256` 复核构建与库内 ZIP；GitHub API 复核发布类型、资产大小、上传状态及服务端 digest；`git diff --check` 检查文档。源码与发布二进制没有修改，未重复 805 项回归（其结果属于上一验收轮）。本节作为独立 docs 提交推送；发布标签仍指向实际构建来源 `da0f963`，不因状态文档提交移动。
+
+实例与边界：按实际进程命令行核对，未发现绑定 `/Users/pufei/Downloads/ctflab-wintermute-pack-20261014` 的 QEMU 或场景网络服务进程；本轮未启动、停止或重置 VM。实测状态根、验收状态根、补丁基盘副本和库内内容包原样保留。后续仍待跨 Mac、GUI 场景面板人工验收；公证需 Keychain Profile 与另行授权，内容包公开再分发许可未核验。
+
+接续语：继续 CTFLab，正式目录 `/Users/pufei/Downloads/ctf-lab`。先读 `AGENTS.md`、当前状态第 46 节及 `docs/verification-wintermute-pack-20261014.md`，现场核对 Git、发布与实例。v0.1.2-preview.20261014 发布链已完成，发布标签/二进制来源是 da0f963，后续 docs 提交只记录收口。下一阶段目标需另行明确；不要自动重做验收、启动或停止 VM、删除资产、公开上传内容包或执行公证。
