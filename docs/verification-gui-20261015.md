@@ -73,3 +73,11 @@
 - 最终状态 status-final.json：独立实例 gen3 reset-ready 保留，活跃预约为空，节点/双网停止证明全为 stopped；结束时重新核验无本轮 QEMU/网络进程。没有删除原始资产、旧验收或受控故障现场。最终默认 GUI 保持打开，不操作默认节点。
 
 源码与日期标签、远端发布及镜像库交付以状态文档最终收口为准。旧 r1/r2 ZIP 保留在 rejected-r1/rejected-r2，不得用于分发。
+
+## 发布交付收口
+
+本轮修复及验收文档提交 `3cc1339`，分支与日期标签 `v0.1.2-preview.20261015` 均已推送；发布包中的 19 个入口/依赖/GUI 文件与该提交逐字节一致。
+
+[修正版预发布](https://github.com/zhangpu1211/ctf-lab/releases/tag/v0.1.2-preview.20261015) 已上线，API 复核 draft=false、prerelease=true，仅 ZIP 与 SHA256 两个资产，uploaded，大小分别 53,797,125/112 字节，服务端 digest 与本地及镜像库一致。API 证据 release-api-final.json；旧 20261014 预发布已追加被修正版替代及漏模块说明，旧资产保留。
+
+镜像库 03-软件 已新增两个日期资产并更新 最新版.md，原入口文本备份于证据根 library-latest-before.md。场景内容包没有公开上传。最终状态文档以单独 docs 提交收口，不移动构建标签；无运行测试 VM/双网服务、无活跃预约，process-final.json 记录结束核验，所有状态根与派生资产保留。
