@@ -1018,6 +1018,30 @@ class CliSurfaceTests(unittest.TestCase):
             app_choices.update(action.choices)
         self.assertEqual(set(app_choices), {"build", "verify"})
 
+    def test_packaged_sources_execute_scenario_without_repository_imports(self) -> None:
+        # 从实际复制后的目录运行，避免源码 sys.path 掩盖发布依赖遗漏。
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            packaged = root / "packaged"
+            ctflab_app._copy_ctflab_sources(PROJECT_ROOT, packaged)
+            env = {key: value for key, value in os.environ.items()
+                   if key not in ("PYTHONPATH", "PYTHONHOME")}
+            for arguments in (("status", "--json"), ("start", "--help"),
+                              ("stop", "--help"), ("reset", "--help"),
+                              ("recover", "--help"), ("release", "--help")):
+                result = subprocess.run(
+                    [sys.executable, "-E", str(packaged / "tools/ctflab.py"),
+                     "--state-dir", str(root / "state"), "scenario", *arguments],
+                    cwd=root, env=env, capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+            modules = sorted(path.stem for path in (PROJECT_ROOT / "tools").glob("ctflab_scenario*.py"))
+            result = subprocess.run(
+                [sys.executable, "-I", "-c",
+                 "import sys; sys.path.insert(0, " + repr(str(packaged / "tools")) +
+                 "); " + "; ".join("import " + name for name in modules)],
+                cwd=root, env=env, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_source_release_contains_app_module_used_by_cli(self) -> None:
         self.assertIn("tools/ctflab_app.py", ctflab_package.RELEASE_TOOL_FILES)
         with tempfile.TemporaryDirectory() as temp:

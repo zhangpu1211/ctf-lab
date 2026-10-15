@@ -597,3 +597,41 @@ GitHub [v0.1.2 预发布](https://github.com/zhangpu1211/ctf-lab/releases/tag/v0
 实例与边界：按实际进程命令行核对，未发现绑定 `/Users/pufei/Downloads/ctflab-wintermute-pack-20261014` 的 QEMU 或场景网络服务进程；本轮未启动、停止或重置 VM。实测状态根、验收状态根、补丁基盘副本和库内内容包原样保留。后续仍待跨 Mac、GUI 场景面板人工验收；公证需 Keychain Profile 与另行授权，内容包公开再分发许可未核验。
 
 接续语：继续 CTFLab，正式目录 `/Users/pufei/Downloads/ctf-lab`。先读 `AGENTS.md`、当前状态第 46 节及 `docs/verification-wintermute-pack-20261014.md`，现场核对 Git、发布与实例。v0.1.2-preview.20261014 发布链已完成，发布标签/二进制来源是 da0f963，后续 docs 提交只记录收口。下一阶段目标需另行明确；不要自动重做验收、启动或停止 VM、删除资产、公开上传内容包或执行公证。
+
+## 47. 发布 App GUI 验收发现阻断（2026-10-15）
+
+按用户“跑一下 GUI 验收”执行已发布 0.1.2 App 的原生桌面验收，结果**未通过**。主窗口、节点列表和 Kali 详情可展示；Wintermute 初次状态读取与点击刷新均报 `ModuleNotFoundError: No module named 'ctflab_scenario'`。App 与发布 ZIP 都缺少场景模块，根因是 `ctflab_package.RELEASE_TOOL_FILES` 未纳入相关依赖。错误横幅显示时面板仍提示“没有场景实例”，不能视为空状态成功。证据与未验收项见 [GUI 验收记录](verification-gui-20261015.md)。
+
+本轮未启动/停止/重置 VM、删除资产或修改默认节点；App 保持打开。未修复源码、重新打包、修改公开资产、提交或推送；当前 HEAD 仍为 `ce90ff4`，新增本轮验收文档与本节待提交。既有 v0.1.2 预发布仍在线，GUI 场景功能存在上述已确认阻断；此前源码实机验收与包内容实测不能证明发布 App 包含完整依赖。
+
+下一步：修复发布依赖清单与错误/空状态展示，补打包目录级验证，重建候选并复验 GUI；修正版发布另按用户指示。接续语：继续 `/Users/pufei/Downloads/ctf-lab`，先读 AGENTS.md、状态第 47 节和 `docs/verification-gui-20261015.md`，核对实际 Git 与 App；本次 GUI 验收失败现场保留，不自动操作 VM、删除资产或替换公开发布。
+
+## 48. GUI 发布依赖与失败提示修复，候选空状态/故障恢复复验通过（2026-10-15）
+
+按用户“继续”修复第 47 节问题：`tools/ctflab_package.py` 补齐 7 个场景依赖，`gui/GuiApp.swift` 区分场景读取失败与空列表、失败时禁用操作、成功刷新清理对应旧错误。增加从复制后打包目录执行场景 CLI/导入的回归；`.gitignore` 纳入本轮验收记录。
+
+App/GUI/package 三组测试分别 62/25/37 项通过；新候选构建 812 个登记文件，app verify 通过。原生桌面完成候选首次读取、刷新、空状态，以及独立故障副本的错误提示/操作禁用/恢复刷新验证，均通过。完整命令、日志与范围见 [GUI 验收记录](verification-gui-20261015.md)。没有重跑全量 805 项或启动真实 VM；运行态停止确认/取消、停止后刷新、事务恢复仍未验收，不能标为完整 GUI 验收通过。
+
+候选 `/Users/pufei/Downloads/ctflab-gui-fix-20261015/app/CTFLab.app`（0.1.2，本地修复候选，ad-hoc、未公证）保持打开；故障副本 fault/ 已恢复模块并退出，不用于分发。默认节点仅只读查询，无 VM 启停/重置/删除。原发布目录、镜像库和 GitHub v0.1.2-preview.20261014 未替换，因此公开旧包仍有第 47 节缺陷。
+
+正式目录与分支未变，HEAD `ce90ff4`；本轮代码、测试、白名单及文档尚未提交/推送，没有新 ZIP/标签/发布。下一步应在独立实例补验 GUI 运行态操作，再按用户指示做修正版交付。接续语：继续 `/Users/pufei/Downloads/ctf-lab`，先读 AGENTS.md、状态第 48 节和 GUI 验收记录，核对现有 diff 与候选；不要使用 fault/ 分发，不自动替换公开资产或操作用户 VM。
+
+第 48 节收口补记：文档守卫 94 项通过、跳过 5（补齐验收快照固定措辞后复跑），`git diff --check` 通过；结束时现场只见候选 GUI，没有 QEMU/场景网络服务。
+
+## 49. GUI 运行态验收与修正版发布进行中（2026-10-15）
+
+用户授权完成 GUI 运行态验收、提交打包发布修正版及镜像库更新。发布前完整回归本轮实际重跑 806 项通过、跳过 10，日志 `ctflab-gui-fix-20261015/full-regression.log`。用户关闭 TUN 后现场路由复核通过。
+
+独立实机测试根 `/Users/pufei/Downloads/ctflab-gui-runtime-20261015`，状态目录 `app-state`，实例 `f9d11feb-185f-4132-80d8-21f28ef688fc` gen1；仅用旧包已安装资产作只读来源，prepare/start 成功，三节点+双网存活、四卡租约完整，见 prepare/start 日志与 `status-running.json`。此为测试进行中状态，操作前必须重验 PID/命令/QMP 身份，不得据本记录直接发信号。
+
+GUI 启动接口不能传隔离状态环境，桌面工具拒绝控制 Terminal；已请求用户手工运行 `CTFLAB_GUI_STATE_DIR=/Users/pufei/Downloads/ctflab-gui-runtime-20261015/app-state /Users/pufei/Downloads/ctflab-gui-fix-20261015/app/CTFLab.app/Contents/MacOS/CTFLabGUI`。默认 GUI 已退出。等待窗口打开后验证停止取消、正常停止、事务收口与孤儿释放；尚未执行受控故障脚本 `fault-steps.py`。当前不得标为完成。
+
+待发布目录 `/Users/pufei/Downloads/ctflab-release-0.1.2-preview-20261015`，候选仍为 0.1.2（修正版日期标签计划 v0.1.2-preview.20261015），尚未提交/推送/建标签/发布，也未更新镜像库软件入口。跨 Mac、公证与人工解题仍不在本轮完成结果中。
+
+第 49 节进行中补记：用户已打开隔离 GUI；发现中文 ps lstart 导致进程身份摘要漂移，已在源码固定三处 ps 采集的 C locale，新增跨语言回归（运行时模块 15 项通过）及实机中英文对照（均 live）。停止确认取消已验证不影响三节点+双网。正在重建 app-r2 和重跑完整回归，未发布；最初日期 ZIP 仅为待淘汰候选，不得发布。
+
+第 49 节运行态验收收口：r2 GUI 已通过运行状态、停止确认取消、正常 ACPI 停止及自动刷新，三节点/双网已全停。对独立实例受控注入指针切换失败，GUI 重置事务收口返回 aborted，GUI 孤儿预约释放返回 orphan-released，账本活跃预约归零。实例 gen1/失败gen2/reset-ready gen3 现场全部保留，无本轮 QEMU/网络进程；r2 GUI 已正常退出。详见 GUI 验收记录。
+
+事务收口后重复建议收口的提示缺陷已在源码修正并补 CLI 故障恢复回归；最终构建输出 app-final，r2 ZIP 不再分发。807 项完整回归属于 locale 修复阶段，最终提示修复后回归正在进行，完成后再记录最终结果并提交/推送/发布。跨 Mac、公证及人工解题未做。
+
+第 49 节最终发布门槛：最终源码完整回归 808 项通过、跳过 10（230.098 秒），app-final 构建/verify 与实际 ZIP 解压随包 CLI 通过；默认 GUI 正常空状态，GUI 源码与运行态验收 r2 完全一致。最终 ZIP 53,797,125 字节，SHA256 `7ffd66736b8970483e53af7990f7d93f33d4568366b18cb4884283b8e056a5fd`。默认 GUI 保持打开；独立测试实例全停、零预约，gen3 reset-ready 故障现场保留。准备将本轮修复与验收文档提交为修正版构建来源，并创建日期标签/预发布；完成结果另记第 50 节。

@@ -237,7 +237,10 @@ def audit_reset(state_root, instance_uuid, *, available_capabilities):
         state = 'recovery-required'
     _require(_read_binding(scene / 'active-generation.json') == pointer
              and read_events(scene / 'reset-lifecycle.jsonl') == events, '审计期间记录变化')
-    return {'state': state, 'generation': pointer['generation']}
+    report = {'state': state, 'generation': pointer['generation']}
+    if last['state'] == 'aborted':
+        report['transaction'] = 'aborted'  # 旧代次保留，但事务已经显式收口。
+    return report
 
 
 def recover_reset_transaction(state_root, instance_uuid, *, available_capabilities, observe_stopped):

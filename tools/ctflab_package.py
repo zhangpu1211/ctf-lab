@@ -62,6 +62,14 @@ RELEASE_TOOL_FILES = (
     "tools/ctflab_update.py",
     # `ctflab import --manifest` 与 `ctflab dist prepare/verify` 依赖该模块。
     "tools/ctflab_dist.py",
+    # 场景 CLI 与 GUI 状态面板的完整运行依赖。
+    "tools/ctflab_scenario.py",
+    "tools/ctflab_scenario_resources.py",
+    "tools/ctflab_scenario_registry.py",
+    "tools/ctflab_scenario_services.py",
+    "tools/ctflab_scenario_nodes.py",
+    "tools/ctflab_scenario_reset.py",
+    "tools/ctflab_scenario_runtime.py",
 )
 RELEASE_DOC_FILES = (
     "LICENSE",

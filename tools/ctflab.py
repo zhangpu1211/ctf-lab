@@ -4745,7 +4745,8 @@ def scenario_status_report(state_root: Path, instance: str) -> dict[str, Any]:
     reset_state = (report.get("reset") or {}).get("state")
     services_state = (report.get("services") or {}).get("state")
     nodes_state = (report.get("nodes") or {}).get("state")
-    if reset_state == "old-active-preserved" and pointer and pointer.get("descriptor") != "reset-ready.json":
+    if reset_state == "old-active-preserved" and (report.get("reset") or {}).get("transaction") != "aborted" \
+            and pointer and pointer.get("descriptor") != "reset-ready.json":
         advice.append("scenario recover --close-reset  # 收口中断的重置事务")
     if pointer and pointer.get("descriptor") == "reset-ready.json":
         advice.append("scenario start  # 接续已提交的重置资产")

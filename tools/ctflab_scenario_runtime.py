@@ -24,6 +24,11 @@ from ctflab_scenario_services import _digest, _read_binding, _validate_reservati
 PS_BINARY = '/bin/ps'
 
 
+def _ps_environment():
+    # lstart 会本地化；身份采集与恢复检查必须使用同一种格式。
+    return dict(os.environ, LC_ALL='C', LANG='C')
+
+
 def popen_spawn(args, *, pass_fds=(), close_fds=True, stdout=None, stderr=None):
     """生产启动器：新会话启动子进程（脱离终端），默认丢弃输出。
 
@@ -61,7 +66,7 @@ def process_start_identity(pid, *, run=None, hasher=hashlib.sha256):
     _require(type(pid) is int and pid > 0, '无效进程号')
     try:
         result = (run or subprocess.run)([PS_BINARY, '-ww', '-p', str(pid), '-o', 'lstart=,command='],
-            capture_output=True, text=True, check=True, timeout=5)
+            capture_output=True, text=True, check=True, timeout=5, env=_ps_environment())
     except subprocess.SubprocessError:
         return None
     fields = _lstart_command(result.stdout)
@@ -75,7 +80,7 @@ def process_command(pid, *, run=None):
     import subprocess
     try:
         result = (run or subprocess.run)([PS_BINARY, '-ww', '-p', str(pid), '-o', 'command='],
-            capture_output=True, text=True, check=True, timeout=5)
+            capture_output=True, text=True, check=True, timeout=5, env=_ps_environment())
     except subprocess.SubprocessError:
         return None
     lines = [line for line in result.stdout.splitlines() if line.strip()]
@@ -117,7 +122,7 @@ def build_inspect(*, run=None):
         try:
             result = (run or subprocess.run)(
                 [PS_BINARY, '-ww', '-p', str(expected['pid']), '-o', 'lstart=,command='],
-                capture_output=True, text=True, check=True, timeout=5)
+                capture_output=True, text=True, check=True, timeout=5, env=_ps_environment())
         except subprocess.SubprocessError:
             return {'status': 'absent'}
         fields = _lstart_command(result.stdout)

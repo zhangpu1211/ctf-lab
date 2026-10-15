@@ -60,6 +60,7 @@ final class GuiModel: ObservableObject {
     @Published var showNodeResetConfirmation = false
     @Published var scenarioReports: [ScenarioReport] = []
     @Published var scenarioBusy = false
+    @Published var scenarioReadError: String?
     @Published var showScenarioStopConfirmation = false
     @Published var nodeResetTarget: String?
     @Published var showImageRemoveConfirmation = false
@@ -1229,8 +1230,13 @@ final class GuiModel: ObservableObject {
             switch outcome {
             case .success(let text):
                 // 无实例时 CLI 输出提示文本而非 JSON；按空场景处理。
+                if self.state.lastError == self.scenarioReadError {
+                    self.state.lastError = nil
+                }
+                self.scenarioReadError = nil
                 self.scenarioReports = ScenarioReport.decode(text) ?? []
             case .failure(let message):
+                self.scenarioReadError = message
                 self.state.lastError = message
             }
         }
@@ -1404,7 +1410,11 @@ struct ScenarioSection: View {
     var body: some View {
         GroupBox("Wintermute 场景（三节点双隔离网；独立于单机节点）") {
             VStack(alignment: .leading, spacing: 8) {
-                if model.scenarioReports.isEmpty {
+                if model.scenarioReadError != nil {
+                    Text("场景状态读取失败；无法判断是否存在或运行实例。请查看错误信息后重试。")
+                        .foregroundStyle(.orange)
+                        .font(.callout)
+                } else if model.scenarioReports.isEmpty {
                     Text(model.scenarioBusy ? "正在读取场景状态…" : "状态根下没有场景实例；用 CLI `scenario prepare` 创建。")
                         .foregroundStyle(.secondary)
                         .font(.callout)
@@ -1428,15 +1438,15 @@ struct ScenarioSection: View {
                     Button("刷新状态") { model.refreshScenario() }
                         .disabled(model.scenarioBusy)
                     Button("请求正常停止…") { model.showScenarioStopConfirmation = true }
-                        .disabled(model.scenarioBusy || model.scenarioReports.isEmpty)
+                        .disabled(model.scenarioBusy || model.scenarioReadError != nil || model.scenarioReports.isEmpty)
                     Button("收口重置事务") {
                         model.recoverScenario(closeReset: true, releaseOrphan: false)
                     }
-                    .disabled(model.scenarioBusy || model.scenarioReports.isEmpty)
+                    .disabled(model.scenarioBusy || model.scenarioReadError != nil || model.scenarioReports.isEmpty)
                     Button("释放接续孤儿预约") {
                         model.recoverScenario(closeReset: false, releaseOrphan: true)
                     }
-                    .disabled(model.scenarioBusy || model.scenarioReports.isEmpty)
+                    .disabled(model.scenarioBusy || model.scenarioReadError != nil || model.scenarioReports.isEmpty)
                 }
                 Text("准备/启动/重置需用 CLI scenario 子命令；进程与 QMP 已核验不代表来宾地址、题目或隔离已验收。")
                     .font(.caption2).foregroundStyle(.secondary)

@@ -240,6 +240,28 @@ class ScenarioCliTests(unittest.TestCase):
         code, output = self.cli("reset", "--new-generation", "3")
         self.assertEqual(code, 0, output)
 
+    def test_closed_reset_does_not_keep_advising_recovery(self):
+        import ctflab_scenario_reset as reset
+        self.full_lifecycle()
+        self.assertEqual(self.cli("stop")[0], 0)
+        def fail_pointer(*_args):
+            raise OSError("synthetic pointer switch interruption")
+        instance = self.current_instance()
+        with self.assertRaises(OSError):
+            reset.reset_scenario_assets(
+                self.root, instance, new_generation=2,
+                available_capabilities=scenario_fixture.CAPS,
+                observe_stopped=ctflab.scenario_stop_proof(self.root),
+                qemu_img="/synthetic/qemu-img", run=self.image_run, replace=fail_pointer)
+        before = json.loads(self.cli("status", "--json")[1])[0]
+        self.assertTrue(any("--close-reset" in item for item in before["next"]))
+        self.assertEqual(self.cli("recover", "--close-reset")[0], 0)
+        after = json.loads(self.cli("status", "--json")[1])[0]
+        self.assertEqual(after["reset"]["transaction"], "aborted")
+        self.assertFalse(any("--close-reset" in item for item in after["next"]))
+        self.assertEqual(after["nodes"]["state"], "stopped-observed")
+        self.assertTrue((self.root / "scenarios" / instance / "generations/2/reset-ready.json").exists())
+
     def test_recover_without_flags_reports_status(self):
         self.full_lifecycle()
         self.cli("stop")

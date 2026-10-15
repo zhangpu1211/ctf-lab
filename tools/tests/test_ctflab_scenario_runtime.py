@@ -61,6 +61,22 @@ class IdentityTests(unittest.TestCase):
         with self.assertRaises(ScenarioError):
             runtime.process_start_identity('4242', run=ps_output(live))
 
+    def test_identity_is_stable_across_gui_and_cli_locales(self):
+        argv = ['/synthetic/qemu', '-name', 'demo']
+        expected = {'pid': 4242, 'argv': argv, 'start_identity': identity_for(argv)}
+        def localized_ps(args, **kwargs):
+            environment = kwargs.get('env', {})
+            start = LSTART if environment.get('LC_ALL') == 'C' else '星期二 10月 14 10:00:00 2026'
+            text = ' '.join(argv) if args[-1] == 'command=' else start + ' ' + ' '.join(argv)
+            return mock.Mock(stdout=text + '\n', returncode=0)
+        for language in ('zh_CN.UTF-8', 'en_US.UTF-8'):
+            with self.subTest(language=language), mock.patch.dict(
+                    runtime.os.environ, {'LANG': language, 'LC_ALL': language, 'LC_TIME': language}):
+                self.assertEqual(runtime.process_start_identity(4242, run=localized_ps), expected['start_identity'])
+                self.assertEqual(runtime.process_command(4242, run=localized_ps), ' '.join(argv))
+                self.assertEqual(runtime.build_inspect(run=localized_ps)('kali', expected),
+                                 dict(expected, status='live'))
+
     def test_build_inspect_reports_live_absent_unknown(self):
         argv = ['/synthetic/qemu', '-name', 'demo']
         expected = {'pid': 4242, 'argv': argv, 'start_identity': identity_for(argv)}
