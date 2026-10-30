@@ -114,6 +114,22 @@ def apply_inventory_overlay(source, results):
     path.write_bytes(updated)
 
 
+def apply_pe_overlay(source, results):
+    path = source/'tools/ctflab_pe_dependencies.py'
+    raw = path.read_bytes()
+    expected = 'd15270f6634b26c97e3b4e7af33d192c44ea4807bdebbd574800fe8731f810b8'
+    if hashlib.sha256(raw).hexdigest() != expected:
+        raise ValueError('PE系统声明补丁前置源码不符')
+    updated = raw.replace(b'mpr msvcrt ', b'mpr msi msvcrt ').replace(b'profapi psapi', b'profapi propsys psapi')
+    if updated == raw: raise ValueError('PE系统声明未匹配')
+    record(results/'candidate-pe-overlay.json', {'path': 'tools/ctflab_pe_dependencies.py',
+        'release_sha256': expected, 'candidate_sha256': hashlib.sha256(updated).hexdigest(),
+        'reason': 'Microsoft声明的Windows Installer与Property System系统DLL',
+        'os_contracts_verified': False, 'already_public_release': False})
+    with (results/'candidate-pe_dependencies.py').open('xb') as stream: stream.write(updated)
+    path.write_bytes(updated)
+
+
 def timestamp_probe(path, results):
     fields = ('st_dev', 'st_ino', 'st_mode', 'st_nlink', 'st_size', 'st_mtime_ns', 'st_ctime_ns', 'st_birthtime_ns')
     before = path.stat()
@@ -257,6 +273,7 @@ def run():
         with target.open('xb') as stream:stream.write(raw)
     apply_native_overlay(source, results)
     apply_inventory_overlay(source, results)
+    apply_pe_overlay(source, results)
     pyroot=root/'python';prepare_python(Path(sys.executable).parent, pyroot)
     requirements=Path(__file__).with_name('requirements-windows-native-ci.txt')
     command([sys.executable,'-I','-m','pip','install','--only-binary=:all:','--require-hashes','--no-deps',
@@ -353,11 +370,13 @@ def build_standard(root):
     os.environ['CARGO_HOME'] = str(root/'cargo-home')
     os.environ['RUSTUP_HOME'] = str(root/'rustup-home')
     from ctflab_desktop_package import static_imports
+    incomplete = []
     for name, directory, entry in [('python', pyroot, 'python.exe'), ('qemu', qroot, 'qemu-system-x86_64.exe')]:
         report = static_imports(directory, entry)
         record(results/(name+'-static-imports.json'), report)
         if not report['bundled_static_dependencies_present']:
-            raise ValueError(name+'静态依赖尚未闭合，报告保留，不跳过检查')
+            incomplete.append(name)
+    if incomplete: raise ValueError(','.join(incomplete)+'静态依赖尚未闭合，报告保留，不跳过检查')
     rustup_bin = root/'cargo-home/bin';rustup_bin.mkdir(parents=True)
     shutil.copy2(root/'rustup.exe', rustup_bin/'rustup.exe')
     command([rustup_bin/'rustup.exe','toolchain','install','1.90.0','--profile','minimal'],results/'standard-rust-toolchain.log')

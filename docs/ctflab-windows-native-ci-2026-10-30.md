@@ -59,3 +59,6 @@ GitHub Windows2025是构建/自动检查环境，不是Windows11用户设备；�
 官方环境依据：https://docs.github.com/en/actions/reference/runners/github-hosted-runners#administrative-privileges 。
 
 第四轮41030090181：普通非提权账户和自身配置目录已实际验证，QEMU清单3321文件完成，候选Rust/清单源与本地对应源摘要一致；独立Rust工具链下载后因rustup不在新CARGO_HOME/bin中拒绝，未放宽应用权限。下一轮把复制的既有rustup布置到准确独立位置，并在编译前保留Python/QEMU静态导入报告；仍不把下载完成记为安装包构建成功。
+
+第五轮41030623039：静态报告发现Python的_msi/_wmi分别导入msi.dll/propsys.dll，原系统DLL声明遗漏。依据Microsoft一手文档补充精确两项，仍保持os-contract-unverified及本地同名DLL遮蔽拒绝。用第三个精确SHA候选源补丁保留五文件分支边界，输出完整候选PE解析源码；未放宽缺失第三方依赖检查。
+依据：https://learn.microsoft.com/en-us/windows/win32/api/msiquery/nf-msiquery-msiopendatabasew 、https://learn.microsoft.com/en-us/windows/desktop/api/propsys/nf-propsys-psgetpropertykeyfromname 。
