@@ -64,3 +64,14 @@ GitHub Windows2025是构建/自动检查环境，不是Windows11用户设备；�
 依据：https://learn.microsoft.com/en-us/windows/win32/api/msiquery/nf-msiquery-msiopendatabasew 、https://learn.microsoft.com/en-us/windows/desktop/api/propsys/nf-propsys-psgetpropertykeyfromname 。
 
 第六/七轮：Python静态依赖通过，逐文件诊断明确只有libgtk-3-0.dll（SHA256 e2cc2698e2e04214e04b18d685550b76558423ebdb2b0a0782171876fe13eb9c）的108160字节导入目录超过原width×4097大小上限。目录包含描述符之外数据，修正为已映射文件/256MiB目录大小上限，描述符仍最多扫描4097条并强制终止符，路径、重叠、别名及缺失依赖检查保持。新增大目录可解析、无终止符仍拒绝测试。原始证据在run-07-artifacts/qemu-pe-diagnostics.json；PE格式依据：https://learn.microsoft.com/en-us/windows/win32/debug/pe-format#import-section 。
+
+第八轮41043610311：所有QEMU PE均解析通过，实际报告列出此前系统声明遗漏9项：cfgmgr32/d3d9/dxgi/dwrite/gdiplus/msimg32/mswsock/opengl32/usp10。逐项核对Microsoft API要求后补充声明，仍只归类os-contract-unverified，不复制宿主DLL、不把静态分析当系统加载或驱动验收。原始missing完整列表保留；第三方DLL和遮蔽检查不变。官方依据见下列链接。
+- https://learn.microsoft.com/en-us/windows/win32/api/cfgmgr32/nf-cfgmgr32-cm_locate_devnodew
+- https://learn.microsoft.com/en-us/windows/win32/api/d3d9/nf-d3d9-direct3dcreate9
+- https://learn.microsoft.com/en-us/windows/win32/api/dxgi/nf-dxgi-createdxgifactory
+- https://learn.microsoft.com/en-us/windows/win32/api/mswsock/nf-mswsock-acceptex
+- https://learn.microsoft.com/en-us/windows/win32/api/wingdi/nf-wingdi-alphablend
+- https://learn.microsoft.com/en-us/windows/win32/api/dwrite/nf-dwrite-dwritecreatefactory
+- https://learn.microsoft.com/en-us/windows/win32/api/usp10/nf-usp10-scriptitemize
+- https://learn.microsoft.com/en-us/windows/win32/opengl/glbegin
+- https://learn.microsoft.com/en-us/windows/win32/api/gdiplusinit/nf-gdiplusinit-gdiplusstartup

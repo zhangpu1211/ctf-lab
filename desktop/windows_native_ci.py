@@ -122,6 +122,7 @@ def apply_pe_overlay(source, results):
         raise ValueError('PE系统声明补丁前置源码不符')
     updated = raw.replace(b'mpr msvcrt ', b'mpr msi msvcrt ').replace(b'profapi psapi', b'profapi propsys psapi')
     updated = updated.replace(b'require(width<=size<=width*4097,', b'require(width<=size<=MAX_PE,')
+    updated = updated.replace(b'wtsapi32 uxtheme', b'wtsapi32 cfgmgr32 d3d9 dxgi dwrite gdiplus msimg32 mswsock opengl32 usp10 uxtheme')
     if updated == raw: raise ValueError('PE系统声明未匹配')
     record(results/'candidate-pe-overlay.json', {'path': 'tools/ctflab_pe_dependencies.py',
         'release_sha256': expected, 'candidate_sha256': hashlib.sha256(updated).hexdigest(),
