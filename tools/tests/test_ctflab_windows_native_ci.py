@@ -110,6 +110,14 @@ class NativePreparationTests(unittest.TestCase):
         self.assertEqual(value['candidate_sha256'], hashlib.sha256(path.read_bytes()).hexdigest())
         self.assertFalse(value['already_public_release'])
 
+    def test_pe_overlay_refuses_drift_without_mutation(self):
+        source=self.root/'source';results=self.root/'results'
+        (source/'tools').mkdir(parents=True);results.mkdir()
+        target=source/'tools/ctflab_pe_dependencies.py';target.write_bytes(b'changed')
+        with self.assertRaises(ValueError): ci.apply_pe_overlay(source,results)
+        self.assertEqual(target.read_bytes(),b'changed')
+        self.assertEqual(list(results.iterdir()),[])
+
     def test_inventory_overlay_refuses_drift(self):
         source = self.root/'source'; path = source/'tools/ctflab_runtime_inventory.py'
         path.parent.mkdir(parents=True); path.write_bytes(b'changed-source')

@@ -372,6 +372,17 @@ def build_standard(root):
     from ctflab_desktop_package import static_imports
     incomplete = []
     for name, directory, entry in [('python', pyroot, 'python.exe'), ('qemu', qroot, 'qemu-system-x86_64.exe')]:
+        from ctflab_pe_dependencies import PE
+        diagnostics = []
+        for binary in sorted(directory.rglob('*')):
+            if binary.suffix.lower() not in ('.exe','.dll','.pyd','.drv'): continue
+            image = PE(binary.read_bytes())
+            try: image.dependencies()
+            except Exception as error:
+                diagnostics.append({'name':binary.relative_to(directory).as_posix(),
+                    'sha256':digest(binary),'directories':image.directories,
+                    'error':type(error).__name__+': '+str(error)})
+        record(results/(name+'-pe-diagnostics.json'), diagnostics)
         report = static_imports(directory, entry)
         record(results/(name+'-static-imports.json'), report)
         if not report['bundled_static_dependencies_present']:
