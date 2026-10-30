@@ -62,3 +62,5 @@ GitHub Windows2025是构建/自动检查环境，不是Windows11用户设备；�
 
 第五轮41030623039：静态报告发现Python的_msi/_wmi分别导入msi.dll/propsys.dll，原系统DLL声明遗漏。依据Microsoft一手文档补充精确两项，仍保持os-contract-unverified及本地同名DLL遮蔽拒绝。用第三个精确SHA候选源补丁保留五文件分支边界，输出完整候选PE解析源码；未放宽缺失第三方依赖检查。
 依据：https://learn.microsoft.com/en-us/windows/win32/api/msiquery/nf-msiquery-msiopendatabasew 、https://learn.microsoft.com/en-us/windows/desktop/api/propsys/nf-propsys-psgetpropertykeyfromname 。
+
+第六/七轮：Python静态依赖通过，逐文件诊断明确只有libgtk-3-0.dll（SHA256 e2cc2698e2e04214e04b18d685550b76558423ebdb2b0a0782171876fe13eb9c）的108160字节导入目录超过原width×4097大小上限。目录包含描述符之外数据，修正为已映射文件/256MiB目录大小上限，描述符仍最多扫描4097条并强制终止符，路径、重叠、别名及缺失依赖检查保持。新增大目录可解析、无终止符仍拒绝测试。原始证据在run-07-artifacts/qemu-pe-diagnostics.json；PE格式依据：https://learn.microsoft.com/en-us/windows/win32/debug/pe-format#import-section 。

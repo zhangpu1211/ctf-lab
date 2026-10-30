@@ -121,10 +121,11 @@ def apply_pe_overlay(source, results):
     if hashlib.sha256(raw).hexdigest() != expected:
         raise ValueError('PE系统声明补丁前置源码不符')
     updated = raw.replace(b'mpr msvcrt ', b'mpr msi msvcrt ').replace(b'profapi psapi', b'profapi propsys psapi')
+    updated = updated.replace(b'require(width<=size<=width*4097,', b'require(width<=size<=MAX_PE,')
     if updated == raw: raise ValueError('PE系统声明未匹配')
     record(results/'candidate-pe-overlay.json', {'path': 'tools/ctflab_pe_dependencies.py',
         'release_sha256': expected, 'candidate_sha256': hashlib.sha256(updated).hexdigest(),
-        'reason': 'Microsoft声明的Windows Installer与Property System系统DLL',
+        'reason': '系统DLL声明及GTK大导入目录；描述符上限和边界校验保留',
         'os_contracts_verified': False, 'already_public_release': False})
     with (results/'candidate-pe_dependencies.py').open('xb') as stream: stream.write(updated)
     path.write_bytes(updated)
