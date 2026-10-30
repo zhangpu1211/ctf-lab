@@ -352,9 +352,17 @@ def build_standard(root):
            'host': platform.platform(), 'temporary_ci_account_only': True})
     os.environ['CARGO_HOME'] = str(root/'cargo-home')
     os.environ['RUSTUP_HOME'] = str(root/'rustup-home')
-    command([root/'rustup.exe','toolchain','install','1.90.0','--profile','minimal'],results/'standard-rust-toolchain.log')
+    from ctflab_desktop_package import static_imports
+    for name, directory, entry in [('python', pyroot, 'python.exe'), ('qemu', qroot, 'qemu-system-x86_64.exe')]:
+        report = static_imports(directory, entry)
+        record(results/(name+'-static-imports.json'), report)
+        if not report['bundled_static_dependencies_present']:
+            raise ValueError(name+'静态依赖尚未闭合，报告保留，不跳过检查')
+    rustup_bin = root/'cargo-home/bin';rustup_bin.mkdir(parents=True)
+    shutil.copy2(root/'rustup.exe', rustup_bin/'rustup.exe')
+    command([rustup_bin/'rustup.exe','toolchain','install','1.90.0','--profile','minimal'],results/'standard-rust-toolchain.log')
     toolchain = root/'rustup-home/toolchains/1.90.0-x86_64-pc-windows-msvc/bin'
-    os.environ['PATH'] = str(toolchain)+os.pathsep+str(root)+os.pathsep+os.environ['PATH']
+    os.environ['PATH'] = str(toolchain)+os.pathsep+str(rustup_bin)+os.pathsep+os.environ['PATH']
     build=root/'build';inventory=root/'qemu-inventory.json'
     command(['pwsh','-NoProfile','-NonInteractive','-File',source/'desktop/Build-Windows.ps1',
              '-PythonRoot',pyroot,'-QemuRoot',qroot,'-QemuInventory',inventory,'-BuildRoot',build],results/'build-standard.log',timeout=2700)

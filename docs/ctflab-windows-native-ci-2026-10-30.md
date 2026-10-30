@@ -57,3 +57,5 @@ GitHub Windows2025是构建/自动检查环境，不是Windows11用户设备；�
 
 第三轮41028690543：原始字段证实同一QEMU文件stat/fstat的设备、inode、大小、mtime、birthtime一致，仅ctime不同，修复后QEMU清单完成。构建器workspace阶段拒绝管理员身份；GitHub官方说明Windows runner默认管理员且UAC关闭。第四轮仅在本轮新云端根授予一次性普通测试用户Modify，密码随机且只留进程内，不输出/入库、不复制任何token。切换后的进程明确验证非提权、加载自身AppData及独立Rust工具链后才构建/安装/卸载，保持原WindowsSecurity拒绝管理员的门禁；不是修改个人电脑账户或已有ACL。账户随临时主机回收，不自动删除任何用户资产。
 官方环境依据：https://docs.github.com/en/actions/reference/runners/github-hosted-runners#administrative-privileges 。
+
+第四轮41030090181：普通非提权账户和自身配置目录已实际验证，QEMU清单3321文件完成，候选Rust/清单源与本地对应源摘要一致；独立Rust工具链下载后因rustup不在新CARGO_HOME/bin中拒绝，未放宽应用权限。下一轮把复制的既有rustup布置到准确独立位置，并在编译前保留Python/QEMU静态导入报告；仍不把下载完成记为安装包构建成功。
