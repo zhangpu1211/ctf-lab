@@ -21,6 +21,7 @@ QEMU_URL = 'https://qemu.weilnetz.de/w64/2026/qemu-w64-setup-20260811.exe'
 QEMU_SHA512 = '5bcf9eed634e8575a37b74f445af41a2fe4106da512d0c30c368301d4c105037fdfab40a5287367a28a957624cddebbc8c07e16c88ab6634f554cdf3d16bf543'
 QEMU_BINARY_SHA256 = '47d57a6072e0bb3bd98f87926eb129eb1736dfe818c67b3b81ef7ce4edd0b3cd'
 RUST_RELEASE_SHA256 = '54b950ba2acc4b7b894a295c7cc36efb4836dc30c6d2df33905d644261558e3c'
+INVENTORY_RELEASE_SHA256 = '308273cb16d7d9e373ad40593a02ed236d386aea135ab63a6c78dd265798ab4e'
 
 
 def digest(path, algorithm='sha256'):
@@ -92,6 +93,37 @@ def apply_native_overlay(source, results):
         'source_archive_unchanged': True, 'already_public_release': False})
     with (results/'candidate-main.rs').open('xb') as stream: stream.write(updated)
     path.write_bytes(updated)
+
+
+
+def apply_inventory_overlay(source, results):
+    path = source/'tools/ctflab_runtime_inventory.py'
+    raw = path.read_bytes()
+    if hashlib.sha256(raw).hexdigest() != INVENTORY_RELEASE_SHA256:
+        raise ValueError('运行时清单补丁前置源码不符，保留原文件')
+    before = b'return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)'
+    after = (b"timestamp = getattr(info, 'st_birthtime_ns', info.st_ctime_ns) if os.name == 'nt' else info.st_ctime_ns\n"
+             b'    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, timestamp)')
+    if raw.count(before) != 1: raise ValueError('清单补丁入口不唯一')
+    updated = raw.replace(before, after, 1)
+    record(results/'candidate-inventory-overlay.json', {
+        'path': 'tools/ctflab_runtime_inventory.py', 'release_sha256': INVENTORY_RELEASE_SHA256,
+        'candidate_sha256': hashlib.sha256(updated).hexdigest(), 'reason': 'Windows路径与文件句柄创建时间统一',
+        'inode_size_mtime_and_hash_checks_preserved': True, 'already_public_release': False})
+    with (results/'candidate-runtime_inventory.py').open('xb') as stream: stream.write(updated)
+    path.write_bytes(updated)
+
+
+def timestamp_probe(path, results):
+    fields = ('st_dev', 'st_ino', 'st_mode', 'st_nlink', 'st_size', 'st_mtime_ns', 'st_ctime_ns', 'st_birthtime_ns')
+    before = path.stat()
+    with path.open('rb') as stream: opened = os.fstat(stream.fileno())
+    after = path.stat()
+    record(results/'windows-file-stat.json', {
+        'path': path.name, 'python': sys.version.split()[0],
+        'before': {n: getattr(before,n,None) for n in fields},
+        'opened': {n: getattr(opened,n,None) for n in fields},
+        'after': {n: getattr(after,n,None) for n in fields}})
 
 
 def command(args, log, **options):
@@ -224,6 +256,7 @@ def run():
         target=source/name;target.parent.mkdir(parents=True,exist_ok=True)
         with target.open('xb') as stream:stream.write(raw)
     apply_native_overlay(source, results)
+    apply_inventory_overlay(source, results)
     pyroot=root/'python';prepare_python(Path(sys.executable).parent, pyroot)
     requirements=Path(__file__).with_name('requirements-windows-native-ci.txt')
     command([sys.executable,'-I','-m','pip','install','--only-binary=:all:','--require-hashes','--no-deps',
@@ -245,6 +278,7 @@ def run():
     record(results/'input-provenance.json', {'source_sha256':digest(source_zip),'qemu_installer_sha512':digest(archive,'sha512'),
           'qemu_binary_sha256':digest(qroot/'qemu-system-x86_64.exe'),'python':sys.version.split()[0],
           'python_setup_action_pinned':True,'source_signature_verified':False})
+    timestamp_probe(qroot/'qemu-system-x86_64.exe', results)
     tool=source/'tools/ctflab_runtime_inventory.py';inventory=root/'qemu-inventory.json'
     command([pyroot/'python.exe','-I','-B',tool,'--root',qroot,'--output',inventory],results/'qemu-inventory.log')
     command(['rustup','toolchain','install','1.90.0','--profile','minimal'],results/'rust-toolchain.log')

@@ -51,3 +51,6 @@ GitHub Windows2025是构建/自动检查环境，不是Windows11用户设备；�
 用户已批准独立CI分支与执行。首轮41027392700在真实Windows2025上准备依赖并运行原生测试：基础8项6通过/2非Windows分支跳过；控制19项18通过，1项因英文Windows cp1252输出中文产生UnicodeEncodeError。保留原日志，不改断言。
 
 下一轮显式以`-X utf8`执行测试；Rust桌面启动Python同样显式指定UTF8，避免中文路径/JSON受系统区域影响。为维持仅5文件的独立分支范围，CI脚本对下载快照中精确SHA绑定的main.rs施加这一处候选补丁，输出补丁前后摘要与candidate-main.rs，原ZIP不改；本地对应Rust源码同步修正但不批量提交。该差异未进入已公开0.1.4，候选不能冒称与原发布源码完全相同。新增2项源漂移/补丁绑定测试。
+
+第二轮41027970390：19项控制测试已在Windows全部通过；固定QEMU安装器SHA512和主程序SHA256匹配。清单校验在stat/fstat身份比较处拒绝。CPython3.12.10官方posixmodule.c的win32_xstat明确把ctime映射到birthtime，fstat走不同实现，因而补充Windows原字段探针及精确SHA绑定的清单候选补丁：统一比较st_birthtime_ns，仍核对设备/inode/大小/mtime和内容摘要；POSIX仍用ctime。原发布清单源码及ZIP保留，本地相应修复与候选内容单列。第三轮将以原生字段结果复核诊断，不据推断宣布通过。
+官方实现：https://raw.githubusercontent.com/python/cpython/v3.12.10/Modules/posixmodule.c 。

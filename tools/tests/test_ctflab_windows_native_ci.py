@@ -110,6 +110,14 @@ class NativePreparationTests(unittest.TestCase):
         self.assertEqual(value['candidate_sha256'], hashlib.sha256(path.read_bytes()).hexdigest())
         self.assertFalse(value['already_public_release'])
 
+    def test_inventory_overlay_refuses_drift(self):
+        source = self.root/'source'; path = source/'tools/ctflab_runtime_inventory.py'
+        path.parent.mkdir(parents=True); path.write_bytes(b'changed-source')
+        results = self.root/'results'; results.mkdir()
+        with self.assertRaises(ValueError): ci.apply_inventory_overlay(source, results)
+        self.assertEqual(path.read_bytes(), b'changed-source')
+        self.assertEqual(list(results.iterdir()), [])
+
     def test_non_windows_cannot_create_run_directory(self):
         if os.name == 'nt': self.skipTest('本用例验证非Windows拒绝边界')
         with patch.dict(os.environ, {'GITHUB_ACTIONS': 'true', 'RUNNER_OS': 'Windows', 'RUNNER_TEMP': str(self.root)}):
