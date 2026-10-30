@@ -281,10 +281,83 @@ def run():
     timestamp_probe(qroot/'qemu-system-x86_64.exe', results)
     tool=source/'tools/ctflab_runtime_inventory.py';inventory=root/'qemu-inventory.json'
     command([pyroot/'python.exe','-I','-B',tool,'--root',qroot,'--output',inventory],results/'qemu-inventory.log')
-    command(['rustup','toolchain','install','1.90.0','--profile','minimal'],results/'rust-toolchain.log')
-    build=root/'build'
+    launch_standard(root, results)
+
+
+def launch_standard(root, results):
+    # 云端runner默认管理员；仅在本轮新根授予一次性标准用户访问，不绕过应用普通用户门。
+    launcher = shutil.which('rustup')
+    if not launcher: raise ValueError('缺少runner已安装的rustup入口')
+    shutil.copy2(launcher, root/'rustup.exe')
+    shutil.copy2(Path(__file__).resolve(), root/'standard-ci.py')
+    record(root/'standard-context.json', {
+        'python': sys.executable, 'script': str(root/'standard-ci.py'), 'path': os.environ['PATH'],
+        'github_run_id': os.environ['GITHUB_RUN_ID'], 'github_run_attempt': os.environ['GITHUB_RUN_ATTEMPT']})
+    bootstrap = root/'standard-bootstrap.ps1'
+    bootstrap.write_text(r'''param([string]$RunRoot)
+$ErrorActionPreference = 'Stop'
+$ctx = Get-Content -LiteralPath (Join-Path $RunRoot 'standard-context.json') -Raw | ConvertFrom-Json
+$env:PATH = $ctx.path
+$env:GITHUB_ACTIONS = 'true'
+$env:RUNNER_OS = 'Windows'
+$env:RUNNER_TEMP = Split-Path -Parent $RunRoot
+$env:GITHUB_RUN_ID = $ctx.github_run_id
+$env:GITHUB_RUN_ATTEMPT = $ctx.github_run_attempt
+$env:USERPROFILE = [Environment]::GetFolderPath('UserProfile')
+$env:APPDATA = [Environment]::GetFolderPath('ApplicationData')
+$env:LOCALAPPDATA = [Environment]::GetFolderPath('LocalApplicationData')
+& $ctx.python -X utf8 -I -B $ctx.script build-standard --root $RunRoot
+exit $LASTEXITCODE
+''', encoding='utf-8')
+    launch = root/'launch-standard.ps1'
+    launch.write_text(r'''param([string]$RunRoot)
+$ErrorActionPreference = 'Stop'
+$ctx = Get-Content -LiteralPath (Join-Path $RunRoot 'standard-context.json') -Raw | ConvertFrom-Json
+$name = 'ctflab' + $ctx.github_run_id.Substring([Math]::Max(0,$ctx.github_run_id.Length-8))
+if (Get-LocalUser -Name $name -ErrorAction SilentlyContinue) { throw '测试账户已存在；拒绝接管。' }
+$random = [Convert]::ToBase64String([Security.Cryptography.RandomNumberGenerator]::GetBytes(32))
+$password = ConvertTo-SecureString ('Aa1!' + $random) -AsPlainText -Force
+New-LocalUser -Name $name -Password $password -AccountNeverExpires -UserMayNotChangePassword | Out-Null
+Add-LocalGroupMember -SID 'S-1-5-32-545' -Member $name
+$account = "$env:COMPUTERNAME\$name"
+# RunRoot由本轮排他创建；不修改仓库、系统目录或任何原有用户根ACL。
+$acl = Get-Acl -LiteralPath $RunRoot
+$rule = [Security.AccessControl.FileSystemAccessRule]::new($account,'Modify','ContainerInherit,ObjectInherit','None','Allow')
+$acl.AddAccessRule($rule)
+Set-Acl -LiteralPath $RunRoot -AclObject $acl
+$credential = [Management.Automation.PSCredential]::new($account,$password)
+$workerArguments = @('-NoProfile','-NonInteractive','-File',(Join-Path $RunRoot 'standard-bootstrap.ps1'),'-RunRoot',$RunRoot)
+$p = Start-Process -FilePath (Get-Command pwsh.exe).Source -ArgumentList $workerArguments -WorkingDirectory $RunRoot -Credential $credential -LoadUserProfile -UseNewEnvironment -Wait -PassThru -RedirectStandardOutput (Join-Path $RunRoot 'results/standard.stdout.log') -RedirectStandardError (Join-Path $RunRoot 'results/standard.stderr.log')
+exit $p.ExitCode
+''', encoding='utf-8')
+    command(['pwsh','-NoProfile','-NonInteractive','-File',launch,'-RunRoot',root],
+            results/'standard-launch.log', timeout=3000)
+
+
+def build_standard(root):
+    if os.name != 'nt' or os.environ.get('GITHUB_ACTIONS') != 'true':
+        raise ValueError('只允许本轮云端Windows普通用户入口')
+    run_id, attempt = os.environ['GITHUB_RUN_ID'], os.environ['GITHUB_RUN_ATTEMPT']
+    expected = Path(os.environ['RUNNER_TEMP'])/f'ctflab-native-{run_id}-{attempt}'
+    if root != expected or root.is_symlink(): raise ValueError('普通用户运行根不符')
+    results = root/'results'; source = root/'source'; pyroot = root/'python'; qroot = root/'qemu'
+    sys.path.insert(0, str(source/'tools'))
+    from ctflab_windows_security import WindowsSecurity
+    # 明确验证非提权令牌；管理员环境仍拒绝，不能记为普通用户测试。
+    WindowsSecurity().current_user()
+    if not all(os.environ.get(n) and Path(os.environ[n]).is_absolute() for n in ('USERPROFILE','APPDATA','LOCALAPPDATA')):
+        raise ValueError('普通用户配置目录未加载，拒绝安装')
+    record(results/'standard-user.json', {'non_elevated_user_verified': True,
+           'profile_paths_present': all(os.environ.get(n) for n in ('USERPROFILE','APPDATA','LOCALAPPDATA')),
+           'host': platform.platform(), 'temporary_ci_account_only': True})
+    os.environ['CARGO_HOME'] = str(root/'cargo-home')
+    os.environ['RUSTUP_HOME'] = str(root/'rustup-home')
+    command([root/'rustup.exe','toolchain','install','1.90.0','--profile','minimal'],results/'standard-rust-toolchain.log')
+    toolchain = root/'rustup-home/toolchains/1.90.0-x86_64-pc-windows-msvc/bin'
+    os.environ['PATH'] = str(toolchain)+os.pathsep+str(root)+os.pathsep+os.environ['PATH']
+    build=root/'build';inventory=root/'qemu-inventory.json'
     command(['pwsh','-NoProfile','-NonInteractive','-File',source/'desktop/Build-Windows.ps1',
-             '-PythonRoot',pyroot,'-QemuRoot',qroot,'-QemuInventory',inventory,'-BuildRoot',build],results/'build.log',timeout=2700)
+             '-PythonRoot',pyroot,'-QemuRoot',qroot,'-QemuInventory',inventory,'-BuildRoot',build],results/'build-standard.log',timeout=2700)
     for name in ('stage-result.json','installer-results.json'):
         shutil.copy2(build/name,results/name)
     installers=list((build/'installers').glob('*.exe'))
@@ -297,12 +370,15 @@ def run():
 
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action',choices=['run','verify-snapshot']);parser.add_argument('--archive',type=Path)
+    parser.add_argument('action',choices=['run','verify-snapshot','build-standard']);parser.add_argument('--archive',type=Path);parser.add_argument('--root',type=Path)
     args=parser.parse_args()
     if args.action=='verify-snapshot':
         if args.archive is None:parser.error('需要--archive')
         if digest(args.archive)!=SOURCE_SHA256:raise ValueError('固定源码ZIP摘要不符')
         files=snapshot_files(args.archive);print(json.dumps({'files':len(files),'source_sha256':SOURCE_SHA256}));return
+    if args.action=='build-standard':
+        if args.root is None:parser.error('需要--root')
+        build_standard(args.root);return
     run()
 
 

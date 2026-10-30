@@ -54,3 +54,6 @@ GitHub Windows2025是构建/自动检查环境，不是Windows11用户设备；�
 
 第二轮41027970390：19项控制测试已在Windows全部通过；固定QEMU安装器SHA512和主程序SHA256匹配。清单校验在stat/fstat身份比较处拒绝。CPython3.12.10官方posixmodule.c的win32_xstat明确把ctime映射到birthtime，fstat走不同实现，因而补充Windows原字段探针及精确SHA绑定的清单候选补丁：统一比较st_birthtime_ns，仍核对设备/inode/大小/mtime和内容摘要；POSIX仍用ctime。原发布清单源码及ZIP保留，本地相应修复与候选内容单列。第三轮将以原生字段结果复核诊断，不据推断宣布通过。
 官方实现：https://raw.githubusercontent.com/python/cpython/v3.12.10/Modules/posixmodule.c 。
+
+第三轮41028690543：原始字段证实同一QEMU文件stat/fstat的设备、inode、大小、mtime、birthtime一致，仅ctime不同，修复后QEMU清单完成。构建器workspace阶段拒绝管理员身份；GitHub官方说明Windows runner默认管理员且UAC关闭。第四轮仅在本轮新云端根授予一次性普通测试用户Modify，密码随机且只留进程内，不输出/入库、不复制任何token。切换后的进程明确验证非提权、加载自身AppData及独立Rust工具链后才构建/安装/卸载，保持原WindowsSecurity拒绝管理员的门禁；不是修改个人电脑账户或已有ACL。账户随临时主机回收，不自动删除任何用户资产。
+官方环境依据：https://docs.github.com/en/actions/reference/runners/github-hosted-runners#administrative-privileges 。
