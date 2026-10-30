@@ -75,3 +75,5 @@ GitHub Windows2025是构建/自动检查环境，不是Windows11用户设备；�
 - https://learn.microsoft.com/en-us/windows/win32/api/usp10/nf-usp10-scriptitemize
 - https://learn.microsoft.com/en-us/windows/win32/opengl/glbegin
 - https://learn.microsoft.com/en-us/windows/win32/api/gdiplusinit/nf-gdiplusinit-gdiplusstartup
+
+第九轮41043965820：Python/QEMU静态检查、普通用户Rust1.90、运行时暂存与包内Python探测通过；Windows前端69项通过。npm调用Tauri时--config被吞掉，配置路径误传cargo；直接使用node执行锁定依赖包@tauri-apps/cli/tauri.js build --config避免npm参数转发，原配置及检查保持。新增第四份精确SHA源补丁及候选完整脚本，原发布源码不改。

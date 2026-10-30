@@ -132,6 +132,22 @@ def apply_pe_overlay(source, results):
     path.write_bytes(updated)
 
 
+def apply_build_overlay(source, results):
+    path = source/'desktop/Build-Windows.ps1'
+    raw = path.read_bytes()
+    expected = '6d7de73f14da60a0c3b93bf55a3fac6aa9e4c72630a23bf0aea8d9f21b536376'
+    if hashlib.sha256(raw).hexdigest() != expected: raise ValueError('Windows构建入口补丁前置源码不符')
+    before = b"& npm run tauri -- build --config (Join-Path $staging 'tauri.bundle.json')"
+    after = b"& node (Join-Path $PSScriptRoot 'node_modules/@tauri-apps/cli/tauri.js') build --config (Join-Path $staging 'tauri.bundle.json')"
+    if raw.count(before) != 1: raise ValueError('Windows构建入口不唯一')
+    updated = raw.replace(before,after,1)
+    record(results/'candidate-build-overlay.json', {'path':'desktop/Build-Windows.ps1',
+        'release_sha256':expected,'candidate_sha256':hashlib.sha256(updated).hexdigest(),
+        'reason':'直接执行锁定包的Tauri入口以保留Windows参数','already_public_release':False})
+    with (results/'candidate-Build-Windows.ps1').open('xb') as stream: stream.write(updated)
+    path.write_bytes(updated)
+
+
 def timestamp_probe(path, results):
     fields = ('st_dev', 'st_ino', 'st_mode', 'st_nlink', 'st_size', 'st_mtime_ns', 'st_ctime_ns', 'st_birthtime_ns')
     before = path.stat()
@@ -276,6 +292,7 @@ def run():
     apply_native_overlay(source, results)
     apply_inventory_overlay(source, results)
     apply_pe_overlay(source, results)
+    apply_build_overlay(source, results)
     pyroot=root/'python';prepare_python(Path(sys.executable).parent, pyroot)
     requirements=Path(__file__).with_name('requirements-windows-native-ci.txt')
     command([sys.executable,'-I','-m','pip','install','--only-binary=:all:','--require-hashes','--no-deps',
