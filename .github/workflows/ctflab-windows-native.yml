@@ -29,7 +29,7 @@ jobs:
       - name: 校验准备器输入边界
         run: python -B -m unittest discover -s tools/tests -p test_ctflab_windows_native_ci.py -v
       - name: 准备固定输入、构建并检查原生安装
-        run: python -I -B desktop/windows_native_ci.py run
+        run: python -X utf8 -I -B desktop/windows_native_ci.py run
       - name: 保留结果与候选安装器
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02

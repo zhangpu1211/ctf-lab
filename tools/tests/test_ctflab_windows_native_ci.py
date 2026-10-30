@@ -90,6 +90,26 @@ class NativePreparationTests(unittest.TestCase):
             with self.assertRaises(ValueError): ci.download(response.url, target, '0'*64)
         self.assertEqual(target.read_bytes(), b'changed')
 
+    def test_overlay_rejects_source_drift_without_writing(self):
+        source = self.root/'source'; path = source/'desktop/src-tauri/src/main.rs'
+        path.parent.mkdir(parents=True); path.write_bytes(b'changed-source')
+        results = self.root/'results'; results.mkdir()
+        with self.assertRaises(ValueError): ci.apply_native_overlay(source, results)
+        self.assertEqual(path.read_bytes(), b'changed-source')
+        self.assertEqual(list(results.iterdir()), [])
+
+    def test_overlay_binds_candidate_and_keeps_release_archive_separate(self):
+        source = self.root/'source'; path = source/'desktop/src-tauri/src/main.rs'
+        path.parent.mkdir(parents=True)
+        raw = b'cmd.args(["-I", "-B"]).arg(script);'; path.write_bytes(raw)
+        results = self.root/'results'; results.mkdir()
+        with patch.object(ci, 'RUST_RELEASE_SHA256', hashlib.sha256(raw).hexdigest()):
+            ci.apply_native_overlay(source, results)
+        self.assertIn(b'"-X", "utf8"', path.read_bytes())
+        value = json.loads((results/'candidate-source-overlay.json').read_text())
+        self.assertEqual(value['candidate_sha256'], hashlib.sha256(path.read_bytes()).hexdigest())
+        self.assertFalse(value['already_public_release'])
+
     def test_non_windows_cannot_create_run_directory(self):
         if os.name == 'nt': self.skipTest('本用例验证非Windows拒绝边界')
         with patch.dict(os.environ, {'GITHUB_ACTIONS': 'true', 'RUNNER_OS': 'Windows', 'RUNNER_TEMP': str(self.root)}):

@@ -20,6 +20,7 @@ SOURCE_SHA256 = '62e870b6700a83031a3c9f1e4cfbded3207be7d9a839e2ef6d72c200608093f
 QEMU_URL = 'https://qemu.weilnetz.de/w64/2026/qemu-w64-setup-20260811.exe'
 QEMU_SHA512 = '5bcf9eed634e8575a37b74f445af41a2fe4106da512d0c30c368301d4c105037fdfab40a5287367a28a957624cddebbc8c07e16c88ab6634f554cdf3d16bf543'
 QEMU_BINARY_SHA256 = '47d57a6072e0bb3bd98f87926eb129eb1736dfe818c67b3b81ef7ce4edd0b3cd'
+RUST_RELEASE_SHA256 = '54b950ba2acc4b7b894a295c7cc36efb4836dc30c6d2df33905d644261558e3c'
 
 
 def digest(path, algorithm='sha256'):
@@ -72,6 +73,25 @@ def snapshot_files(archive):
         if any(hashlib.sha256(raw).hexdigest() != files[name] for name, raw in payload.items()):
             raise ValueError('源码摘要不符')
         return payload
+
+
+
+def apply_native_overlay(source, results):
+    # Windows首轮已复现cp1252无法输出中文；只对已发布的精确Rust源施加这一处候选补丁。
+    path = source/'desktop/src-tauri/src/main.rs'
+    raw = path.read_bytes()
+    if hashlib.sha256(raw).hexdigest() != RUST_RELEASE_SHA256:
+        raise ValueError('候选补丁前置源码不符，保留原文件')
+    before = b'cmd.args(["-I", "-B"]).arg(script);'
+    after = b'cmd.args(["-X", "utf8", "-I", "-B"]).arg(script);'
+    if raw.count(before) != 1: raise ValueError('候选UTF8入口匹配不唯一')
+    updated = raw.replace(before, after, 1)
+    record(results/'candidate-source-overlay.json', {
+        'path': 'desktop/src-tauri/src/main.rs', 'release_sha256': RUST_RELEASE_SHA256,
+        'candidate_sha256': hashlib.sha256(updated).hexdigest(), 'reason': 'Windows英文区域下固定UTF8桥接',
+        'source_archive_unchanged': True, 'already_public_release': False})
+    with (results/'candidate-main.rs').open('xb') as stream: stream.write(updated)
+    path.write_bytes(updated)
 
 
 def command(args, log, **options):
@@ -203,12 +223,13 @@ def run():
     for name,raw in files.items():
         target=source/name;target.parent.mkdir(parents=True,exist_ok=True)
         with target.open('xb') as stream:stream.write(raw)
+    apply_native_overlay(source, results)
     pyroot=root/'python';prepare_python(Path(sys.executable).parent, pyroot)
     requirements=Path(__file__).with_name('requirements-windows-native-ci.txt')
     command([sys.executable,'-I','-m','pip','install','--only-binary=:all:','--require-hashes','--no-deps',
              '--no-compile','--target',pyroot/'Lib/site-packages','-r',requirements],results/'python-dependencies.log')
     for suite in ('test_ctflab_windows_native.py', 'test_ctflab_windows_control.py'):
-        command([pyroot/'python.exe', '-B', '-m', 'unittest', 'discover', '-s', 'tools/tests', '-p', suite, '-v'],
+        command([pyroot/'python.exe', '-X', 'utf8', '-B', '-m', 'unittest', 'discover', '-s', 'tools/tests', '-p', suite, '-v'],
                 results/(suite+'.log'), cwd=source, timeout=180)
     archive=root/'qemu-installer.exe';download(QEMU_URL, archive, QEMU_SHA512, 'sha512')
     extracted=root/'qemu-extracted'
