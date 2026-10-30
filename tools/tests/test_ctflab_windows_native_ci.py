@@ -118,6 +118,14 @@ class NativePreparationTests(unittest.TestCase):
         self.assertEqual(target.read_bytes(),b'changed')
         self.assertEqual(list(results.iterdir()),[])
 
+    def test_build_overlay_refuses_drift_without_mutation(self):
+        source=self.root/'source';results=self.root/'results'
+        (source/'desktop').mkdir(parents=True);results.mkdir()
+        target=source/'desktop/Build-Windows.ps1';target.write_bytes(b'changed')
+        with self.assertRaises(ValueError): ci.apply_build_overlay(source,results)
+        self.assertEqual(target.read_bytes(),b'changed')
+        self.assertEqual(list(results.iterdir()),[])
+
     def test_inventory_overlay_refuses_drift(self):
         source = self.root/'source'; path = source/'tools/ctflab_runtime_inventory.py'
         path.parent.mkdir(parents=True); path.write_bytes(b'changed-source')

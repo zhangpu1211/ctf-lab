@@ -77,3 +77,15 @@ GitHub Windows2025是构建/自动检查环境，不是Windows11用户设备；�
 - https://learn.microsoft.com/en-us/windows/win32/api/gdiplusinit/nf-gdiplusinit-gdiplusstartup
 
 第九轮41043965820：Python/QEMU静态检查、普通用户Rust1.90、运行时暂存与包内Python探测通过；Windows前端69项通过。npm调用Tauri时--config被吞掉，配置路径误传cargo；直接使用node执行锁定依赖包@tauri-apps/cli/tauri.js build --config避免npm参数转发，原配置及检查保持。新增第四份精确SHA源补丁及候选完整脚本，原发布源码不改。
+
+## 最终结果：原生构建与云端自动安装检查通过
+
+2026-10-30北京时间19:21，第十轮[41044544057](https://github.com/zhangpu1211/ctf-lab/actions/runs/41044544057)成功，输入提交`b7f481639e88e7570dcf8b059a9677a6452c16a9`。Windows Server 2025普通非提权账户完成：运行时静态核对、包内Python、前端69项、Rust release实际编译、NSIS生成、安装、5625文件载荷集合/摘要匹配、包内依赖、可见自有GUI窗口/正常退出、卸载及两类应用数据标记保留。基础测试8项6通过2非Windows路径跳过，控制19项通过。没有Windows Rust单测或全项目单测重跑声明。
+
+安装器`CTFLab_0.1.4_x64-setup.exe`为302903771字节，SHA256 `8583d7796dcd231aeec9ca334f18978547af92d810a062f80e4f93ece46b13a2`，Authenticode为NotSigned。artifact ZIP为303008779字节，SHA256 `9461db717f66bc425e8d43f382026f0924f8864cfdd9688053c3b47fbd74aca4`，本地回下载一致。静态解包安装器5625份runtime文件，重建bundle-manifest与云端独立保留的摘要`0b1312d26a83595c1dbb37cced8618e7ddd0d45dab8ce7309e6331941b326616`完全一致，四份候选源与本地源逐字节一致。Mac没有执行EXE。
+
+本地持久交付：`/Users/pufei/Downloads/CTFLab-Library/03-软件/CTFLab-0.1.4-Windows-native-candidate-20261030/`，含EXE、对应316文件候选源码ZIP、清单/校验及验收证据。源码清单明确标为windows-native-candidate-source，记录原源ZIP摘要和四份补丁；原公开0.1.4源ZIP/Windows构建源码ZIP均不改写。完整云端artifact在`output/windows-native-20261030/run-10-artifacts.zip`，解压材料、完整日志、收据、installer-readback-verification.json、reconstructed-bundle-manifest.json及delivery.json均在该输出目录。云端artifact保留7天，本地副本不依赖其期限。
+
+stage-result.json中的installer_built=false是编译前暂存阶段的原始记录，保留不篡改；最终构建/安装结果以installer-results.json、installation-results.json及completion.json为准。Windows11人工界面/干净机、真实WHPX/来宾/课程、升级迁移回退、签名及G0/G1仍未关闭。云端仅自动检查自有窗口，不冒称完整UI人工验收；没有VM启动/停止或个人资产删除。
+
+本地最终准备器17项、PE11项通过；相关package19项和inventory10项通过，详见本轮对应日志。最后仅补文档与一项源漂移测试时，以[skip ci]保存到同一获批分支，构建脚本/工作流输入不变，不重新生成相同安装器。候选仍不公开Release，不修改默认分支或本地HEAD。
