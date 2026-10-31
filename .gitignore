@@ -161,3 +161,11 @@ probes/
 !/docs/verification-wintermute-pack-20261014.md
 
 !/docs/verification-gui-20261015.md
+
+!/.github/
+
+!/.github/ISSUE_TEMPLATE/
+
+!/.github/ISSUE_TEMPLATE/问题反馈.md
+
+!/.github/SECURITY.md
