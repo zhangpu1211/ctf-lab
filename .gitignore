@@ -104,3 +104,11 @@ __pycache__/
 runtime/
 logs/
 probes/
+
+!/.github/
+
+!/.github/ISSUE_TEMPLATE/
+
+!/.github/ISSUE_TEMPLATE/问题反馈.md
+
+!/.github/SECURITY.md
