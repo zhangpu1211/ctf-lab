@@ -1,5 +1,7 @@
 # CTFLab 当前状态与文档入口
 
+> 最新双平台预览（2026-11-01）：GitHub预发布`v0.1.4-preview.20261101`已发布Apple Silicon Mac包与Windows x64 NSIS安装器；Windows云端原生构建、安装/卸载和载荷检查通过。两端仍为未公证/未签名预览，G0/G1、Windows 11实机、WHPX与用户试点门槛继续开放；详见第179节。
+
 > 最新交付（2026-10-30）：第139节0.1.4双端UI与Mac预览发布。Mac可执行包已发布，Windows同步提供最新版构建源码，**没有Windows EXE安装器**；暂无Windows原生环境，原生构建/安装验收未完成。旧版保留，43项/G0/G1仍开放。
 
 > 最新开发入口（2026-10-28）：第113节来宾准备恢复桌面接入与Windows PE静态依赖核对；全部未关闭判据继续保留。源码未打包发布，原生平台/安装/课程/43项/G0/G1仍未完成。
@@ -21,7 +23,7 @@
 | 对象 | 当前入口 | 边界 |
 |---|---|---|
 | 源码工作区 | `/Users/pufei/Downloads/ctf-lab` | 保留现有未提交修改；不是新的已发布 App |
-| 已发布软件 | 镜像库 `03-软件/CTFLab-0.1.4-preview.20261030` 中新App；本轮下载包见第139节 | GitHub预发布v0.1.4-preview.20261030；Apple Silicon、macOS 26+，ad-hoc、未公证；旧0.1.2及更旧包保留 |
+| 已发布软件 | GitHub预发布`v0.1.4-preview.20261101`（Mac Apple Silicon + Windows x64）；镜像库`03-软件/CTFLab-0.1.4-preview.20261030`保留旧包 | 新Release含Mac ZIP、Windows NSIS安装器、源码归档、Windows构建证据与SHA-256清单；镜像库尚未同步本轮新包。预览边界与历史包分别记录 |
 | 可迁移镜像库 | `/Users/pufei/Downloads/CTFLab-Library` | `01-待处理` 保存原始输入；`02-已处理` 保存三节点包及独立 Acfun 本地适配包；不含运行进度 |
 
 旧 worktree、历史 build/e2e 目录不再是使用入口。保留历史文档里的路径只用于追溯，清理后的文件不能继续按旧命令调用。
@@ -3090,3 +3092,19 @@ r4/r5验收与清理核验：daemon inactive、r4目录/netns全清、ctflab-att
 ## 178. operator密钥撤销核验与Mac侧私钥销毁（2026-11-01）
 
 用户执行撤键意图明确但命令两次未生效（sudo遗留root属主ak.tmp阻断重定向+grep -v全过滤返回码1中断&&链）——经既有SSH通道代为执行修正版（新临时名+mv，`|| true`吸收grep返回码），authorized_keys清空后**SSH实测Permission denied**。Mac侧三把r4/r5私钥已销毁（摘要前缀记录于output/kali-deploy-r4-20261101/ssh-auth/revocation-record.json；公钥与回执保留作审计）。Kali侧残留：0字节root属主ak.tmp（cosmetic，用户可rm）。至此r4/r5全部临时授权彻底撤销。窗口两项补跑与G0明细仍待用户（§175入口不变）。无提交/推送/发布。
+
+
+## 179. v0.1.4双平台预览发布与Windows最新源码绑定（2026-11-01）
+
+用户本轮授权推送最新代码并向GitHub Release发布Mac与Windows程序，已在正式目录`/Users/pufei/Downloads/ctf-lab`完成。发布页：<https://github.com/zhangpu1211/ctf-lab/releases/tag/v0.1.4-preview.20261101>；状态为GitHub预发布，标签与发布代码提交为`ae5966b3bf28ccf714acf79f621bf0341af87835`，`main`与开发分支已同步推送。后续文档收口提交单独位于`main`，不改变上述标签与二进制来源。
+
+**发布前发现并修正**：旧Windows成功运行`41307994876`仍下载2026-10-30固定源码快照，不能作为最新代码证据；准备器改为对`GITHUB_SHA`执行归档并记录提交/逐文件摘要。首个新构建`41311767809`暴露摘要变量复用错误；修复后`41311921823`在核验安装载荷时又发现Windows白名单遗漏最新外部接入及场景模块，已取消并补齐12个本地模块。新增Python同类本地模块导入闭包测试，防止“窗口可开但延迟导入缺件”。最终Windows构建运行`41312707007`绑定`ae5966b`，原生构建、自动安装、载荷摘要、可见窗口、正常退出与卸载通过；artifact`13086810942`，安装器`CTFLab_0.1.4_x64-setup.exe`为302,976,558字节、NotSigned。
+
+**Release资产**（GitHub服务端摘要与本地一致）：
+- Mac `CTFLab-0.1.4-preview.20261101-macos-arm64.zip`，59,847,200字节，SHA-256 `df0784eb082a1d55d335564e2b631f53575e0ee485af05913e7fe0b2e01fd1f3`；内置App sidecar，可映射的132份项目源码与当前工作区一致，重新签名后`app verify`通过。
+- Windows `CTFLab-0.1.4-preview.20261101-windows-x64-setup.exe`，302,976,558字节，SHA-256 `3941fc423cf3e08ffb06cf200f118d122bd70835d23cd28094e0ccb68a7ff843`；来源清单记录499文件，安装器内已核对外部接入、场景运行等最新模块。
+- `CTFLab-0.1.4-preview.20261101-source.zip`，SHA-256 `62cda122342c85e4f03754df84a161d3d296b938a0069c620eb60251a3a91f89`；另有Windows构建证据ZIP与`SHA256SUMS.txt`。
+
+**本轮验证**：最终全量`output/release-20261101/full-regression-release.log`为2364项、0失败、23项条件跳过（389.916秒）；前端81项、Windows构建准备器18项、桌面包专项20项通过。Windows CI报告`installed_payload_matches=true`、`visible_native_window_observed=true`、`gui_normal_exit=true`、`uninstall_program_removed=true`、`application_data_sentinels_preserved=true`。
+
+**实际限制**：Windows构建环境是Windows Server 2025 x64，不是Windows 11用户机；`windows_11_verified`、`whpx_or_vm_or_course_verified`、`manual_ui_verified`均为false，Mac ad-hoc且未公证、Windows Authenticode NotSigned。G0/G1、干净机升级回退、真实WHPX/来宾/课程及用户试点继续开放。本轮未启动或停止用户VM、未连接真实网络、未删除用户资产。可恢复入口：后续在获准Windows x64实机按`docs/ctflab-g0-acceptance-plan-2026-11-01.md`验收并补签。
