@@ -24,6 +24,13 @@ from dataclasses import dataclass
 import re
 from typing import Any, BinaryIO, Iterable
 
+if __package__ in (None, ''):
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+from ctflab_external_l2 import FrameGate, SessionQuota
+from ctflab_external_attach import challenge_token
+
+AUTH_LIMIT_BYTES = 512
+
 
 HUB_HOST = "127.0.0.1"
 SERVER_IP = "192.168.242.1"
@@ -188,10 +195,22 @@ class FrameRateLimiter:
 class PcapWriter:
     """写入标准 Ethernet PCAP，供 Wireshark/tcpdump 离线分析。"""
 
-    def __init__(self, path: Path):
-        self.path = path.expanduser().resolve()
+    def __init__(self, path: Path, *, max_bytes: int = 64*1024*1024, instance_uuid=None, generation=None, network_id=None):
+        if type(max_bytes) is not int or not 24<=max_bytes<=1024**3:
+            raise ValueError('PCAP配额必须在24字节到1GiB之间')
+        selected=path.expanduser().absolute()
+        if selected.is_symlink() or selected.exists() and getattr(selected.lstat(),'st_file_attributes',0)&0x400:
+            raise ValueError('PCAP文件不能为链接或重解析点')
+        # 先固定用户明确选择的目录，兼容macOS /var和/tmp系统别名；最终文件仍独占创建。
+        self.path=selected.parent.resolve()/selected.name
+        if self.path.with_suffix(self.path.suffix+'.capture.json').exists():
+            raise FileExistsError('已有采集元数据，保留原件')
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.handle: BinaryIO = self.path.open("wb")
+        self.max_bytes=max_bytes;self.bytes_written=24;self.frames_written=0
+        self.frames_dropped_quota=0;self.frames_truncated_snaplen=0
+        self.binding={'instance_uuid':instance_uuid,'generation':generation,'network_id':network_id}
+        fd=os.open(self.path,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
+        self.handle: BinaryIO = os.fdopen(fd,'wb')
         self.handle.write(struct.pack("<IHHIIII", 0xA1B2C3D4, 2, 4, 0, 0, PCAP_SNAPLEN, 1))
         self.handle.flush()
 
@@ -200,12 +219,29 @@ class PcapWriter:
         seconds = int(moment)
         microseconds = int((moment - seconds) * 1_000_000)
         captured = frame[:PCAP_SNAPLEN]
+        if self.bytes_written+16+len(captured)>self.max_bytes:
+            self.frames_dropped_quota+=1
+            return
         self.handle.write(struct.pack("<IIII", seconds, microseconds, len(captured), len(frame)))
         self.handle.write(captured)
         self.handle.flush()
+        self.bytes_written+=16+len(captured);self.frames_written+=1
+        self.frames_truncated_snaplen+=int(len(captured)<len(frame))
+
+    def summary(self):
+        return {'max_bytes':self.max_bytes,'bytes_written':self.bytes_written,'frames_written':self.frames_written,
+                'frames_dropped_quota':self.frames_dropped_quota,'frames_truncated_snaplen':self.frames_truncated_snaplen,
+                'upstream_loss':'unknown','clock':'host-wall-clock-unverified','binding':self.binding}
 
     def close(self) -> None:
+        if self.handle.closed:return
+        self.handle.flush();os.fsync(self.handle.fileno())
         self.handle.close()
+        metadata=self.path.with_suffix(self.path.suffix+'.capture.json')
+        fd=os.open(metadata,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
+        with os.fdopen(fd,'w',encoding='utf-8') as stream:
+            json.dump(self.summary(),stream,ensure_ascii=False,sort_keys=True)
+            stream.flush();os.fsync(stream.fileno())
 
 
 def dhcp_request_from_frame(frame: bytes) -> tuple[str, bytes, int, int, int, dict[int, bytes]] | None:
@@ -337,6 +373,8 @@ class DHCPServer:
         instance_uuid: str | None = None,
         network_id: str | None = None,
         generation: int | None = None,
+        external: dict | None = None,
+        external_listener_fd: int | None = None,
     ):
         self.config = config or DHCPConfig()
         self.port = port
@@ -368,12 +406,54 @@ class DHCPServer:
         self.client_count = 0
         self.switch = LearningSwitch()
         self.rate_limiter = FrameRateLimiter(max_frames_per_second)
-        self.pcap = PcapWriter(pcap_path) if pcap_path else None
+        self.pcap = PcapWriter(pcap_path,instance_uuid=instance_uuid,generation=generation,network_id=network_id) if pcap_path else None
         self.frames_received = 0
         self.frames_forwarded = 0
         self.frames_generated = 0
         self.frames_dropped_rate_limit = 0
+        self.frames_dropped_gate = 0
         self.last_state_write = 0.0
+        # 外部接入口：仅在本代次计划预留槽位时启用；认证通过前不进入交换。
+        self.external = self._prepare_external(external)
+        self.external_listener_fd = external_listener_fd
+        self.external_gate = (FrameGate(self.external["gate_policy"])
+                              if self.external else None)
+        self.external_peer: socket.socket | None = None
+        self.external_pending: dict[socket.socket, dict] = {}
+        self._external_buffer = bytearray()
+        self._clients: dict[socket.socket, bytearray] = {}
+        self.external_quota = None
+
+    def _prepare_external(self, external):
+        if external is None:
+            return None
+        require_keys = {'mac', 'address', 'secret'}
+        if type(external) is not dict or not require_keys <= set(external) <= require_keys | {'allowed_macs'}:
+            raise ValueError("外部接入配置字段错误")
+        mac = external["mac"].lower()
+        address = str(ipaddress.IPv4Address(external["address"]))
+        if not re.fullmatch(r"[0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){5}", mac) or mac_bytes(mac)[0] & 1:
+            raise ValueError("外部预约MAC必须为本地单播")
+        if not re.fullmatch(r"[0-9a-f]{64}", external["secret"]):
+            raise ValueError("外部接入秘密必须为64位十六进制")
+        if not self.config.usable(ipaddress.IPv4Address(address)) or address == self.config.server_ip:
+            raise ValueError("外部预约地址无效")
+        if mac == self.config.server_mac.lower() or mac in self.static_leases:
+            raise ValueError("外部预约MAC与登记冲突")
+        if address in set(self.static_leases.values()):
+            raise ValueError("外部预约地址与登记冲突")
+        # 预约进入静态租约表：池内地址被排除，Kali始终使用静态配置。
+        self.static_leases[mac] = address
+        allowed = {value.lower() for value in external.get("allowed_macs", [])}
+        allowed.add(self.config.server_mac.lower())
+        gate_policy = {'schema': 1, 'cidr': self.config.cidr, 'address': address,
+                       'mac': mac, 'mtu': 1400, 'limits': {'max_frames_per_second': 1000,
+                       'burst_frames': 250, 'max_bytes': 2**30, 'max_seconds': 7200,
+                       'queue_frames': 256},
+                       'allowed_macs': sorted(allowed)}
+        return {'mac': mac, 'address': address, 'secret': external["secret"],
+                'gate_policy': gate_policy, 'authenticated_as': None,
+                'frames_in': 0, 'frames_out': 0, 'frames_dropped': 0}
 
     def write_state(self) -> None:
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
@@ -398,11 +478,20 @@ class DHCPServer:
             "learned_macs": self.switch.learned_macs(),
             "rate_limit_frames_per_second": self.rate_limiter.max_frames_per_second,
             "pcap_path": str(self.pcap.path) if self.pcap else None,
+            "capture": self.pcap.summary() if self.pcap else None,
             "counters": {
                 "received": self.frames_received,
                 "forwarded": self.frames_forwarded,
                 "generated": self.frames_generated,
                 "dropped_rate_limit": self.frames_dropped_rate_limit,
+                "dropped_external_gate": self.frames_dropped_gate,
+            },
+            "external": None if not self.external else {
+                "mac": self.external["mac"], "address": self.external["address"],
+                "authenticated_session": self.external["authenticated_as"],
+                "frames_in": self.external["frames_in"], "frames_out": self.external["frames_out"],
+                "frames_dropped": self.external["frames_dropped"],
+                "port": self.external.get("port"),
             },
             "updated_at": now_iso(),
         }
@@ -489,6 +578,192 @@ class DHCPServer:
                 raise ConnectionError("实验网连接已关闭")
             packet = packet[sent:]
 
+    # ---- 外部攻击机接入口（仅本代次计划预留时启用） ----
+
+    def _prepare_external_listener(self) -> socket.socket | None:
+        if self.external is None or self.external_listener_fd is None:
+            return None
+        listener = socket.socket(fileno=self.external_listener_fd)
+        try:
+            valid = (listener.family == socket.AF_INET
+                     and listener.getsockopt(socket.SOL_SOCKET, socket.SO_TYPE) == socket.SOCK_STREAM)
+            name = listener.getsockname()
+            if not valid or name[0] != HUB_HOST or name[1] == self.port:
+                raise ValueError("外部接入口端点无效")
+        except OSError as error:
+            listener.close()
+            raise ValueError("外部接入口端点无效") from error
+        self.external["port"] = name[1]
+        listener.setblocking(False)
+        return listener
+
+    def _accept_external(self, listener: socket.socket) -> None:
+        if self.external_peer is not None or self.external_pending:
+            # 已有认证中或已连接的会话：先收口，不并发第二会话。
+            return
+        try:
+            peer, _address = listener.accept()
+        except OSError:
+            return
+        peer.setblocking(False)
+        self.external_pending[peer] = {"buffer": b"", "attempts": 0}
+
+    def _read_external_auth(self, peer: socket.socket, entry: dict) -> None:
+        try:
+            chunk = peer.recv(AUTH_LIMIT_BYTES)
+        except (ConnectionError, OSError):
+            self._drop_external("auth-transport")
+            return
+        if not chunk:
+            self._drop_external("auth-closed")
+            return
+        entry["buffer"] += chunk
+        if len(entry["buffer"]) > AUTH_LIMIT_BYTES:
+            self._drop_external("auth-oversize")
+            return
+        if b"\n" not in entry["buffer"]:
+            entry["attempts"] += 1
+            if entry["attempts"] > 4:
+                self._drop_external("auth-slow")
+            return
+        line, _, rest = entry["buffer"].partition(b"\n")
+        entry["buffer"] = rest
+        if "challenge" not in entry:
+            try:
+                text = line.decode("ascii")
+                scheme, session, nonce_relay = text.split()
+            except (UnicodeDecodeError, ValueError):
+                self._drop_external("auth-format")
+                return
+            if scheme != "AUTH" or not re.fullmatch(r"[0-9a-f-]{36}", session) \
+                    or not re.fullmatch(r"[0-9a-f]{32}", nonce_relay):
+                self._drop_external("auth-format")
+                return
+            nonce_switch = os.urandom(16).hex()
+            entry["challenge"] = {"session": session, "nonce_relay": nonce_relay,
+                                  "nonce_switch": nonce_switch,
+                                  "expected": challenge_token(self.external["secret"], session,
+                                                              nonce_switch, nonce_relay)}
+            try:
+                peer.sendall(f"CHALLENGE {nonce_switch}\n".encode())
+            except OSError:
+                self._drop_external("auth-send")
+            entry["attempts"] += 1
+            if entry["attempts"] > 6:
+                self._drop_external("auth-attempts")
+            return
+        token = line.strip()[6:].decode("ascii", "replace") if line.strip().startswith(b"TOKEN ") else None
+        challenge = entry.pop("challenge")
+        if token is None or token != challenge["expected"]:
+            self._drop_external("auth-token")
+            return
+        self.external_pending.pop(peer, None)
+        self.external_peer = peer
+        self.external["authenticated_as"] = challenge["session"]
+        self.external_quota = SessionQuota(self.external["gate_policy"]["limits"])
+        self._external_buffer = bytearray()
+        try:
+            peer.sendall(f"READY {challenge['session']}\n".encode())
+        except OSError:
+            self._drop_external("ready-send")
+            return
+        self.write_state()
+        print("External attach authenticated", flush=True)
+
+    def _read_external_peer(self) -> None:
+        peer = self.external_peer
+        if peer is None:
+            return
+        try:
+            chunk = peer.recv(65536)
+        except (ConnectionError, OSError):
+            chunk = b""
+        if not chunk:
+            self._drop_external("closed")
+            return
+        self._external_buffer.extend(chunk)
+        while len(self._external_buffer) >= 4:
+            frame_length = struct.unpack("!I", self._external_buffer[:4])[0]
+            if frame_length < 14 or frame_length > 65536:
+                self._drop_external("bad-length")
+                return
+            if len(self._external_buffer) < 4 + frame_length:
+                break
+            frame = bytes(self._external_buffer[4:4 + frame_length])
+            del self._external_buffer[:4 + frame_length]
+            self._external_ingress(frame)
+        self.maybe_write_state()
+
+    def _external_ingress(self, frame: bytes) -> None:
+        if self.external_gate is None or not self.external_gate.ingress(frame):
+            self.frames_dropped_gate += 1
+            if self.external:
+                self.external["frames_dropped"] += 1
+            return
+        broadcast = frame[:6] == b"\xff" * 6
+        if not self.external_quota.consume(len(frame), broadcast=broadcast):
+            if self.external:
+                self.external["frames_dropped"] += 1
+            return
+        self.external["frames_in"] += 1
+        self.frames_received += 1
+        if self.pcap:
+            self.pcap.write(frame)
+        for other in self.switch.forwarding_targets(self.external_peer, frame, list(self._clients_view())):
+            try:
+                self.send_frame(other, frame)
+                self.frames_forwarded += 1
+            except (ConnectionError, OSError):
+                other.close()
+                self._clients_view().pop(other, None)
+                self.forget_client(other)
+        response = self.dhcp_response(frame)
+        if response is not None:
+            if self.pcap:
+                self.pcap.write(response)
+            self.send_frame(self.external_peer, response)
+            self.frames_generated += 1
+
+    def _external_egress(self, frame: bytes) -> bool:
+        if self.external_gate is None:
+            return False
+        allowed = self.external_gate.egress(frame)
+        if not allowed:
+            self.frames_dropped_gate += 1
+            if self.external:
+                self.external["frames_dropped"] += 1
+            return False
+        if not self.external_quota.consume(len(frame), broadcast=frame[:6] == b"\xff" * 6):
+            if self.external:
+                self.external["frames_dropped"] += 1
+            return False
+        self.external["frames_out"] += 1
+        return True
+
+    def _clients_view(self):
+        return self._clients
+
+    def _drop_external(self, reason: str) -> None:
+        peer = self.external_peer
+        if peer is not None:
+            self.switch.forget(peer)
+            try:
+                peer.close()
+            except OSError:
+                pass
+        for pending in list(self.external_pending):
+            try:
+                pending.close()
+            except OSError:
+                pass
+        self.external_pending.clear()
+        self.external_peer = None
+        self._external_buffer = bytearray()
+        if self.external:
+            self.external["authenticated_as"] = None
+            self.write_state()
+        print(f"External attach dropped: {reason}", flush=True)
+
     def serve(self) -> int:
         import select
 
@@ -510,13 +785,30 @@ class DHCPServer:
             listener.bind((HUB_HOST, self.port))
             listener.listen(8)
         listener.setblocking(False)
+        external_listener = self._prepare_external_listener()
         clients: dict[socket.socket, bytearray] = {}
+        self._clients = clients
         self.write_state()
         print(f"L2 hub + DHCP listening on tcp://{HUB_HOST}:{self.port}", flush=True)
         try:
             while self.running:
-                readable, _, _ = select.select([listener, *clients], [], [], 1.0)
+                watch = [listener]
+                if external_listener is not None:
+                    watch.append(external_listener)
+                if self.external_peer is not None:
+                    watch.append(self.external_peer)
+                watch.extend(self.external_pending)
+                readable, _, _ = select.select([*watch, *clients], [], [], 1.0)
                 for current in readable:
+                    if external_listener is not None and current is external_listener:
+                        self._accept_external(external_listener)
+                        continue
+                    if self.external_peer is not None and current is self.external_peer:
+                        self._read_external_peer()
+                        continue
+                    if current in self.external_pending:
+                        self._read_external_auth(current, self.external_pending[current])
+                        continue
                     if current is listener:
                         peer, _address = listener.accept()
                         peer.setblocking(False)
@@ -558,14 +850,23 @@ class DHCPServer:
                         if self.pcap:
                             self.pcap.write(frame)
 
-                        for other in self.switch.forwarding_targets(current, frame, clients):
+                        peers = list(clients)
+                        if self.external_peer is not None:
+                            peers.append(self.external_peer)
+                        for other in self.switch.forwarding_targets(current, frame, peers):
+                            if self.external_peer is not None and other is self.external_peer:
+                                if not self._external_egress(frame):
+                                    continue
                             try:
                                 self.send_frame(other, frame)
                                 self.frames_forwarded += 1
                             except (ConnectionError, OSError):
                                 other.close()
-                                clients.pop(other, None)
-                                self.forget_client(other)
+                                if other is self.external_peer:
+                                    self._drop_external("send-failed")
+                                else:
+                                    clients.pop(other, None)
+                                    self.forget_client(other)
 
                         response = self.dhcp_response(frame)
                         if response is None:
@@ -582,6 +883,9 @@ class DHCPServer:
                 peer.close()
             listener.close()
             self.client_count = 0
+            self._drop_external("shutdown")
+            if external_listener is not None:
+                external_listener.close()
             if self.pcap:
                 self.pcap.close()
             self.write_state()
@@ -605,6 +909,12 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--instance-uuid")
     parser.add_argument("--network-id", choices=("outer", "inner"))
     parser.add_argument("--generation", type=int)
+    parser.add_argument("--external-mac", help="外部攻击机预约MAC（启用认证接入口）")
+    parser.add_argument("--external-address", help="外部攻击机预约IPv4")
+    parser.add_argument("--external-secret", help="外部接入一次性挑战秘密（16进制64位）")
+    parser.add_argument("--external-listener-fd", type=int, help=argparse.SUPPRESS)
+    parser.add_argument("--external-allowed-mac", action="append", default=[],
+                        metavar="MAC", help="本网段允许发往外部口的节点MAC")
     return parser.parse_args(argv)
 
 
@@ -622,6 +932,12 @@ def main() -> int:
         static_leases[mac.lower()] = address
     if args.max_frames_per_second <= 0:
         raise SystemExit("--max-frames-per-second 必须为正整数")
+    external = None
+    if any(value is not None for value in (args.external_mac, args.external_address, args.external_secret)):
+        if args.external_mac is None or args.external_address is None or args.external_secret is None:
+            raise SystemExit("--external-* 三项必须同时提供")
+        external = {"mac": args.external_mac, "address": args.external_address,
+                    "secret": args.external_secret, "allowed_macs": args.external_allowed_mac}
     server = DHCPServer(
         args.port,
         static_leases,
@@ -633,6 +949,8 @@ def main() -> int:
         instance_uuid=args.instance_uuid,
         network_id=args.network_id,
         generation=args.generation,
+        external=external,
+        external_listener_fd=args.external_listener_fd,
     )
     signal.signal(signal.SIGTERM, lambda _signum, _frame: setattr(server, "running", False))
     signal.signal(signal.SIGINT, lambda _signum, _frame: setattr(server, "running", False))

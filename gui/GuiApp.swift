@@ -6,33 +6,106 @@
 import AppKit
 import SwiftUI
 
+struct PublicDiagnosticsSheet: View {
+    @ObservedObject var model: GuiModel
+    let snapshot: MacPublicDiagnostics
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("分享诊断摘要").font(.title2)
+            Text("只包含软件版本、系统类型和匿名节点阶段。摘要来自当前列表快照，可能已过期，不代表来宾或服务验收。")
+            Text("下方内容就是将保存的完整文件。不会包含路径、账号、节点原名、进程号或日志，也不会自动上传。")
+                .font(.caption).foregroundStyle(.secondary)
+            ScrollView {
+                Text(snapshot.text).font(.system(.caption, design: .monospaced)).textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }.frame(minHeight: 320)
+            if !model.publicDiagnosticsError.isEmpty { Text(model.publicDiagnosticsError).foregroundStyle(.red) }
+            HStack {
+                Spacer()
+                Button("关闭") { model.publicDiagnostics = nil }
+                Button("保存此预览…") { model.savePublicDiagnostics(snapshot) }.keyboardShortcut(.defaultAction)
+            }
+        }.padding(20).frame(width: 680, height: 500)
+    }
+}
+
 // MARK: - 运行模型
-
-enum CliOutcome {
-    case success(String)
-    case failure(String)
-}
-
-/// 子进程输出的线程安全缓冲（读取句柄与结束回调可能在不同队列）。
-final class OutputBuffer: @unchecked Sendable {
-    private let lock = NSLock()
-    private var data = Data()
-
-    func append(_ chunk: Data) {
-        lock.lock()
-        data.append(chunk)
-        lock.unlock()
-    }
-
-    func text() -> String {
-        lock.lock()
-        defer { lock.unlock() }
-        return String(data: data, encoding: .utf8) ?? ""
-    }
-}
 
 @MainActor
 final class GuiModel: ObservableObject {
+    @Published var publicDiagnostics: MacPublicDiagnostics?
+    @Published var publicDiagnosticsError = ""
+    @Published var sceneGeneric = true
+    @Published var sceneRuntimeProfile = ""
+    @Published var sceneLocalView: MacRemoteJSON?
+    @Published var sceneExternalAttach: MacRemoteJSON?
+    @Published var sceneAttachForm: [String: String] = [:]
+    @Published var showScenarioWorkspace = false
+    @Published var sceneInstance = UUID().uuidString.lowercased()
+    @Published var sceneManifest = ""
+    @Published var sceneManifestSHA = ""
+    @Published var sceneAssets: [String: String] = [:]
+    @Published var sceneFirmware: [String: [String]] = [:]
+    @Published var scenePlan: MacRemoteJSON?
+    @Published var sceneSourceManifest: MacRemoteJSON?
+    @Published var sceneReply: MacRemoteJSON?
+    @Published var sceneSnapshot: String?
+    @Published var sceneDraft: MacRemoteJSON = .null
+    @Published var sceneDraftDiff: MacRemoteJSON = .null
+    @Published private(set) var sceneDraftHistory: MacGraphHistory?
+    @Published var sceneDraftContext = ""
+    @Published var sceneGraphOpen = false
+    @Published var sceneDraftNodeName = ""
+    @Published var sceneDraftAsset = ""
+    @Published var sceneDraftNetworkName = ""
+    @Published var sceneDraftCIDR = ""
+    @Published var sceneHistory: [MacSavedOperation] = []
+    @Published var sceneHistoryHasNext = false
+    @Published var sceneHistoryRecord: MacSavedRecord?
+    @Published var sceneEvents: [MacRemoteJSON] = []
+    @Published var sceneEventNotice = ""
+    private var sceneHistoryNext: String?
+    private var sceneEventCursor = 0
+    private var sceneDraftRevision = 0
+    private var sceneLastRequest: MacRemoteJSON?
+    private var sceneCallTicket: UUID?
+    @Published var sceneWorkspaceBusy = false
+    @Published var sceneEmulation = false
+    @Published var sceneNewGeneration = "2"
+    @Published var sceneMessage = "先选择场景清单查看设计；读取状态不会准备或启动。"
+    @Published var showRemoteWorkspace = false
+    @Published var remoteTargets: [MacSavedTarget] = []
+    @Published var remoteSelected = ""
+    @Published var remoteConfig = ""
+    @Published var remoteLabel = ""
+    @Published var remoteWizard = ["host": "", "port": "22", "user": "", "server_uuid": "", "identity": "", "known_hosts": ""]
+    @Published var remoteContext: MacRemoteContext?
+    @Published var remoteInstance = ""
+    @Published var remoteView: MacRemoteJSON = .null
+    @Published var remoteLeases: MacRemoteJSON = .null
+    @Published var remoteLease = ""
+    @Published var remoteTTL = "1800"
+    @Published var remoteStopConsent = false
+    @Published var remotePending: [MacRemoteJSON] = []
+    @Published var remotePendingKnown = false
+    @Published var remoteAdminOpen = false
+    @Published var remoteOffers: [MacRemoteJSON] = []
+    @Published var remoteOffer = ""
+    @Published var remoteCourseInstance = ""
+    @Published var remoteCoursePlan: MacRemoteJSON = .null
+    @Published var remoteAudit: MacRemoteJSON = .null
+    @Published var remoteAuditPlan: MacRemoteJSON = .null
+    @Published var remoteBusy = false
+    @Published var remoteMessage = "读取保存列表不会连接服务器。"
+    @Published var remoteConnectionID: String?
+    @Published var remoteUploads: [MacRemoteJSON] = []
+    @Published var remoteDownloads: [MacRemoteJSON] = []
+    @Published var remoteExports: [MacRemoteJSON] = []
+    @Published var remoteAssetFile = ""
+    @Published var remoteAssetSource = ""
+    @Published var remoteTransferID: (kind: String, id: String)?
+    private var remoteEpoch = 0
+    private var remoteHistoryInFlight = false
     @Published var state = GuiState()
     @Published var log: String = ""
     @Published var verifyRows: [DistEntry] = []
@@ -1028,11 +1101,44 @@ final class GuiModel: ObservableObject {
         }
     }
 
+    func previewPublicDiagnostics() {
+        guard !state.phase.isBusy, !nodes.isEmpty else {
+            state.lastError = "请先检查状态，再预览诊断摘要。"; return
+        }
+        #if arch(arm64)
+        let machine = "arm64"
+        #elseif arch(x86_64)
+        let machine = "x86_64"
+        #else
+        let machine = "unknown"
+        #endif
+        publicDiagnosticsError = ""
+        do {
+            publicDiagnostics = try MacPublicDiagnostics.preview(nodes,
+                version: Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "unknown",
+                machine: machine)
+        } catch { publicDiagnostics = nil; state.lastError = "无法生成诊断摘要；没有导出任何文件。" }
+    }
+
+    func savePublicDiagnostics(_ snapshot: MacPublicDiagnostics) {
+        guard publicDiagnostics?.id == snapshot.id else { return }
+        publicDiagnosticsError = ""
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = "ctflab-share-summary.json"
+        panel.message = "保存当前预览的匿名摘要；不会上传，也不会重新采集状态。"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            try snapshot.save(to: url)
+            publicDiagnostics = nil
+            NSWorkspace.shared.activateFileViewerSelecting([url])
+        } catch { publicDiagnosticsError = "摘要保存未完成。请使用新文件名；已有文件保留，不会覆盖。" }
+    }
+
     func exportDiagnostics() {
         guard !state.phase.isBusy else { return }
         let panel = NSSavePanel()
         panel.nameFieldStringValue = "ctflab-diagnostics-\(UUID().uuidString.prefix(8)).json"
-        panel.message = "包含运行状态、路径与脱敏日志尾行；不含口令和剪贴板正文。请检查后再分享。"
+        panel.message = "包含运行状态、路径与日志尾行，可能含敏感信息，仅供本机排查。公开反馈请用“分享诊断摘要”。"
         guard panel.runModal() == .OK, let url = panel.url else { return }
         if FileManager.default.fileExists(atPath: url.path) {
             state.lastError = "请使用新文件名；诊断导出不会覆盖已有文件。"
@@ -1219,6 +1325,295 @@ final class GuiModel: ObservableObject {
         }
     }
 
+    var sceneHasCurrent: Bool { sceneGeneric ? sceneLocalView != nil : sceneSnapshot != nil }
+    func sceneGenericAllowed(_ action: String) -> Bool {
+        guard !sceneWorkspaceBusy, let view = sceneLocalView else { return false }
+        let status = view["status"], state = status["state"].text ?? "unknown"
+        if action == "cancel" { return status["operation_id"].text != nil && ["accepted", "unknown"].contains(status["result"].text ?? "") }
+        if status["result"].text == "accepted" || view["execution"]["identity"].text == "running" { return false }
+        if action != "recover" && !MacObservationWindow.fresh(view) { return false }
+        if action == "start" && (view["runtime"]["dependencies"]["tls_control"].flag == false || view["runtime"]["emulation_required"].flag == true && !sceneEmulation) { return false }
+        switch action {
+        case "prepare": return view["generation"].integer == 0 && state == "unknown"
+        case "start", "reset": return ["prepared", "stopped"].contains(state)
+        case "stop": return ["process-running", "guest-ready", "service-ready", "recovery-required"].contains(state)
+        case "recover": return (view["generation"].integer ?? 0) > 0
+        case "guest": return state == "process-running"
+        default: return false
+        }
+    }
+    func sceneGenericCall(_ payload: [String: MacRemoteJSON]) {
+        guard !sceneWorkspaceBusy, MacRemoteRules.uuid(sceneInstance) else { return }
+        do {
+            let encoded = try MacRemoteJSON.object(["instance_uuid": .string(sceneInstance), "payload": .object(payload)]).encoded()
+            let context = sceneInstance, action = payload["action"]?.text ?? "", revision = sceneDraftRevision
+            let ticket = UUID(); sceneCallTicket = ticket
+            sceneWorkspaceBusy = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + 30) { [weak self] in
+                guard let self, self.sceneCallTicket == ticket else { return }
+                self.sceneCallTicket = nil; self.sceneWorkspaceBusy = false
+                guard self.sceneGeneric, self.sceneInstance == context else { return }
+                if let old = self.sceneLocalView { self.sceneLocalView = MacObservationWindow.invalidated(old) }
+                self.sceneMessage = "请求暂未返回，结果可能已记录；请读取状态或查询原请求。不会自动重发，也不终止后台工作。"
+            }
+            if action != "draft" && action != "overview" && action != "query-request" && action != "external-attach-status"
+                && action != "operation-history" && action != "operation-result" && action != "events" { sceneLocalView = nil; sceneSnapshot = nil }
+            run(.genericClient(json: encoded)) { [weak self] outcome in
+                guard let self, self.sceneCallTicket == ticket else { return }
+                self.sceneCallTicket = nil; self.sceneWorkspaceBusy = false
+                guard self.sceneGeneric, self.sceneInstance == context else { return }
+                let output: String
+                switch outcome { case .success(let v), .failure(let v): output = v }
+                do {
+                    let reply = try MacRemoteJSON.decode(output)
+                    if let message = reply["error"]["message"].text { if let old = self.sceneLocalView { self.sceneLocalView = MacObservationWindow.invalidated(old) }; self.sceneMessage = message; return }
+                    self.sceneReply = reply
+                    if action == "preview" {
+                        self.scenePlan = reply["plan"]; self.sceneSourceManifest = reply["source_manifest"]; self.sceneManifestSHA = reply["manifest_sha256"].text ?? ""
+                        self.sceneMessage = "通用设计已校验；尚未配置、复制或启动。"
+                    } else if action == "instances", reply["state"].text == "listed" {
+                        self.sceneMessage = reply["reports"].items.isEmpty ? "还没有通用实验。到模板页选择场景设计、配置资产并建立实例。" : "已列出保存的实验；选择实例后读取状态，不会自动启动。"
+                    } else if action == "overview", reply["manifest"] != .null {
+                        self.sceneLocalView = reply; self.sceneSourceManifest = reply["manifest"]; self.scenePlan = .object(["manifest": reply["manifest"]]); self.sceneManifestSHA = ""
+                        self.sceneMessage = "已读取当前通用实例。进程、来宾、服务和课程验收分别核对。"
+                    } else if action == "external-attach-status", reply["state"].text == "external-attach-status" {
+                        self.sceneExternalAttach = reply
+                        self.sceneMessage = "外部攻击机状态已读取；连接/断开按前置条件开放。"
+                    } else if action == "query-request" {
+                        self.sceneMessage = reply["recorded"].flag == true ? "原请求记录已读取：" + (reply["response"]["state"].text ?? "结果待核对") + "；未派发操作。" : "暂未找到原请求；标识保留，不会自动重发。"
+                    } else if action == "operation-history" {
+                        do {
+                            let page = try MacHistoryPage(reply, instance: context)
+                            if let expected = self.sceneHistoryNext {
+                                guard page.operations.first?.operationID == expected else { throw MacRemoteError.invalid }
+                                self.sceneHistory += page.operations
+                            } else { self.sceneHistory = page.operations }
+                            self.sceneHistoryNext = page.nextBefore
+                            self.sceneHistoryHasNext = page.truncated
+                            self.sceneMessage = page.truncated ? "已读取已保存操作历史（只读），还有更早记录；可翻页或查看原响应。" : "已读取已保存操作历史（只读）；不含请求参数，不会自动重发。"
+                        } catch { self.sceneMessage = "历史回复无法核验，保留已读取内容；不自动重发。" }
+                    } else if action == "operation-result" {
+                        do {
+                            let record = try MacSavedRecord(reply, instance: context)
+                            self.sceneHistoryRecord = record
+                            self.sceneMessage = record.response == .null ? "该操作尚无已保存响应（历史）；当前状态以重新读取为准。" : "原响应已读取（历史）；未派发任何操作。"
+                        } catch { self.sceneMessage = "原响应回复无法核验，保留现场；不自动重发。" }
+                    } else if action == "events" {
+                        let result = MacEventPage.refresh(.number(Double(self.sceneEventCursor)), reply, view: self.sceneLocalView)
+                        self.sceneEventCursor = result.cursor
+                        if result.reload {
+                            self.sceneEvents = []
+                            self.sceneEventNotice = "事件序列已变化或无法核验，本地时间线已清空；请重新读取状态后再读取新事件，不会重发操作。"
+                        } else {
+                            self.sceneEvents = Array((self.sceneEvents + result.events).suffix(80))
+                            self.sceneEventNotice = result.events.isEmpty ? "暂无新事件。" : ""
+                        }
+                    } else if action == "draft", revision == self.sceneDraftRevision, self.sceneDraftContext == context {
+                        guard reply["applied"].flag == false, reply["requires_new_generation"].flag == true,
+                              reply["manifest"] == self.sceneDraft else { throw MacRemoteError.invalid }
+                        self.sceneDraftDiff = reply; self.sceneMessage = "草稿及差异已校验；未修改运行实例，可导出后配置新实例。"
+                    } else { self.sceneMessage = "本次请求已返回，请重新读取状态；结果未知时不自动重发。" }
+                } catch { if let old = self.sceneLocalView { self.sceneLocalView = MacObservationWindow.invalidated(old) }; self.sceneMessage = "回复无法核验，保留现场，不自动重发。" }
+            }
+        } catch { sceneMessage = "请求无法编码。" }
+    }
+    func sceneRequestGeneric(_ action: String, list: Bool = false) {
+        if list { sceneGenericCall(["action": .string("instances")]); return }
+        if action == "status" { sceneGenericCall(["action": .string("overview")]); return }
+        if action == "preview" { sceneGenericCall(["action": .string("preview"), "manifest": .string(sceneManifest)]); return }
+        if action == "configure" {
+            guard MacRemoteRules.digest(sceneManifestSHA), !sceneRuntimeProfile.isEmpty else { sceneMessage = "先预览清单并选择私有运行时配置。"; return }
+            sceneGenericCall(["action": .string("configure"), "manifest": .string(sceneManifest), "manifest_sha256": .string(sceneManifestSHA),
+                "assets": .object(sceneAssets.mapValues { .string($0) }), "profile": .string(sceneRuntimeProfile),
+                "nvram": .object(Dictionary(uniqueKeysWithValues: sceneUEFINodes.map { ($0, MacRemoteJSON.string(sceneFirmware[$0]?[1] ?? "")) }))]); return
+        }
+        guard sceneGenericAllowed(action), let view = sceneLocalView else { return }
+        var params: [String: MacRemoteJSON] = [:]
+        switch action {
+        case "prepare": params = ["course_id": .string("host"), "baseline_id": .string("host")]
+        case "start": params = ["display": .string("headless"), "allow_emulation": .bool(view["runtime"]["emulation_required"].flag == true && sceneEmulation)]
+        case "reset": params = ["baseline_id": .string("host")]
+        case "cancel": params = ["operation_id": view["status"]["operation_id"]]
+        default: break
+        }
+        sceneSubmit(action, params: params, view: view)
+    }
+    func sceneSubmit(_ operation: String, params: [String: MacRemoteJSON], view: MacRemoteJSON) {
+        let request: [String: MacRemoteJSON] = ["protocol": .string("ctflab-local"), "version": .number(1),
+            "request_id": .string(UUID().uuidString.lowercased()), "operation": .string(operation), "instance_uuid": .string(sceneInstance),
+            "expected_generation": operation == "prepare" ? .null : view["status"]["generation"],
+            "expected_state_revision": operation == "prepare" ? .null : view["status"]["state_revision"],
+            "idempotency_key": .string(UUID().uuidString.lowercased()), "parameters": .object(params)]
+        sceneLastRequest = .object(request)
+        sceneGenericCall(["action": .string("submit"), "request": .object(request)])
+    }
+    var sceneCanQueryOriginal: Bool { !sceneWorkspaceBusy && sceneLastRequest?["instance_uuid"].text == sceneInstance }
+    func sceneQueryOriginal() {
+        guard sceneCanQueryOriginal, let request = sceneLastRequest else { return }
+        sceneGenericCall(["action":.string("query-request"),"request":request])
+    }
+    // MARK: A03 持久历史与严格事件（只读；实例来自当前选择，主体来自本机进程，界面不能替换）
+    func sceneResetReadonly() {
+        sceneHistory = []; sceneHistoryNext = nil; sceneHistoryHasNext = false
+        sceneHistoryRecord = nil; sceneEvents = []; sceneEventCursor = 0; sceneEventNotice = ""
+    }
+    func sceneHistoryLoad() {
+        guard !sceneWorkspaceBusy, MacRemoteRules.uuid(sceneInstance) else { return }
+        sceneHistory = []; sceneHistoryNext = nil; sceneHistoryHasNext = false; sceneHistoryRecord = nil
+        sceneGenericCall(["action": .string("operation-history"), "limit": .number(20)])
+    }
+    func sceneHistoryNextPage() {
+        guard !sceneWorkspaceBusy, MacRemoteRules.uuid(sceneInstance), let before = sceneHistoryNext else { return }
+        sceneGenericCall(["action": .string("operation-history"), "limit": .number(20), "before": .string(before)])
+    }
+    func sceneSavedRecord(_ operationID: String) {
+        guard !sceneWorkspaceBusy, MacRemoteRules.uuid(operationID) else { return }
+        sceneGenericCall(["action": .string("operation-result"), "operation_id": .string(operationID)])
+    }
+    func sceneEventsRefresh() {
+        guard !sceneWorkspaceBusy, MacRemoteRules.uuid(sceneInstance) else { return }
+        sceneGenericCall(["action": .string("events"), "after": .number(Double(sceneEventCursor))])
+    }
+    func sceneGuest(_ node: String, _ action: String) {
+        guard sceneGenericAllowed("guest"), let view = sceneLocalView else { return }
+        sceneSubmit("guest", params: ["node": .string(node), "action": .string(action)], view: view)
+    }
+    func sceneGuestPreparation(_ node: String, target: String, resume: Bool) {
+        guard sceneGenericAllowed("guest"), let view = sceneLocalView else { return }
+        do {
+            let value = try MacGuestRecovery.parameters(view,node: node,target: target,resume: resume)
+            guard case .object(let params) = value else { return }
+            sceneSubmit("guest",params: params,view: view)
+        } catch { sceneMessage = "请先恢复核验实验进程，再核对原准备记录；现场变化后须重新核对。" }
+    }
+    func sceneRecoverPreparation(_ action: String) {
+        guard let view = sceneLocalView, MacObservationWindow.fresh(view), view["execution"]["identity"].text != "running" else { return }
+        let source = view[action == "resume-dispatch" ? "dispatch" : "preparation"]
+        guard source[action == "resume-dispatch" ? "resume_allowed" : "restart_allowed"].flag == true else { return }
+        sceneGenericCall(["action": .string(action), "instance_uuid": .string(sceneInstance), "operation_id": source["operation_id"],
+            "state_revision": source["state_revision"], "attempt_id": .string(UUID().uuidString.lowercased())])
+    }
+    func sceneLoadDraft() {
+        guard sceneGeneric, !sceneWorkspaceBusy, sceneLocalView != nil, let source = sceneSourceManifest else { return }
+        do { sceneDraft = try MacGraphDraft.checked(source); sceneDraftHistory = try MacGraphHistory(sceneDraft); sceneDraftContext = sceneInstance; sceneDraftRevision += 1; sceneDraftDiff = .null }
+        catch { sceneMessage = "当前清单无法显示为拓扑草稿。" }
+    }
+    func sceneEditDraft(_ transform: (MacRemoteJSON) throws -> MacRemoteJSON) {
+        guard !sceneWorkspaceBusy, sceneGeneric, sceneDraftContext == sceneInstance else { return }
+        do { let next = try transform(sceneDraft); var history = try sceneDraftHistory ?? MacGraphHistory(sceneDraft); try history.edit(next); sceneDraftHistory = history; sceneDraft = history.present; sceneDraftRevision += 1; sceneDraftDiff = .null }
+        catch { sceneMessage = "草稿操作未完成：核对资源范围、依赖循环、标识、可用地址、网段重叠或重复连接。" }
+    }
+    func sceneMoveDraft(_ redo: Bool) {
+        guard !sceneWorkspaceBusy, sceneGeneric, sceneDraftContext == sceneInstance, var history = sceneDraftHistory, history.present == sceneDraft else { return }
+        if redo { history.redo() } else { history.undo() }
+        sceneDraftHistory = history; sceneDraft = history.present; sceneDraftRevision += 1; sceneDraftDiff = .null
+    }
+    func sceneValidateDraft() {
+        guard sceneDraftContext == sceneInstance, sceneDraft != .null else { return }
+        sceneDraftDiff = .null; sceneGenericCall(["action": .string("draft"), "manifest": sceneDraft])
+    }
+    func sceneExportDraft() {
+        guard sceneDraftContext == sceneInstance, sceneDraftDiff["manifest"] == sceneDraft, sceneDraftDiff["applied"].flag == false else { return }
+        let picker = NSSavePanel(); picker.nameFieldStringValue = "ctflab-scenario-draft.json"
+        guard picker.runModal() == .OK, let url = picker.url else { return }
+        do {
+            let encoder = JSONEncoder(); encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+            try encoder.encode(sceneDraft).write(to: url, options: .withoutOverwriting)
+            sceneMessage = "已导出后端校验草稿；已有文件不覆盖。草稿导出不等于可执行模板；发布可执行模板须通过具体场景验收并绑定草稿摘要。"
+        } catch { sceneMessage = "草稿未导出，已有文件保留。" }
+    }
+    func sceneExport() {
+        guard let manifest = sceneSourceManifest, manifest != .null else { return }
+        let picker = NSSavePanel(); picker.nameFieldStringValue = "ctflab-scenario.json"
+        guard picker.runModal() == .OK, let url = picker.url else { return }
+        do { let encoder = JSONEncoder(); encoder.outputFormatting = [.prettyPrinted, .sortedKeys]; let data = try encoder.encode(manifest); guard data.count <= 4 * 1024 * 1024 else { throw MacRemoteError.invalid }; try data.write(to: url, options: .withoutOverwriting); sceneMessage = "已导出校验清单；已有文件不覆盖。" }
+        catch { sceneMessage = "导出未完成；已有文件保留。" }
+    }
+    func sceneDisplay(_ node: String) {
+        guard let view = sceneLocalView, MacObservationWindow.fresh(view), view["observations"][node]["state"].text == "process-running" else { return }
+        sceneGenericCall(["action": .string("display"), "node": .string(node)])
+    }
+    func sceneRearm(_ node: String) {
+        guard let view = sceneLocalView, MacObservationWindow.fresh(view), view["status"]["operation_id"] == .null else { return }
+        sceneGenericCall(["action": .string("rearm-observer"), "instance_uuid": .string(sceneInstance), "generation": view["generation"],
+            "state_revision": view["status"]["state_revision"], "node": .string(node), "attempt_id": .string(UUID().uuidString.lowercased())])
+    }
+
+    func sceneRearmLog(_ node: String) {
+        guard let view = sceneLocalView, MacLogRecovery.allowed(view,node:node,busy:sceneWorkspaceBusy) else { return }
+        sceneGenericCall(["action": .string("rearm-log"), "instance_uuid": .string(sceneInstance), "generation": view["generation"],
+            "state_revision": view["status"]["state_revision"], "node": .string(node), "attempt_id": .string(UUID().uuidString.lowercased())])
+    }
+
+    var sceneAssetIDs: [String] {
+        if case .object(let items) = scenePlan?["manifest"]["assets"] { return items.keys.sorted() }
+        return []
+    }
+    var sceneNodeIDs: [String] {
+        if case .object(let items) = scenePlan?["manifest"]["nodes"] { return items.keys.sorted() }
+        return []
+    }
+    var sceneNetworkIDs: [String] {
+        if case .object(let items) = scenePlan?["manifest"]["networks"] { return items.keys.sorted() }
+        return []
+    }
+    func sceneMembers(_ network: String) -> String {
+        sceneNodeIDs.filter { node in
+            scenePlan?["manifest"]["nodes"][node]["interfaces"].items.contains { $0["network"].text == network } == true
+        }.joined(separator: "  ↔  ")
+    }
+    var sceneUEFINodes: [String] { sceneNodeIDs.filter { scenePlan?["manifest"]["nodes"][$0]["firmware"].text == "uefi" } }
+    func chooseSceneFile(_ kind: String, id: String = "", role: Int = 0) {
+        guard !sceneWorkspaceBusy else { return }
+        let picker = NSOpenPanel(); picker.canChooseDirectories = false; picker.allowsMultipleSelection = false
+        guard picker.runModal() == .OK, let url = picker.url else { return }
+        if kind == "profile" { sceneRuntimeProfile = url.path }
+        else if kind == "manifest" { sceneManifest = url.path; scenePlan = nil; sceneSourceManifest = nil; sceneAssets = [:]; sceneFirmware = [:] }
+        else if kind == "asset" { sceneAssets[id] = url.path }
+        else { var pair = sceneFirmware[id] ?? ["", ""]; pair[role] = url.path; sceneFirmware[id] = pair }
+        sceneSnapshot = nil; sceneLocalView = nil
+    }
+    func sceneRequest(_ action: String, list: Bool = false) {
+        guard !sceneWorkspaceBusy, list || MacRemoteRules.uuid(sceneInstance) else { return }
+        if sceneGeneric { sceneRequestGeneric(action, list: list); return }
+        var value: [String: MacRemoteJSON] = ["action": .string(action), "instance_uuid": list ? .null : .string(sceneInstance)]
+        if action == "preview" || action == "prepare" { value["manifest"] = .string(sceneManifest) }
+        if action == "prepare" {
+            value["manifest_sha256"] = .string(sceneManifestSHA)
+            value["assets"] = .object(sceneAssets.mapValues { .string($0) })
+            value["firmware"] = .object(sceneFirmware.mapValues { .array($0.map { .string($0) }) })
+        }
+        if !["status", "preview"].contains(action) {
+            guard let checksum = sceneSnapshot else { sceneMessage = "请先读取当前实例状态，再确认本次操作。"; return }
+            value["expected_sha256"] = .string(checksum)
+        }
+        if action == "start" { value["allow_emulation"] = .bool(sceneEmulation) }
+        if action == "reset" {
+            guard let generation = Int(sceneNewGeneration), generation >= 2 else { sceneMessage = "目标代次须为大于当前代次的整数。"; return }
+            value["new_generation"] = .number(Double(generation))
+        }
+        do {
+            let encoded = try MacRemoteJSON.object(value).encoded(), context = sceneInstance
+            sceneWorkspaceBusy = true; sceneSnapshot = nil
+            run(.scenarioClient(json: encoded)) { [weak self] outcome in
+                guard let self else { return }; self.sceneWorkspaceBusy = false
+                guard context == self.sceneInstance else { return }
+                let output: String
+                switch outcome { case .success(let v), .failure(let v): output = v }
+                do {
+                    let reply = try MacRemoteJSON.decode(output)
+                    if let error = reply["error"]["message"].text { self.sceneMessage = error; return }
+                    self.sceneReply = reply
+                    if action == "preview" { self.scenePlan = reply["plan"]; self.sceneSourceManifest = reply["source_manifest"]; self.sceneManifestSHA = reply["manifest_sha256"].text ?? ""; self.sceneMessage = "设计已校验；尚未准备磁盘、启动或验证网络。" }
+                    else if action == "status" {
+                        if !list { self.sceneSnapshot = reply["snapshot_sha256"].text }
+                        self.sceneMessage = "已读取现场；选择实例后再次读取，变更操作只用本次状态。"
+                    } else { self.sceneMessage = "本次操作已返回。请重新读取状态；进程就绪不代表课程或隔离已验收。" }
+                } catch { self.sceneMessage = "回复无法核验，结果未知；保留现场，不自动重发。" }
+            }
+        } catch { sceneMessage = "请求无法编码，请核对所选清单和资产。" }
+    }
+
     // MARK: Wintermute 场景（独立状态根；不动单机 profile）
 
     func refreshScenario() {
@@ -1274,12 +1669,23 @@ final class GuiModel: ObservableObject {
 
     // MARK: CLI 调用
 
-    private func run(_ action: CliAction, completion: @escaping (CliOutcome) -> Void) {
+    private func run(_ action: CliAction, completion: @escaping @MainActor (CliOutcome) -> Void) {
         let arguments = action.arguments(stateDir: stateDirOverride)
         appendLog("$ \(action.displayCommand)")
         let process = Process()
         process.executableURL = URL(fileURLWithPath: cliPath)
         process.arguments = arguments
+        let privateInput = action.privateRequest
+        guard privateInput == nil || privateInput!.count <= 4 * 1024 * 1024 else {
+            completion(.failure("请求超过容量，本次没有启动CLI。")); return
+        }
+        guard let ticket = CLIRequestSlots.shared.acquire() else {
+            completion(.failure("待核验的CLI请求已达上限，本次没有启动新进程；请先核对已有请求。")); return
+        }
+        let response = CLIResponseOnce { outcome in Task { @MainActor in completion(outcome) } }
+        let lifetime = CLIRequestLifetime(ticket: ticket, hasInput: privateInput != nil)
+        let inputPipe = privateInput == nil ? nil : Pipe()
+        if let inputPipe { process.standardInput = inputPipe }
         var environment: [String: String] = [
             "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
             "LANG": ProcessInfo.processInfo.environment["LANG"] ?? "en_US.UTF-8",
@@ -1301,7 +1707,8 @@ final class GuiModel: ObservableObject {
                 importCanCancel = true
                 environment["CTFLAB_IMPORT_CANCEL_FILE"] = directory.appendingPathComponent("cancel").path
             } catch {
-                completion(.failure("无法建立导入取消通道：\(error.localizedDescription)"))
+                ticket.release()
+                response.finish(.failure("无法建立导入取消通道：\(error.localizedDescription)"))
                 return
             }
         }
@@ -1311,67 +1718,100 @@ final class GuiModel: ObservableObject {
         process.standardOutput = pipe
         process.standardError = pipe
         let handle = pipe.fileHandleForReading
-        let buffer = OutputBuffer()
-        handle.readabilityHandler = { [weak self] fileHandle in
-            let chunk = fileHandle.availableData
-            guard !chunk.isEmpty else { return }
-            buffer.append(chunk)
-            if let text = String(data: chunk, encoding: .utf8) {
-                let snapshot = buffer.text()
+        let buffer = OutputBuffer(limit: privateInput == nil ? 16 * 1024 * 1024 : 4 * 1024 * 1024)
+        let collector = CLIPipeCollector(handle: handle, buffer: buffer)
+        guard collector.canObserve else {
+            ticket.release()
+            if let directory = importDirectory {
+                try? FileManager.default.removeItem(at: directory)
+                if activeImportControl == directory { activeImportControl = nil; importCanCancel = false }
+            }
+            response.finish(.failure("无法建立CLI输出观察通道，本次没有启动进程。")); return
+        }
+        let updates = CLIOutputUpdates()
+        let onChunk: @Sendable (Data) -> Void = { [weak self] chunk in
+            if privateInput != nil {
+                if buffer.overflowed { response.finish(.failure(buffer.snapshot().text)) }
+                return
+            }
+            if updates.offer(chunk, progress: buffer.latestProgress()) {
                 Task { @MainActor [weak self] in
+                    let batch = updates.take()
                     guard let self else { return }
-                    self.appendLog(text)
+                    self.appendLog(batch.text)
                     if let directory = importDirectory, self.activeImportControl == directory,
                        !FileManager.default.fileExists(atPath: directory.appendingPathComponent("cancel").path),
-                       let progress = ImportProgress.latest(in: snapshot) {
+                       let progress = batch.progress {
                         self.state.progressText = progress.label
                         self.importCanCancel = progress.cancellable
                     }
                 }
             }
         }
+        handle.readabilityHandler = { fileHandle in
+            switch collector.receive(onChunk) {
+            case .received: break
+            case .eof: fileHandle.readabilityHandler = nil
+            case .failed:
+                fileHandle.readabilityHandler = nil
+                if privateInput != nil { response.finish(.failure(buffer.snapshot().text)) }
+            }
+        }
+        if privateInput != nil { response.startTimeout(seconds: 90) }
         process.terminationHandler = { [weak self] finished in
             handle.readabilityHandler = nil
-            // terminationHandler 可能先于 readabilityHandler 收到最后一批字节；显式 drain，
-            // 避免 JSON 尾部丢失导致 GUI 把一次成功误报为“无法解析输出”。
-            let trailing = handle.readDataToEndOfFile()
-            if !trailing.isEmpty {
-                buffer.append(trailing)
-                if let text = String(data: trailing, encoding: .utf8) {
-                    Task { @MainActor [weak self] in self?.appendLog(text) }
-                }
-            }
-            let output = buffer.text()
+            let closed = collector.drain(onChunk)
+            lifetime.processFinished(outputClosed: closed)
+            let snapshot = buffer.snapshot()
+            let output = snapshot.text
             Task { @MainActor [weak self] in
                 guard let self else { return }
-                if let directory = importDirectory {
+                if closed, let directory = importDirectory {
                     try? FileManager.default.removeItem(at: directory)
                     if self.activeImportControl == directory {
                         self.activeImportControl = nil
                         self.importCanCancel = false
                     }
                 }
-                if finished.terminationStatus == 0 {
-                    completion(.success(output))
+                if case .onboardX86(let source, let id) = action,
+                   finished.terminationStatus != 0, snapshot.candidateCreated {
+                    self.retryCandidate = (id, source)
+                }
+                if !snapshot.complete {
+                    response.finish(.failure(output))
+                } else if finished.terminationStatus == 0 {
+                    response.finish(.success(output))
                 } else {
                     // 错误弹窗只截取尾部；候选是否已创建必须检查完整输出，
                     // 否则长转换/多条警告会把重试依据截掉。
-                    if case .onboardX86(let source, let id) = action,
-                       output.contains("候选配置已生成：") {
-                        self.retryCandidate = (id, source)
-                    }
                     let label = action.displayCommand
                     let message = action.preservesRawOutputOnFailure
                         ? output
                         : GuiMessages.failureMessage(
                             action: label, exitCode: finished.terminationStatus, output: output)
-                    completion(.failure(message))
+                    response.finish(.failure(message))
                 }
             }
         }
         do {
             try process.run()
+            if let privateInput, let inputPipe {
+                DispatchQueue.global(qos: .userInitiated).async {
+                    do {
+                        try inputPipe.fileHandleForWriting.write(contentsOf: privateInput)
+                        try inputPipe.fileHandleForWriting.close()
+                        lifetime.inputFinished()
+                    } catch {
+                        buffer.markReadFailure()
+                        do { try inputPipe.fileHandleForWriting.close(); lifetime.inputFinished() } catch {}
+                        response.finish(.failure(buffer.snapshot().text))
+                    }
+                }
+            }
         } catch {
+            handle.readabilityHandler = nil
+            ticket.release()
+            try? inputPipe?.fileHandleForWriting.close()
             if let directory = importDirectory {
                 try? FileManager.default.removeItem(at: directory)
                 activeImportControl = nil
@@ -1379,7 +1819,302 @@ final class GuiModel: ObservableObject {
             }
             let message = "无法启动内置 CLI：\(error.localizedDescription)\n（\(cliPath)）"
             appendLog(message)
-            completion(.failure(message))
+            response.finish(.failure(message))
+        }
+    }
+
+    // 远程回调只更新同一上下文；页面重开不自动连接、重试或停止。
+    private func remoteCall(_ value: MacRemoteJSON, completion: @escaping (MacRemoteJSON?) -> Void) {
+        let ticket = remoteEpoch
+        do {
+            let encoded = try value.encoded()
+            run(.remoteClient(json: encoded)) { [weak self] outcome in
+                guard let self, ticket == self.remoteEpoch else { return }
+                let text: String
+                switch outcome { case .success(let v), .failure(let v): text = v }
+                do {
+                    let reply = try MacRemoteJSON.decode(text)
+                    if let error = reply["error"]["message"].text { self.remoteMessage = error; completion(nil) }
+                    else { completion(reply) }
+                } catch { self.remoteMessage = "响应未能核验；结果未知，不自动重发。"; completion(nil) }
+            }
+        } catch { remoteMessage = "请求结构无法核验。"; completion(nil) }
+    }
+    func loadRemoteTargets() {
+        guard !remoteBusy else { return }; remoteBusy = true
+        remoteCall(.object(["action": .string("targets")])) { reply in
+            self.remoteBusy = false
+            guard let reply else { return }
+            do { self.remoteTargets = try reply["targets"].items.map(MacSavedTarget.init) }
+            catch { self.remoteTargets = []; self.remoteMessage = "目标列表无法核验。" }
+        }
+    }
+    func chooseRemoteConfig() {
+        let panel = NSOpenPanel(); panel.canChooseFiles = true; panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false; panel.message = "选择管理员提供的私有SSH连接配置，不会连接服务器。"
+        if panel.runModal() == .OK, let path = panel.url?.path { remoteConfig = path }
+    }
+    func saveRemoteTarget() {
+        guard !remoteBusy, !remoteLabel.isEmpty, remoteConfig.hasPrefix("/") else { return }
+        remoteBusy = true
+        remoteCall(.object(["action": .string("save-target"), "id": .string(UUID().uuidString.lowercased()),
+            "label": .string(remoteLabel), "config": .string(remoteConfig)])) { reply in
+            self.remoteBusy = false
+            if reply != nil { self.remoteMessage = "目标已保存；尚未连接，请明确选择连接。"; self.loadRemoteTargets() }
+        }
+    }
+    func chooseRemoteIdentity(_ key: String) {
+        guard ["identity", "known_hosts"].contains(key), !remoteBusy else { return }
+        let panel = NSOpenPanel(); panel.canChooseFiles = true; panel.canChooseDirectories = false; panel.allowsMultipleSelection = false
+        panel.message = key == "identity" ? "选择本机SSH身份文件；不复制私钥。" : "选择管理员提供的固定主机密钥文件。"
+        if panel.runModal() == .OK, let path = panel.url?.path { remoteWizard[key] = path }
+    }
+    func createRemoteTarget() {
+        guard !remoteBusy, !remoteLabel.isEmpty, let port = Int(remoteWizard["port"] ?? ""), (1...65535).contains(port),
+              MacRemoteRules.uuid((remoteWizard["server_uuid"] ?? "").lowercased()),
+              remoteWizard.values.allSatisfy({ !$0.isEmpty }) else { remoteMessage = "请填写目标名称、服务器标识、端口与身份/固定主机密钥文件。"; return }
+        var config = remoteWizard.mapValues { MacRemoteJSON.string($0) }
+        config["port"] = .number(Double(port)); config["server_uuid"] = .string((remoteWizard["server_uuid"] ?? "").lowercased())
+        config["ssh"] = .string("/usr/bin/ssh")
+        remoteBusy = true
+        remoteCall(.object(["action": .string("create-target"), "id": .string(UUID().uuidString.lowercased()),
+            "label": .string(remoteLabel), "config": .object(config)])) { reply in
+            self.remoteBusy = false
+            if reply != nil { self.remoteMessage = "私有配置已生成并保存；未连接或安装SSH，私钥未复制。"; self.loadRemoteTargets() }
+        }
+    }
+    func disconnectRemote() {
+        remoteEpoch += 1; remoteAdminOpen = false; remoteOffers = []; remoteCoursePlan = .null; remoteAudit = .null; remoteAuditPlan = .null; remoteOffer = ""; remoteCourseInstance = ""; remoteBusy = false; remoteConnectionID = nil; remoteContext = nil
+        remoteView = .null; remoteLeases = .null; remotePending = []; remotePendingKnown = false
+        remoteInstance = ""; remoteLease = ""; remoteStopConsent = false; remoteExports = []
+        remoteUploads = []; remoteDownloads = []; remoteTransferID = nil
+        remoteHistoryInFlight = false
+        remoteMessage = "管理已断开；远程实验与传输不因关闭面板而停止，也不会自动重发。"
+    }
+    func connectRemote() {
+        guard !remoteBusy, let saved = remoteTargets.first(where: { $0.id == remoteSelected }) else { return }
+        disconnectRemote(); remoteSelected = saved.id; remoteBusy = true
+        let identity = UUID().uuidString.lowercased(); remoteConnectionID = identity
+        remoteCall(.object(["action": .string("connect"), "id": .string(saved.id), "connection_id": .string(identity)])) { reply in
+            self.remoteBusy = false; self.remoteConnectionID = nil
+            guard let reply else { return }
+            if reply["connection_phase"].text == "cancelled" {
+                self.remoteContext = nil; self.remoteMessage = "本次连接已取消；未发送实验变更。"; return
+            }
+            do {
+                self.remoteContext = try MacRemoteContext(saved: saved, reply: reply)
+                self.remoteMessage = "连接已核验；请选择分配实例，再明确读取状态。"
+            } catch { self.remoteContext = nil; self.remoteMessage = "连接目标/权限无法核验；未发送实验变更。" }
+        }
+    }
+    func cancelRemoteConnection() {
+        guard let identity = remoteConnectionID else { return }
+        remoteCall(.object(["action": .string("cancel-connect"), "id": .string(remoteSelected), "connection_id": .string(identity)])) { reply in
+            guard let reply else { return }
+            self.remoteMessage = reply["connection_phase"].text == "returned" ? "连接已经返回；取消不会追溯关闭它，可明确断开管理。" : "已登记本次连接取消；不停止远程实验。"
+        }
+    }
+    func selectRemoteInstance(_ value: String) {
+        guard !remoteBusy else { return }
+        remoteEpoch += 1; remoteInstance = value; remoteView = .null; remoteLeases = .null
+        remoteLease = ""; remoteStopConsent = false; remotePending = []; remotePendingKnown = false; remoteExports = []
+    }
+    private func remoteRead(_ action: String, context: MacRemoteContext) -> MacRemoteJSON {
+        .object(["action": .string("request"), "id": .string(context.saved.id), "payload": .object([
+            "action": .string(action), "target": .string(context.saved.target), "instance_uuid": .string(remoteInstance)])])
+    }
+    func refreshRemote() {
+        guard !remoteBusy, let context = remoteContext, context.instances.contains(remoteInstance) else { return }
+        remoteBusy = true; remotePendingKnown = false
+        remoteCall(remoteRead("overview", context: context)) { reply in
+            do {
+                guard let reply else { throw MacRemoteError.invalid }
+                self.remoteView = try MacRemoteRules.overview(reply, context: context, instance: self.remoteInstance, previous: self.remoteView)
+            } catch { self.remoteView = .null; self.remoteBusy = false; return }
+            @MainActor func pending() {
+                self.remoteCall(.object(["action": .string("pending"), "id": .string(context.saved.id)])) { reply in
+                    self.remoteBusy = false
+                    guard let reply, reply["truncated"].flag == false else { self.remotePendingKnown = false; return }
+                    self.remotePending = reply["attempts"].items
+                    self.remotePendingKnown = self.remotePending.allSatisfy { MacRemoteRules.uuid($0["id"].text ?? "") && $0["payload"]["target"].text == context.saved.target }
+                }
+            }
+            if context.leases {
+                self.remoteCall(self.remoteRead("lease-status", context: context)) { reply in
+                    self.remoteLeases = reply?["target"].text == context.saved.target ? reply?["result"] ?? .null : .null
+                    pending()
+                }
+            } else { self.remoteLeases = .null; pending() }
+        }
+    }
+    var remoteHasPending: Bool { !remotePendingKnown || !remotePending.isEmpty }
+    func remoteAllowed(_ operation: String) -> Bool {
+        if remoteContext?.leases == true, ["prepare", "start", "reset"].contains(operation),
+           !MacRemoteRules.activeLease(remoteLeases, selected: remoteLease, instance: remoteInstance) { return false }
+        return MacRemoteRules.allowed(operation, view: remoteView, context: remoteContext, instance: remoteInstance,
+            lease: remoteLease, busy: remoteBusy, pending: remoteHasPending)
+    }
+    func performRemote(_ operation: String) {
+        guard remoteAllowed(operation), let context = remoteContext else { return }
+        do {
+            let payload = try MacRemoteRules.operation(operation, view: remoteView, context: context, instance: remoteInstance, lease: remoteLease)
+            sendRemoteMutation(payload, context: context)
+        } catch { remoteMessage = "状态/目标已变化，请刷新。" }
+    }
+    func changeRemoteLease(_ action: String) {
+        guard !remoteBusy, !remoteHasPending, let context = remoteContext, let ttl = Int(remoteTTL) else { return }
+        do {
+            let payload = try MacRemoteRules.lease(action, status: remoteLeases, context: context, instance: remoteInstance,
+                selected: remoteLease, ttl: ttl, consent: remoteStopConsent)
+            sendRemoteMutation(payload, context: context)
+        } catch { remoteMessage = "租约权限/期限/状态无法核验，请刷新；到期停止策略还需要明确勾选。" }
+    }
+    private func sendRemoteMutation(_ payload: MacRemoteJSON, context: MacRemoteContext) {
+        remoteBusy = true; remotePendingKnown = false
+        remoteCall(.object(["action": .string("request"), "id": .string(context.saved.id), "payload": payload,
+            "attempt_id": .string(UUID().uuidString.lowercased())])) { reply in
+            self.remoteBusy = false
+            if let reply, reply["target"].text == context.saved.target {
+                let result = reply["result"]
+                if result["state"].text == "active", result["time_state"].text == "active", MacRemoteRules.uuid(result["lease_id"].text ?? "") { self.remoteLease = result["lease_id"].text ?? "" }
+                self.remoteMessage = "请求已返回；接收不等于执行完成，请以当前核验状态为准。"
+            }
+            self.refreshRemote()
+        }
+    }
+    func loadRemoteAdminPending() {
+        guard !remoteBusy, let context = remoteContext else { return }
+        remoteBusy = true
+        remoteCall(.object(["action": .string("pending"), "id": .string(context.saved.id)])) { reply in
+            self.remoteBusy = false
+            guard let reply, reply["truncated"].flag == false else { return }
+            self.remotePending = reply["attempts"].items.filter { $0["payload"]["target"].text == context.saved.target }
+        }
+    }
+    func remoteAdministration(_ action: String, values: [String: MacRemoteJSON] = [:]) {
+        guard !remoteBusy, let context = remoteContext else { return }
+        do {
+            let payload = try MacRemoteRules.administration(action, context: context, values: values)
+            var request: [String: MacRemoteJSON] = ["action": .string("request"), "id": .string(context.saved.id), "payload": payload]
+            if ["course-provision", "audit-settle"].contains(action) { request["attempt_id"] = .string(UUID().uuidString.lowercased()) }
+            remoteBusy = true
+            remoteCall(.object(request)) { reply in
+                self.remoteBusy = false
+                do {
+                    guard let reply else { throw MacRemoteError.invalid }
+                    let result = try MacRemoteRules.administrationResult(reply, payload: payload, context: context)
+                    switch action {
+                    case "course-list": self.remoteOffers = result["offers"].items; self.remoteCoursePlan = .null
+                    case "course-preview": self.remoteCoursePlan = result
+                    case "audit-review": self.remoteAudit = result; self.remoteAuditPlan = .null
+                    case "audit-settlement-preview": self.remoteAuditPlan = result
+                    default:
+                        self.remoteCoursePlan = .null; self.remoteAuditPlan = .null; self.remoteAudit = .null
+                        self.remoteMessage = "管理请求已返回；课程尚需准备和实机验收，审计原执行结果仍为未知。"
+                    }
+                } catch {
+                    self.remoteCoursePlan = .null; self.remoteAuditPlan = .null
+                    self.remoteMessage = "管理响应未能核验。变更请求已在本机记录；可读取原请求后明确重试。"
+                }
+                self.loadRemoteAdminPending()
+            }
+        } catch { remoteMessage = "管理参数或当前权限无法核验，请重新选择并预览。" }
+    }
+    func retryRemoteAdministration(_ item: MacRemoteJSON) {
+        guard !remoteBusy, let context = remoteContext, item["payload"]["target"].text == context.saved.target,
+              let action = item["payload"]["action"].text, ["course-provision", "audit-settle"].contains(action),
+              let identity = item["id"].text, MacRemoteRules.uuid(identity) else { return }
+        remoteBusy = true
+        remoteCall(.object(["action": .string("retry"), "attempt_id": .string(identity)])) { _ in
+            self.remoteBusy = false; self.remoteCoursePlan = .null; self.remoteAuditPlan = .null; self.remoteAudit = .null
+            self.loadRemoteAdminPending()
+        }
+    }
+    func retryRemote(_ item: MacRemoteJSON) {
+        guard !remoteBusy, let context = remoteContext, item["payload"]["target"].text == context.saved.target,
+              item["payload"]["instance_uuid"].text == remoteInstance, let identity = item["id"].text, MacRemoteRules.uuid(identity) else { return }
+        remoteBusy = true; remotePendingKnown = false
+        remoteCall(.object(["action": .string("retry"), "attempt_id": .string(identity)])) { _ in self.remoteBusy = false; self.refreshRemote() }
+    }
+    func remoteDisplayAllowed(_ node: String) -> Bool {
+        !remoteBusy && remoteContext?.display == true && remoteContext?.leases == true
+            && remoteView["status"]["state"].text == "process-running" && remoteView["observations"][node]["state"].text == "process-running"
+            && MacRemoteRules.activeLease(remoteLeases, selected: remoteLease, instance: remoteInstance)
+    }
+    func requestRemoteDisplay(_ node: String) {
+        guard remoteDisplayAllowed(node), let context = remoteContext else { return }
+        remoteBusy = true
+        remoteCall(.object(["action": .string("display"), "id": .string(context.saved.id), "instance_uuid": .string(remoteInstance),
+            "node": .string(node), "lease_id": .string(remoteLease)])) { reply in
+            self.remoteBusy = false
+            if reply != nil { self.remoteMessage = "已请求独立显示窗口；连接尚未验证，关闭窗口不会停止实验。" }
+        }
+    }
+
+    func chooseRemoteAsset() {
+        let panel = NSOpenPanel(); panel.canChooseFiles = true; panel.canChooseDirectories = false; panel.allowsMultipleSelection = false
+        panel.message = "选择已获准上传的原始资产；不会执行或解包。"
+        if panel.runModal() == .OK, let path = panel.url?.path { remoteAssetFile = path }
+    }
+    func refreshRemoteTransferHistory() {
+        guard !remoteHistoryInFlight, let context = remoteContext else { return }; remoteHistoryInFlight = true
+        remoteCall(.object(["action": .string("asset-history"), "id": .string(context.saved.id)])) { reply in
+            self.remoteUploads = reply?["uploads"].items ?? []
+            self.remoteCall(.object(["action": .string("evidence-history"), "id": .string(context.saved.id)])) { reply in
+                self.remoteDownloads = reply?["downloads"].items ?? []; self.remoteHistoryInFlight = false
+            }
+        }
+    }
+    func uploadRemoteAsset() {
+        guard !remoteBusy, let context = remoteContext, context.assets, remoteAssetFile.hasPrefix("/"), !remoteAssetSource.isEmpty else { return }
+        let id = UUID().uuidString.lowercased(); remoteTransferID = ("asset", id); remoteBusy = true
+        remoteCall(.object(["action": .string("asset-upload"), "id": .string(context.saved.id), "upload_id": .string(id),
+            "file": .string(remoteAssetFile), "source": .string(remoteAssetSource), "audience": .string("student")])) { reply in
+            self.remoteBusy = false; self.remoteTransferID = nil
+            if reply != nil { self.remoteMessage = "本次传输已返回；历史verified不代表当前远端，需明确核对。" }
+            self.refreshRemoteTransferHistory()
+        }
+    }
+    func remoteTransferAction(_ action: String, kind: String, identity: String) {
+        guard MacRemoteRules.uuid(identity), let context = remoteContext, ["asset", "evidence"].contains(kind) else { return }
+        let cancelling = action.hasSuffix("cancel")
+        let active = remoteTransferID?.kind == kind && remoteTransferID?.id == identity
+        let history = kind == "asset" ? remoteUploads : remoteDownloads
+        let key = kind == "asset" ? "upload_id" : "download_id"
+        guard active || history.contains(where: { $0[key].text == identity && $0["target_id"].text == context.saved.id
+            && (kind == "asset" || $0["instance_uuid"].text == remoteInstance) }) else { return }
+        guard cancelling || (kind == "asset" ? context.assets : context.evidence) else { return }
+        guard cancelling || !remoteBusy else { return }
+        if !cancelling { remoteBusy = true; remoteTransferID = (kind, identity) }
+        remoteCall(.object(["action": .string(action), kind == "asset" ? "upload_id" : "download_id": .string(identity)])) { reply in
+            if !cancelling { self.remoteBusy = false; self.remoteTransferID = nil }
+            if let reply {
+                if action == "asset-probe" {
+                    self.remoteMessage = reply["server_current_verified"].flag == true ? "服务器当前完整传输状态已核对；不代表课程可用。" : "服务器当前状态未通过完整核对；历史verified不作为当前证据。"
+                } else { self.remoteMessage = cancelling ? "已请求暂停，部分文件和记录保留。" : "显式传输请求已返回；未自动打开或执行内容。" }
+            }
+            self.refreshRemoteTransferHistory()
+        }
+    }
+    func listRemoteEvidence() {
+        guard !remoteBusy, let context = remoteContext, context.evidence, context.instances.contains(remoteInstance) else { return }
+        remoteBusy = true
+        remoteCall(.object(["action": .string("evidence-list"), "id": .string(context.saved.id), "instance_uuid": .string(remoteInstance)])) { reply in
+            self.remoteBusy = false; self.remoteExports = reply?["exports"].items ?? []
+        }
+    }
+    func downloadRemoteEvidence(export: MacRemoteJSON, file: MacRemoteJSON) {
+        guard !remoteBusy, let context = remoteContext, context.evidence, context.instances.contains(remoteInstance),
+              let name = file["name"].text, let sha = file["sha256"].text, MacRemoteRules.digest(sha),
+              MacRemoteRules.uuid(export["export_id"].text ?? ""), file["size"].integer != nil else { return }
+        let id = UUID().uuidString.lowercased(); remoteTransferID = ("evidence", id); remoteBusy = true
+        let payload: MacRemoteJSON = .object(["instance_uuid": .string(remoteInstance), "export_id": export["export_id"],
+            "file": .string(name), "sha256": .string(sha), "size": file["size"]])
+        remoteCall(.object(["action": .string("evidence-download"), "id": .string(context.saved.id),
+            "download_id": .string(id), "payload": payload])) { reply in
+            self.remoteBusy = false; self.remoteTransferID = nil
+            if reply != nil { self.remoteMessage = "下载请求已返回；副本留在本机私有目录，不自动打开/解包。" }
+            self.refreshRemoteTransferHistory()
         }
     }
 
@@ -1590,24 +2325,90 @@ struct CourseManagerSheet: View {
     }
 }
 
+private enum MacWorkspacePage: String, CaseIterable {
+    case library = "镜像库", experiments = "实验", topology = "拓扑", templates = "模板", remote = "远程", versions = "版本", diagnostics = "诊断"
+    var icon: String {
+        switch self {
+        case .library: return "square.stack.3d.up"
+        case .experiments: return "play.rectangle"
+        case .topology: return "point.3.connected.trianglepath.dotted"
+        case .templates: return "square.grid.2x2"
+        case .remote: return "network"
+        case .versions: return "arrow.triangle.2.circlepath"
+        case .diagnostics: return "waveform.path.ecg"
+        }
+    }
+    var subtitle: String {
+        switch self {
+        case .library: return "管理镜像，直接进入你的实验节点。"
+        case .experiments: return "选择实验，查看状态，控制一次完整的运行。"
+        case .topology: return "从节点到网段，清楚看到实验的连接关系。"
+        case .templates: return "配置可复用场景，校验设计后再建立实验。"
+        case .remote: return "连接受限运行器，管理远程实验与课程。"
+        case .versions: return "校验本地更新，选择版本与恢复入口。"
+        case .diagnostics: return "检查当前状态，整理可以分享的诊断证据。"
+        }
+    }
+}
+
+private final class MacWorkspaceSelection: ObservableObject {
+    @Published var page: MacWorkspacePage = .library
+    @Published var editTopology = false
+    @Published var showActivity = false
+}
+
 struct ContentView: View {
     @ObservedObject var model: GuiModel
+    @StateObject private var workspace = MacWorkspaceSelection()
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            header
-            directoryRow
-            actionRow
-            if let error = model.state.lastError {
-                errorBanner(error)
-            }
-            verifyTable
-            ScenarioSection(model: model)
-            mainSplit
-            logPanel
+        NavigationSplitView {
+            VStack(alignment: .leading, spacing: 14) {
+                HStack(spacing: 10) {
+                    Image(systemName: "cube.transparent.fill").font(.system(size: 28)).foregroundStyle(.blue)
+                    VStack(alignment: .leading) { Text("CTFLab").font(.title2.bold()); Text("本地实验工作台").font(.caption).foregroundStyle(.secondary) }
+                }.padding(.horizontal, 8).padding(.top, 8)
+                VStack(spacing: 3) {
+                    // Cmd+1…7 直接切换页面：侧栏按钮同时注册键盘快捷键，无需先聚焦。
+                    ForEach(Array(MacWorkspacePage.allCases.enumerated()), id: \.element) { offset, item in
+                        Button { workspace.page = item } label: {
+                            HStack(spacing: 10) { Image(systemName: item.icon).frame(width: 22); Text(item.rawValue); Spacer(); if workspace.page == item { Image(systemName: "chevron.right").font(.caption2) } }
+                                .font(.system(size: 13, weight: workspace.page == item ? .semibold : .regular))
+                                .padding(.horizontal, 12).padding(.vertical, 8)
+                                .background(workspace.page == item ? Color.accentColor.opacity(0.13) : .clear, in: RoundedRectangle(cornerRadius: 9))
+                                .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundStyle(workspace.page == item ? Color.accentColor : .primary)
+                        .keyboardShortcut(KeyEquivalent(Character(String(offset + 1))), modifiers: .command)
+                        .accessibilityLabel("切换到\(item.rawValue)（Command \(offset + 1)）")
+                    }
+                }
+                Divider()
+                imageListColumn
+            }.padding(12)
+                .navigationTitle("工作空间")
+                .navigationSplitViewColumnWidth(min: 290, ideal: 320, max: 400)
+        } detail: {
+            VStack(alignment: .leading, spacing: 16) {
+                HStack(alignment: .top) {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text(workspace.page.rawValue).font(.system(size: 29, weight: .bold))
+                        Text(workspace.page.subtitle).font(.callout).foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Button { workspace.showActivity.toggle() } label: { Label("活动", systemImage: "text.alignleft") }
+                }
+                if let error = model.state.lastError { errorBanner(error) }
+                workspaceContent.frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                if workspace.showActivity { logPanel }
+            }.padding(24)
+                .background(Color(nsColor: .windowBackgroundColor))
+                .navigationTitle("CTFLab · " + workspace.page.rawValue)
         }
-        .padding(16)
-        .frame(minWidth: 1080, minHeight: 760)
+        .navigationSplitViewStyle(.balanced)
+        .tint(.accentColor)
+        .frame(minWidth: 1040, minHeight: 740)
         .alert(GuiMessages.resetConfirmationTitle, isPresented: $model.showResetConfirmation) {
             Button(GuiMessages.resetCancelButton, role: .cancel) {}
             Button(GuiMessages.resetConfirmButton, role: .destructive) { model.confirmReset() }
@@ -1637,17 +2438,130 @@ struct ContentView: View {
         }
         .sheet(isPresented: $model.showRecovery) { RecoverySheet(model: model) }
         .sheet(isPresented: $model.showCourseManager) { CourseManagerSheet(model: model) }
+        .sheet(isPresented: $model.showRemoteWorkspace) { MacRemoteSheet(model: model) }
+        .sheet(isPresented: $model.showScenarioWorkspace) { MacScenarioSheet(model: model) }
+        .sheet(item: $model.publicDiagnostics) { snapshot in
+            PublicDiagnosticsSheet(model: model, snapshot: snapshot)
+        }
         .onReceive(Timer.publish(every: 3, on: .main, in: .common).autoconnect()) { _ in
             model.refreshAutomatically()
         }
     }
 
-    private var header: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text("CTFLab 实验环境").font(.title2).bold()
-            Text(model.state.statusLine).foregroundStyle(.secondary)
-            Text("状态目录：\(model.stateDirLabel)").font(.caption).foregroundStyle(.secondary)
+    @ViewBuilder private var workspaceContent: some View {
+        switch workspace.page {
+        case .library:
+            VStack(alignment: .leading, spacing: 16) {
+                actionRow
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 18) {
+                        detailColumn.frame(minHeight: 320)
+                        DisclosureGroup("文件夹与成套导入") { directoryRow; verifyTable }
+                        DisclosureGroup("Wintermute 课程快捷操作") { ScenarioSection(model: model) }
+                    }.padding(18).frame(maxWidth: .infinity, alignment: .leading)
+                }.background(.background, in: RoundedRectangle(cornerRadius: 16))
+            }
+        case .experiments:
+            MacScenarioSheet(model: model, embedded: true)
+        case .topology:
+            topologyWorkspace
+        case .templates:
+            MacScenarioSheet(model: model, embedded: true, configurationOnly: true)
+        case .remote:
+            MacRemoteSheet(model: model, embedded: true)
+        case .versions:
+            VStack(alignment: .leading, spacing: 20) {
+                Label("本地版本管理", systemImage: "shippingbox").font(.title2.bold())
+                Text("选择更新包后先校验，再打开已核验的版本。保留上一槽位用于回退。切换版本前请妥善处理正在进行的操作。")
+                    .foregroundStyle(.secondary)
+                Button("校验本地 App 更新…") { model.stageLocalUpdate() }
+                Button("打开所选更新版本…") { model.launchUpdate() }
+                Button("回退上个更新槽位…") { model.rollbackUpdate() }
+                Text(model.updateMessage.isEmpty ? "尚未校验本地更新包。" : model.updateMessage).textSelection(.enabled)
+                Spacer()
+            }.padding(24).frame(maxWidth: .infinity, alignment: .leading).background(.background, in: RoundedRectangle(cornerRadius: 16)).disabled(model.state.phase.isBusy)
+        case .diagnostics:
+            VStack(alignment: .leading, spacing: 20) {
+                Label("状态与证据", systemImage: "stethoscope").font(.title2.bold())
+                Text(model.state.statusLine).textSelection(.enabled)
+                Button("检查状态") { model.checkStatus() }.disabled(!model.state.canCheckStatus)
+                Button("预览可分享诊断摘要…") { model.previewPublicDiagnostics() }.disabled(model.state.phase.isBusy || model.nodes.isEmpty)
+                Button("导出完整本机诊断（私密）…") { model.exportDiagnostics() }.disabled(model.state.phase.isBusy)
+                Text("分享前可预览摘要；完整诊断可能包含本机路径，应保留在私有环境。") .font(.caption).foregroundStyle(.secondary)
+                logPanel
+                Spacer()
+            }.padding(24).frame(maxWidth: .infinity, alignment: .leading).background(.background, in: RoundedRectangle(cornerRadius: 16))
         }
+    }
+
+    private var topologyWorkspace: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Picker("视图", selection: $workspace.editTopology) { Text("连接总览").tag(false); Text("编辑草稿").tag(true) }.pickerStyle(.segmented).frame(width: 240)
+                Spacer()
+                Button("选择实验") { workspace.page = .experiments }
+                Button("读取此实例状态") { model.sceneRequest("status") }.disabled(model.sceneWorkspaceBusy)
+            }
+            if workspace.editTopology {
+                if model.sceneDraft != .null && model.sceneDraftContext == model.sceneInstance && model.sceneGeneric {
+                    MacGraphSheet(model: model, embedded: true)
+                } else {
+                    VStack(alignment: .leading, spacing: 16) {
+                        Label("从已读取的通用实验载入设计", systemImage: "pencil.and.outline").font(.title3.bold())
+                        Text("先在实验页选择通用实例并读取状态，再载入草稿。编辑只生成新设计，不会更改运行中的节点或连线。")
+                        Button("载入当前实验草稿") { model.sceneLoadDraft() }.disabled(model.sceneLocalView == nil || !model.sceneGeneric || model.sceneWorkspaceBusy)
+                    }.padding(24)
+                }
+            } else if let view = model.sceneLocalView {
+                TimelineView(.periodic(from: .now, by: 1)) { _ in
+                    MacRuntimeTopology(view: view, expanded: true).padding(20)
+                }
+            } else if let manifest = model.sceneSourceManifest, let design = MacDesignTopology.project(manifest) {
+                VStack(alignment: .leading, spacing: 12) {
+                    Label("清单设计 · 尚未读取运行状态", systemImage: "pencil.and.outline").font(.headline)
+                    MacRuntimeTopology(view: design, expanded: true)
+                }.padding(20)
+            } else {
+                VStack(alignment: .leading, spacing: 18) {
+                    Label("资源节点", systemImage: "square.stack.3d.up").font(.headline)
+                    Text("尚未读取场景连接。下面是已导入的真实资源，不推断它们之间的网络关系；选择实验后可查看节点、网卡、网段与设计连线。")
+                        .font(.callout).foregroundStyle(.secondary)
+                    ScrollView {
+                        LazyVGrid(columns: [GridItem(.adaptive(minimum: 220), spacing: 18)], spacing: 18) {
+                            ForEach(filteredNodes, id: \.id) { node in
+                                Button { model.selectedFilePath = nil; model.selectNode(node.id); workspace.page = .library } label: {
+                                    VStack(alignment: .leading, spacing: 12) {
+                                        Image(systemName: "desktopcomputer").font(.system(size: 30)).foregroundStyle(.blue)
+                                        Text(node.name ?? LabNode.displayName(for: node.id)).font(.headline)
+                                        Text("资源节点 · 未读取场景连接").font(.caption).foregroundStyle(.secondary)
+                                        Label("查看节点", systemImage: "arrow.up.right") .font(.caption)
+                                    }.padding(20).frame(maxWidth: .infinity, alignment: .leading)
+                                        .background(.blue.opacity(0.06), in: RoundedRectangle(cornerRadius: 14))
+                                }.buttonStyle(.plain)
+                            }
+                        }
+                        if filteredNodes.isEmpty { ContentUnavailableView("还没有镜像节点", systemImage: "square.stack.3d.up", description: Text("到镜像库添加资源，或在实验页选择已有实例。")) }
+                    }
+                }.padding(24)
+            }
+            Spacer(minLength: 0)
+        }.frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            .background(.background, in: RoundedRectangle(cornerRadius: 16))
+    }
+
+    private var header: some View {
+        HStack(alignment: .top, spacing: 16) {
+            VStack(alignment: .leading, spacing: 6) {
+                Text("实验工作台").font(.system(size: 28, weight: .bold))
+                Text(model.state.statusLine).font(.callout).foregroundStyle(.secondary)
+            }
+            Spacer()
+            Label("本地运行", systemImage: "desktopcomputer")
+                .font(.caption).foregroundStyle(.secondary)
+                .padding(.horizontal, 12).padding(.vertical, 7)
+                .background(.regularMaterial, in: Capsule())
+        }
+        .help("状态目录：\(model.stateDirLabel)")
     }
 
     private var directoryRow: some View {
@@ -1689,7 +2603,9 @@ struct ContentView: View {
                 Divider()
                 Button("检查状态") { model.checkStatus() }
                     .disabled(!model.state.canCheckStatus)
-                Button("导出脱敏诊断…") { model.exportDiagnostics() }
+                Button("分享诊断摘要…") { model.previewPublicDiagnostics() }
+                    .disabled(model.state.phase.isBusy || model.nodes.isEmpty)
+                Button("完整本机诊断（私密）…") { model.exportDiagnostics() }
                     .disabled(model.state.phase.isBusy)
                 Divider()
                 Toggle("共享文本剪贴板（启动时生效）", isOn: $model.clipboardSharingEnabled)
@@ -1716,6 +2632,8 @@ struct ContentView: View {
                 Button("停止后续导入") { model.stopRemainingImports() }
                     .disabled(model.stopImportQueueRequested)
             }
+            Button("本机场景…") { model.showScenarioWorkspace = true }
+            Button("远程实验…") { model.showRemoteWorkspace = true }
             Button("课程组合…") { model.showCourseManager = true }
                 .disabled(model.state.phase.isBusy)
         }
@@ -1746,6 +2664,7 @@ struct ContentView: View {
                     model.selectNode(nil)
                     return
                 }
+                workspace.page = .library
                 if newValue.hasPrefix("file:") {
                     model.state.selectedProfileID = nil
                     model.selectedFilePath = String(newValue.dropFirst(5))
@@ -1780,7 +2699,7 @@ struct ContentView: View {
     private var imageListColumn: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack {
-                Text("镜像").font(.headline)
+                Label("镜像与节点", systemImage: "externaldrive").font(.headline)
                 Spacer()
                 Text("\(filteredNodes.count) 个")
                     .font(.caption).foregroundStyle(.secondary)
@@ -1822,7 +2741,7 @@ struct ContentView: View {
             }
             .listStyle(.sidebar)
         }
-        .padding(.trailing, 12)
+        .padding(.trailing, 0)
     }
 
     private func imageNodeRow(_ node: StatusProfile) -> some View {
@@ -1850,7 +2769,8 @@ struct ContentView: View {
                                     (nodeState == .running ? Color.green : Color.secondary))
                                  : Color.secondary.opacity(0.7))
         }
-        .padding(.vertical, 2)
+        .padding(.vertical, 7)
+        .accessibilityElement(children: .combine)
         .contextMenu {
             Button(model.libraryPreferences.favorites.contains(node.id) ? "取消收藏" : "收藏此节点") {
                 model.toggleFavorite(node.id)
@@ -1890,15 +2810,13 @@ struct ContentView: View {
                   let node = model.nodes.first(where: { $0.id == id }) {
             nodeDetail(node)
         } else {
-            VStack(alignment: .leading, spacing: 8) {
-                Text("当前状态").font(.headline)
+            ContentUnavailableView {
+                Label("选择一个实验", systemImage: "square.stack.3d.up")
+            } description: {
                 Text(model.nodes.filter(\.imported).isEmpty
-                     ? "尚无已导入镜像：选择镜像文件夹会自动扫描并导入，或从“导入…”手动添加。"
-                     : "从左侧选择一个镜像查看状态与操作。")
-                    .foregroundStyle(.secondary)
+                     ? "选择镜像文件夹或导入镜像，建立你的第一个实验。"
+                     : "从资源库选择镜像，查看运行状态并继续实验。")
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-            .padding(.leading, 12)
         }
     }
 
@@ -2363,5 +3281,915 @@ struct CTFLabGuiApp: App {
             ContentView(model: model)
                 .onAppear { model.refreshStatus() }
         }
+    }
+}
+
+// 原生远程工作区：窗口只驱动固定客户端动作，不启动本机VM或改变远程生命周期。
+@MainActor
+private struct MacRemoteSheet: View {
+    @ObservedObject var model: GuiModel
+    var embedded = false
+    @Environment(\.dismiss) private var dismiss
+    private let names = ["prepare": "准备实验", "start": "启动", "stop": "正常停止", "reset": "整课重置", "recover": "恢复核验", "cancel": "取消后续操作"]
+    private func confirm(_ message: String, action: () -> Void) {
+        let alert = NSAlert(); alert.messageText = message
+        alert.informativeText = "仅向当前已核验目标发送本次明确请求；结果未知时不自动重发。"
+        alert.addButton(withTitle: "确认"); alert.addButton(withTitle: "取消")
+        if alert.runModal() == .alertFirstButtonReturn { action() }
+    }
+    private func leaseEnabled(_ action: String) -> Bool {
+        guard !model.remoteBusy, !model.remoteHasPending, let context = model.remoteContext, let ttl = Int(model.remoteTTL) else { return false }
+        return (try? MacRemoteRules.lease(action, status: model.remoteLeases, context: context, instance: model.remoteInstance,
+            selected: model.remoteLease, ttl: ttl, consent: model.remoteStopConsent)) != nil
+    }
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack { Text("远程实验").font(.title2).bold(); Spacer(); if !embedded { Button("关闭管理") { model.disconnectRemote(); dismiss() } } }
+            Text("连接受限Linux运行器。关闭面板不会停止实验；需要管理员提供的私有连接配置。").font(.caption).foregroundStyle(.secondary)
+            ScrollView {
+                VStack(alignment: .leading, spacing: 18) {
+                    targetSection
+                    if let context = model.remoteContext {
+                        if context.courses || context.audit {
+                            Button(model.remoteAdminOpen ? "返回实例管理" : "课程与审计管理") {
+                                model.remoteAdminOpen.toggle()
+                                if model.remoteAdminOpen { model.loadRemoteAdminPending() }
+                            }.disabled(model.remoteBusy)
+                        }
+                        if model.remoteAdminOpen { administrationSection(context) } else { instanceSection(context) }
+                    }
+                }.padding(4)
+            }
+            Text(model.remoteMessage).textSelection(.enabled).font(.callout)
+            if model.remoteBusy { HStack { ProgressView().controlSize(.small); Text("请求处理中；未确认结果不会自动重发。").font(.caption) } }
+        }.padding(embedded ? 0 : 20).frame(minWidth: embedded ? 0 : 920, minHeight: embedded ? 0 : 760)
+        .onAppear { model.loadRemoteTargets() }
+        .onDisappear { if !embedded { model.disconnectRemote() } }
+        .onReceive(Timer.publish(every: 2, on: .main, in: .common).autoconnect()) { _ in
+            if model.remoteTransferID != nil { model.refreshRemoteTransferHistory() }
+        }
+    }
+    private var targetSection: some View {
+        GroupBox("本机保存的目标") {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack {
+                    TextField("目标名称", text: $model.remoteLabel).frame(width: 160)
+                    TextField("私有配置文件", text: $model.remoteConfig)
+                    Button("选择配置…") { model.chooseRemoteConfig() }
+                    Button("保存目标") { model.saveRemoteTarget() }.disabled(model.remoteBusy || model.remoteLabel.isEmpty || model.remoteConfig.isEmpty)
+                }.disabled(model.remoteBusy)
+                Text("保存只登记本机配置/身份文件引用，不复制私钥，不连接服务器。").font(.caption).foregroundStyle(.secondary)
+                DisclosureGroup("填写服务器信息生成配置") {
+                    VStack(alignment: .leading, spacing: 6) {
+                        ForEach(["host", "port", "user", "server_uuid", "identity", "known_hosts"], id: \.self) { key in
+                            HStack {
+                                Text(["host": "服务器地址", "port": "SSH端口", "user": "SSH用户", "server_uuid": "服务器UUID", "identity": "身份文件", "known_hosts": "固定主机密钥文件"][key] ?? key).frame(width: 130, alignment: .leading)
+                                TextField("", text: Binding(get: { model.remoteWizard[key] ?? "" }, set: { model.remoteWizard[key] = $0 }))
+                                if ["identity", "known_hosts"].contains(key) { Button("选择…") { model.chooseRemoteIdentity(key) } }
+                            }
+                        }
+                        Text("使用Mac系统SSH。主机密钥文件会复制到私有配置目录，原文件不变；私钥仅引用，不复制。").font(.caption)
+                        Button("生成并保存配置（不连接）") { model.createRemoteTarget() }.disabled(model.remoteLabel.isEmpty)
+                    }.padding(6).disabled(model.remoteBusy)
+                }
+                HStack {
+                    Picker("保存目标", selection: $model.remoteSelected) {
+                        Text("请选择").tag("")
+                        ForEach(model.remoteTargets) { item in Text(item.label + " · " + String(item.server.prefix(8))).tag(item.id) }
+                    }.disabled(model.remoteBusy || model.remoteContext != nil)
+                    Button("刷新列表") { model.loadRemoteTargets() }.disabled(model.remoteBusy)
+                    Button("明确连接") { model.connectRemote() }.disabled(model.remoteBusy || model.remoteSelected.isEmpty)
+                    Button("断开管理") { model.disconnectRemote() }.disabled(model.remoteContext == nil && model.remoteConnectionID == nil)
+                    if model.remoteConnectionID != nil { Button("取消本次连接") { model.cancelRemoteConnection() } }
+                }
+            }.padding(6)
+        }
+    }
+    private func administrationSection(_ context: MacRemoteContext) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("管理操作只使用服务器登记课程与分配实例。配置不启动实验；审计观察不重放操作，原执行结果保留未知。").font(.caption)
+            if context.courses {
+                GroupBox("登记课程") {
+                    VStack(alignment: .leading) {
+                        Button("读取登记课程") { model.remoteAdministration("course-list") }
+                        Picker("课程", selection: $model.remoteOffer) {
+                            Text("请选择").tag("")
+                            ForEach(Array(model.remoteOffers.enumerated()), id: \.offset) { _, offer in Text(offer["title"].text ?? "课程").tag(offer["offer_id"].text ?? "") }
+                        }.onChange(of: model.remoteOffer) { model.remoteCoursePlan = .null; model.remoteCourseInstance = "" }
+                        Picker("分配实例", selection: $model.remoteCourseInstance) {
+                            Text("请选择").tag("")
+                            ForEach(model.remoteOffers.first(where: { $0["offer_id"].text == model.remoteOffer })?["instances"].items.compactMap(\.text) ?? [], id: \.self) { Text($0).tag($0) }
+                        }.onChange(of: model.remoteCourseInstance) { model.remoteCoursePlan = .null }
+                        Button("预览课程配置") { model.remoteAdministration("course-preview", values: ["offer_id": .string(model.remoteOffer), "instance_uuid": .string(model.remoteCourseInstance)]) }
+                        if let hash = model.remoteCoursePlan["mapping_sha256"].text {
+                            Text("映射摘要：" + hash).font(.caption).textSelection(.enabled)
+                            Button("确认配置（不启动）") { confirm("确认配置所选课程？") {
+                                model.remoteAdministration("course-provision", values: ["offer_id": .string(model.remoteOffer), "instance_uuid": .string(model.remoteCourseInstance), "mapping_sha256": .string(hash)])
+                            } }
+                        }
+                    }
+                }
+            }
+            if context.audit {
+                GroupBox("未决审计") {
+                    VStack(alignment: .leading) {
+                        Button("读取 / 刷新未决记录") { readAudit(after: 0) }
+                        if let count = model.remoteAudit["pending_count"].integer { Text("未决 \(count) 项；独立快照不代表VM当前状态。") }
+                        ForEach(Array(model.remoteAudit["pending"].items.enumerated()), id: \.offset) { _, row in
+                            HStack {
+                                Text((row["attempt_id"].text ?? "") + " · " + (row["observation"].text ?? "未知")).font(.caption)
+                                Button("预览终态观察") { model.remoteAdministration("audit-settlement-preview", values: ["attempt_id": row["attempt_id"]]) }
+                            }
+                        }
+                        if model.remoteAudit["more"].flag == true { Button("下一页") { readAudit(after: model.remoteAudit["next_intent"].integer ?? 0) } }
+                        if let hash = model.remoteAuditPlan["review_sha256"].text {
+                            Text("观察摘要：" + hash).font(.caption)
+                            Button("追加观察，保留原结果未知") { confirm("确认追加此契约终态观察？") {
+                                model.remoteAdministration("audit-settle", values: ["attempt_id": model.remoteAuditPlan["attempt_id"], "review_sha256": .string(hash)])
+                            } }
+                        }
+                    }
+                }
+            }
+            Button("读取本机未确认管理请求") { model.loadRemoteAdminPending() }
+            ForEach(Array(model.remotePending.filter { ["course-provision", "audit-settle"].contains($0["payload"]["action"].text ?? "") }.enumerated()), id: \.offset) { _, item in
+                HStack {
+                    Text((item["payload"]["action"].text ?? "") + " · " + (item["phase"].text ?? "未知"))
+                    Button("使用原请求重试") { confirm("确认以原请求标识重试管理操作？") { model.retryRemoteAdministration(item) } }
+                }
+            }
+        }.disabled(model.remoteBusy)
+    }
+    private func readAudit(after: Int) {
+        let audit = model.remoteAudit
+        let checkpoint: MacRemoteJSON = audit["audit_head_seq"].integer == nil ? .null : .object(["seq": audit["audit_head_seq"], "sha256": audit["audit_head_sha256"]])
+        model.remoteAdministration("audit-review", values: ["after": .number(Double(after)), "limit": .number(50), "checkpoint": checkpoint])
+    }
+    private func instanceSection(_ context: MacRemoteContext) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("服务器：\(context.saved.server)").font(.caption).textSelection(.enabled)
+            HStack {
+                Picker("分配实例", selection: Binding(get: { model.remoteInstance }, set: { model.selectRemoteInstance($0) })) {
+                    Text("请选择").tag("")
+                    ForEach(context.instances, id: \.self) { Text($0).tag($0) }
+                }.disabled(model.remoteBusy)
+                Button("读取 / 刷新当前状态") { model.refreshRemote() }.disabled(model.remoteBusy || model.remoteInstance.isEmpty)
+            }
+            if model.remoteView != .null {
+                Text("当前状态：\(model.remoteView["status"]["state"].text ?? "未核验") · 代次 \(model.remoteView["generation"].integer ?? 0)")
+                HStack {
+                    ForEach(["prepare", "start", "stop", "reset", "recover", "cancel"], id: \.self) { operation in
+                        Button(names[operation] ?? operation) {
+                            confirm("确认向当前实例请求\(names[operation] ?? operation)？") { model.performRemote(operation) }
+                        }.disabled(!model.remoteAllowed(operation))
+                    }
+                }
+                if context.leases { leaseSection }
+                GroupBox("节点显示") {
+                    ForEach(Array(model.remoteView["topology"]["nodes"].items.enumerated()), id: \.offset) { _, node in
+                        HStack {
+                            Text(node["id"].text ?? "未核验节点")
+                            Button("请求显示窗口") { model.requestRemoteDisplay(node["id"].text ?? "") }
+                                .disabled(!model.remoteDisplayAllowed(node["id"].text ?? ""))
+                        }
+                    }
+                    Text("需要当前活动租约；窗口请求返回不等于连接成功。剪贴板/文件传输不开启。").font(.caption)
+                }
+            }
+            if !model.remotePending.isEmpty {
+                GroupBox("本地未决请求（不自动发送）") {
+                    ForEach(Array(model.remotePending.enumerated()), id: \.offset) { _, item in
+                        HStack {
+                            Text("原请求 \(String((item["id"].text ?? "").prefix(8))) · \(item["phase"].text ?? "未知")")
+                            Button("明确使用原标识重试") {
+                                confirm("使用原请求、原幂等键重试？") { model.retryRemote(item) }
+                            }.disabled(model.remoteBusy || item["payload"]["instance_uuid"].text != model.remoteInstance)
+                        }
+                    }
+                }
+            }
+            transferSection(context)
+        }
+    }
+    private var leaseSection: some View {
+        GroupBox("资源租约") {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack {
+                    Picker("当前租约", selection: $model.remoteLease) {
+                        Text("请选择").tag("")
+                        ForEach(Array(model.remoteLeases["leases"].items.enumerated()), id: \.offset) { _, row in
+                            Text(String((row["lease_id"].text ?? "").prefix(8)) + " · " + (row["time_state"].text ?? "未知")).tag(row["lease_id"].text ?? "")
+                        }
+                    }
+                    TextField("期限（秒）", text: $model.remoteTTL).frame(width: 120)
+                    ForEach([("lease-acquire", "申请"), ("lease-renew", "续期"), ("lease-release", "释放")], id: \.0) { action, label in
+                        Button(label) { confirm("按当前策略\(label)资源租约？释放需服务器确认全部停止，磁盘引用保留。") { model.changeRemoteLease(action) } }.disabled(!leaseEnabled(action))
+                    }
+                }.disabled(model.remoteBusy)
+                if model.remoteLeases["expiry_action"].text == "request-stop" {
+                    Toggle("我理解此租约允许到期处理时请求正常停止；本界面不会运行调度。", isOn: $model.remoteStopConsent)
+                }
+                Text("权限/状态读取失败时不开放新变更；未决请求需先核验或明确原标识重试。").font(.caption)
+            }.padding(6)
+        }
+    }
+    private func transferSection(_ context: MacRemoteContext) -> some View {
+        DisclosureGroup("许可资产与封存证据") {
+            VStack(alignment: .leading, spacing: 8) {
+                Button("读取本机传输记录") { model.refreshRemoteTransferHistory() }
+                if context.assets {
+                    HStack {
+                        TextField("许可索引来源标识", text: $model.remoteAssetSource)
+                        TextField("原始资产文件", text: $model.remoteAssetFile)
+                        Button("选择资产…") { model.chooseRemoteAsset() }
+                        Button("明确上传") { confirm("上传当前原始资产到已连接运行器？服务器仍需当前许可。") { model.uploadRemoteAsset() } }
+                            .disabled(model.remoteBusy || model.remoteAssetFile.isEmpty || model.remoteAssetSource.isEmpty)
+                    }.disabled(model.remoteBusy)
+                }
+                if let active = model.remoteTransferID {
+                    Button("暂停本次传输") { model.remoteTransferAction(active.kind == "asset" ? "asset-cancel" : "evidence-cancel", kind: active.kind, identity: active.id) }
+                }
+                ForEach(Array(model.remoteUploads.enumerated()), id: \.offset) { _, row in
+                    HStack {
+                        Text("上传 \(String((row["upload_id"].text ?? "").prefix(8))) · \(row["received"].integer ?? 0)/\(row["size"].integer ?? 0) · \(row["phase"].text ?? "未知")")
+                        Button("明确续传") { model.remoteTransferAction("asset-resume", kind: "asset", identity: row["upload_id"].text ?? "") }.disabled(model.remoteBusy || !context.assets || row["phase"].text == "verified")
+                        Button("当前远端核对") { model.remoteTransferAction("asset-probe", kind: "asset", identity: row["upload_id"].text ?? "") }.disabled(model.remoteBusy || !context.assets)
+                    }
+                }
+                if context.evidence {
+                    Button("明确列出当前实例封存证据") { model.listRemoteEvidence() }.disabled(model.remoteBusy || model.remoteInstance.isEmpty)
+                    ForEach(Array(model.remoteExports.enumerated()), id: \.offset) { _, export in
+                        ForEach(Array(export["files"].items.enumerated()), id: \.offset) { _, file in
+                            HStack {
+                                Text(file["name"].text ?? "未知文件")
+                                Button("下载私有副本") { confirm("下载此封存文件？原件不改，不自动打开或解包。") { model.downloadRemoteEvidence(export: export, file: file) } }.disabled(model.remoteBusy)
+                            }
+                        }
+                    }
+                }
+                ForEach(Array(model.remoteDownloads.filter { $0["instance_uuid"].text == model.remoteInstance }.enumerated()), id: \.offset) { _, row in
+                    HStack {
+                        Text("下载 \(row["file"].text ?? "") · \(row["received"].integer ?? 0)/\(row["size"].integer ?? 0) · \(row["phase"].text ?? "未知")")
+                        Button("明确续传") { model.remoteTransferAction("evidence-resume", kind: "evidence", identity: row["download_id"].text ?? "") }.disabled(model.remoteBusy || !context.evidence || row["phase"].text == "verified")
+                    }
+                    if let path = row["local_path"].text { Text("私有副本：" + path).font(.caption).textSelection(.enabled) }
+                }
+                Text("传输verified为历史记录，不代表当前远端/本机文件已重新核验。关闭页面不停止实验，不自动续传、打开或执行内容。").font(.caption).foregroundStyle(.secondary)
+            }.padding(8)
+        }
+    }
+}
+
+private final class MacScenarioPresentation: ObservableObject {
+    @Published var setupOpen = false
+}
+
+private struct MacScenarioSheet: View {
+    @ObservedObject var model: GuiModel
+    var embedded = false
+    var configurationOnly = false
+    @StateObject private var presentation = MacScenarioPresentation()
+    @Environment(\.dismiss) private var dismiss
+    private func confirm(_ action: String, _ title: String) {
+        let alert = NSAlert(); alert.messageText = title
+        alert.informativeText = "仅操作当前实例。旧资产保留，正常停止超时不强杀；结果未知时先读取状态，不自动重发。"
+        alert.addButton(withTitle: "确认"); alert.addButton(withTitle: "取消")
+        if alert.runModal() == .alertFirstButtonReturn { model.sceneRequest(action) }
+    }
+    private func confirmCustom(_ title: String, action: () -> Void) {
+        let alert = NSAlert(); alert.messageText = title
+        alert.informativeText = "只处理当前通用实例的明确请求；结果未知时保留现场，不自动重发。"
+        alert.addButton(withTitle: "确认"); alert.addButton(withTitle: "取消")
+        if alert.runModal() == .alertFirstButtonReturn { action() }
+    }
+    private var configurationControls: some View {
+            HStack {
+                Button("选择私有运行时配置…") { model.chooseSceneFile("profile") }
+                Text(model.sceneRuntimeProfile.isEmpty ? "未选择" : URL(fileURLWithPath: model.sceneRuntimeProfile).lastPathComponent)
+                Button("建立通用实例") { confirm("configure", "按已预览清单建立新通用实例？") }
+                    .disabled(model.scenePlan == nil || !MacRemoteRules.digest(model.sceneManifestSHA) || model.sceneRuntimeProfile.isEmpty)
+                Button("导出校验清单") { model.sceneExport() }.disabled(model.scenePlan == nil)
+                Button("编辑拓扑草稿") { model.sceneLoadDraft(); model.sceneGraphOpen = model.sceneDraft != .null }
+                    .disabled(model.sceneLocalView == nil || model.sceneWorkspaceBusy)
+            }
+    }
+    private var genericControls: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            if let view = model.sceneLocalView {
+                Text("当前代次 \(view["generation"].integer ?? 0) · 操作记录 \(localLabel(view["status"]["state"].text))")
+                if !MacObservationWindow.fresh(view) { Text(view["freshness"]["reason"].text == "changed-during-sampling" ? "采样期间实验已变化，请重新读取；设计信息保留，运行状态待核验。" : "状态已过期或采样不完整，请重新读取；设计信息保留，运行状态待核验。").font(.caption).foregroundStyle(.orange) }
+                MacRuntimeTopology(view: view)
+                HStack {
+                    Button("读取外部攻击机状态") { model.sceneGenericCall(["action": .string("external-attach-status")]) }
+                        .disabled(model.sceneWorkspaceBusy)
+                }
+                MacExternalAttachCard(model: model, summary: (try? MacExternalAttachSummary(model.sceneExternalAttach ?? .null))
+                    ?? (try? MacExternalAttachSummary(view["external_attach"])) ?? nil)
+                DisclosureGroup("持续监督历史（非当前运行状态）") {
+                    Text("读取已保存采样，不启动监督或重放操作；进程现在的状态以重新读取为准。").font(.caption)
+                    if view["supervision_history"]["unavailable"].flag == true {
+                        Text("历史记录暂不可核验，现场已保留。").foregroundStyle(.orange)
+                    }
+                    ForEach(Array(view["supervision_history"]["watches"].items.suffix(16).reversed().enumerated()), id: \.offset) { _, item in
+                        Text("代次 \(item["generation"].integer ?? 0) · \(item["ticks"].integer ?? 0)次 · \(item["sampled_at"].text ?? "尚无采样") · " + (item["coherent"].flag == true && item["complete"].flag == true ? "末次完整一致（历史）" : "末次待核验（历史）"))
+                            .font(.caption).textSelection(.enabled)
+                    }
+                }
+                if view["runtime"]["dependencies"]["tls_control"].flag == false { Text("当前运行时缺少认证控制依赖；设计和准备可用，启动须使用完整通用运行时。").font(.caption).foregroundStyle(.orange) }
+                HStack {
+                    Button("查询原请求") { model.sceneQueryOriginal() }.disabled(!model.sceneCanQueryOriginal)
+                    Button("取消后续操作") { confirm("cancel", "取消当前操作尚未执行的后续步骤？") }.disabled(!model.sceneGenericAllowed("cancel"))
+                    if MacObservationWindow.fresh(view), view["dispatch"]["resume_allowed"].flag == true {
+                        Button("继续派发原请求") { confirmCustom("明确继续尚未领取的原请求？") { model.sceneRecoverPreparation("resume-dispatch") } }
+                    }
+                    if MacObservationWindow.fresh(view), view["preparation"]["restart_allowed"].flag == true {
+                        Button("保留现场，重新准备") { confirmCustom("保留旧半成品，以全新操作重新准备？") { model.sceneRecoverPreparation("restart-preparation") } }
+                    }
+                }
+                DisclosureGroup("已保存操作（历史）") {
+                    Text("从原操作账本只读读取；不显示请求参数或幂等键；历史记录不代表当前运行状态，也不会自动重发或恢复。").font(.caption)
+                    HStack {
+                        Button("读取历史") { model.sceneHistoryLoad() }.disabled(model.sceneWorkspaceBusy)
+                        Button("更早一页") { model.sceneHistoryNextPage() }.disabled(model.sceneWorkspaceBusy || !model.sceneHistoryHasNext)
+                    }
+                    ForEach(Array(model.sceneHistory.enumerated()), id: \.offset) { _, row in
+                        HStack {
+                            Text("\(row.operation) · \(row.status) · 代次 \(row.expectedGeneration.map(String.init) ?? "—")" + (row.cancelRequested ? " · 已记录取消意图" : ""))
+                                .font(.caption).textSelection(.enabled)
+                            Spacer()
+                            Button("原响应") { model.sceneSavedRecord(row.operationID) }.disabled(model.sceneWorkspaceBusy)
+                        }
+                    }
+                    if let record = model.sceneHistoryRecord {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("原响应（历史）：\(record.record.operation) · " + (record.response["result"].text ?? "无已保存响应；状态以重新读取为准。"))
+                                .font(.caption).textSelection(.enabled)
+                            if let code = record.response["error"]["code"].text {
+                                Text("公开错误：\(code) · \(record.response["error"]["message"].text ?? "")").font(.caption).foregroundStyle(.orange)
+                            }
+                        }
+                    }
+                }
+                DisclosureGroup("实验事件（严格游标）") {
+                    Text("按序号连续性只读追加；出现缺口、实例不符或游标过期时清空本地时间线，并要求重新读取状态，不自动重发操作。").font(.caption)
+                    Button("读取新事件") { model.sceneEventsRefresh() }.disabled(model.sceneWorkspaceBusy)
+                    if !model.sceneEventNotice.isEmpty { Text(model.sceneEventNotice).font(.caption).foregroundStyle(.orange) }
+                    ForEach(Array(model.sceneEvents.reversed().enumerated()), id: \.offset) { _, event in
+                        Text("#\(event["sequence"].integer ?? 0) · \(event["stage"].text ?? "?") · \(localLabel(event["state"].text)) · 代次\(event["generation"].integer ?? 0) · \(event["timestamp"].text ?? "")")
+                            .font(.caption).textSelection(.enabled)
+                    }
+                }
+                ForEach(model.sceneNodeIDs, id: \.self) { node in
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text(node + " · " + localLabel(MacObservationWindow.fresh(view) ? view["observations"][node]["state"].text : "unknown")).bold()
+                        HStack {
+                            Button("打开 / 重连显示") { model.sceneDisplay(node) }.disabled(!MacObservationWindow.fresh(view) || view["observations"][node]["state"].text != "process-running" || view["runtime"]["dependencies"]["display"].flag == false)
+                            Button("恢复退出观测") { confirmCustom("核验当前进程并补建退出观测？") { model.sceneRearm(node) } }
+                                .disabled(!MacObservationWindow.fresh(view) || view["observations"][node]["state"].text != "process-running" || view["supervision"][node]["observer"].text == "running")
+                        }
+                        if view["supervision"][node]["logs"]["kind"].text == "posix-fifo-v1" {
+                            Text("日志接收：" + (view["supervision"][node]["logs"]["receiver"].text == "lock-held" ? "接收锁已占用" : "尚未确认接收") + "；历史可能有缺口。").font(.caption)
+                            Button("重接日志接收器") { confirmCustom("保留旧片段，重接当前日志通道？不重启或停止实验。") { model.sceneRearmLog(node) } }
+                                .disabled(!MacLogRecovery.allowed(view,node:node,busy:model.sceneWorkspaceBusy))
+                        }
+                        if view["guest_agents"][node] != .null {
+                            HStack {
+                                Button("配置实验网络") { confirmCustom("按固定策略配置来宾实验网络？") { model.sceneGuest(node, "network-apply") } }
+                                Button("启动DNS与时间") { confirmCustom("启动本代次DNS与时间服务？") { model.sceneGuest(node, "services-start") } }
+                                Button("停止基础服务") { confirmCustom("保存并停止本代次基础服务？") { model.sceneGuest(node, "services-stop") } }
+                                Button("读取来宾状态") { model.sceneGuest(node, "status") }
+                            }.disabled(!model.sceneGenericAllowed("guest"))
+                            if view["guest_agents"][node]["containers"].flag == true {
+                                HStack {
+                                    Button("准备容器") { confirmCustom("准备本代次容器？") { model.sceneGuest(node, "containers-prepare") } }
+                                    Button("启动容器") { confirmCustom("启动本代次容器？") { model.sceneGuest(node, "containers-start") } }
+                                    Button("保存并停止容器") { confirmCustom("保存并停止本代次容器？") { model.sceneGuest(node, "containers-stop") } }
+                                }.disabled(!model.sceneGenericAllowed("guest"))
+                                MacGuestRecoveryView(model: model,node: node)
+                                    .id(model.sceneInstance + ":" + String(view["generation"].integer ?? 0) + ":" + node)
+                            }
+                            if view["guest_agents"][node]["analysis"].flag == true {
+                                Button("离线分析并封存") { confirmCustom("使用本代次固定分析器处理证据？") { model.sceneGuest(node, "analysis-run") } }.disabled(!model.sceneGenericAllowed("guest"))
+                            }
+                        }
+                    }.padding(8).background(Color.secondary.opacity(0.06)).cornerRadius(6)
+                }
+            }
+        }
+    }
+    private func localLabel(_ value: String?) -> String {
+        ["unknown":"尚未核验", "prepared":"已准备", "stopped":"已停止", "process-running":"进程运行，服务待验", "recovery-required":"需要恢复核验", "preparing":"正在准备", "starting":"正在启动", "stopping":"正在停止", "resetting":"正在创建新代次", "recovering":"正在核验", "failed":"未完成"][value ?? "unknown"] ?? "待核对"
+    }
+    private func label(_ value: String?) -> String {
+        switch value { case "stopped-observed": return "已观测停止"; case "running-observed": return "仍有进程运行"
+        case "recovery-required": return "需要恢复核验"; case "committed-observed": return "已选定代次"
+        case "old-active-preserved": return "旧代次已保留"; default: return "待核对" }
+    }
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack { Text(configurationOnly ? "场景设计与配置" : "实验运行").font(.title2).bold(); Spacer(); if !embedded { Button("关闭面板") { dismiss() } } }
+            Text("选择原固定三节点或新版通用场景。通用模式支持ARM原生与明确确认的x86仿真；设计、进程、服务和课程验收分别记录。")
+                .font(.caption).foregroundStyle(.secondary)
+            ScrollView {
+                VStack(alignment: .leading, spacing: 12) {
+                    Picker("运行链", selection: $model.sceneGeneric) { Text("原固定三节点").tag(false); Text("新版通用v2").tag(true) }.pickerStyle(.segmented)
+                    HStack { TextField("实例UUID", text: $model.sceneInstance)
+                        Button("新实例") { model.sceneInstance = UUID().uuidString.lowercased(); model.sceneSnapshot = nil }
+                        Button("列出已有场景") { model.sceneRequest("status", list: true) }
+                        Button("读取此实例状态") { model.sceneRequest("status") } }
+                    if !configurationOnly {
+                        TimelineView(.periodic(from: .now, by: 1)) { _ in
+                        HStack(spacing: 20) {
+                            Label(model.sceneGeneric ? "通用实验" : "Wintermute", systemImage: "cube")
+                            if let view = model.sceneLocalView {
+                                Text("代次 \(view["generation"].integer ?? 0)").bold()
+                                Text(MacObservationWindow.fresh(view) ? "当前采样 · " + localLabel(view["status"]["state"].text) : "状态待核验 · 请重新读取").foregroundStyle(.secondary)
+                            } else { Text("尚未读取此实例状态").foregroundStyle(.secondary) }
+                        }.padding(18).frame(maxWidth: .infinity, alignment: .leading).background(.blue.opacity(0.06), in: RoundedRectangle(cornerRadius: 12))
+                        }
+                    }
+                    if !configurationOnly {
+                    HStack {
+                        Button("准备独立副本") { confirm("prepare", "准备当前实例的独立副本？") }.disabled(model.sceneGeneric ? !model.sceneGenericAllowed("prepare") : !model.sceneHasCurrent || model.scenePlan == nil)
+                        Button("启动场景") { confirm("start", "启动当前场景？") }.disabled(model.sceneGeneric ? !model.sceneGenericAllowed("start") : !model.sceneHasCurrent || !model.sceneEmulation)
+                        Button("正常停止") { confirm("stop", "核验身份并请求正常停止当前场景？") }.disabled(model.sceneGeneric ? !model.sceneGenericAllowed("stop") : !model.sceneHasCurrent)
+                        Button(model.sceneGeneric ? "恢复核验" : "收口中断重置") { confirm("recover", "只读核验当前实例并收口可确认的中断？") }.disabled(model.sceneGeneric ? !model.sceneGenericAllowed("recover") : !model.sceneHasCurrent)
+                    }
+                    HStack { if !model.sceneGeneric { TextField("新代次", text: $model.sceneNewGeneration).frame(width: 90) }
+                        Button("整场景重置到新代次") { confirm("reset", "保留旧代次并创建新代次？") }.disabled(model.sceneGeneric ? !model.sceneGenericAllowed("reset") : !model.sceneHasCurrent) }
+                    }
+                    DisclosureGroup(configurationOnly ? "清单、资产与运行配置" : "新建实验 / 调整准备配置", isExpanded: Binding(get: { configurationOnly || presentation.setupOpen }, set: { presentation.setupOpen = $0 })) {
+                        if model.sceneGeneric { configurationControls }
+                    HStack { Button("选择场景清单…") { model.chooseSceneFile("manifest") }
+                        Text(model.sceneManifest.isEmpty ? "未选择" : URL(fileURLWithPath: model.sceneManifest).lastPathComponent)
+                        Button("查看设计") { model.sceneRequest("preview") }.disabled(model.sceneManifest.isEmpty) }
+                    ForEach(model.sceneNodeIDs, id: \.self) { node in
+                        HStack { Text(node).bold(); Text("\(model.scenePlan?["manifest"]["nodes"][node]["cpus"].integer ?? 0) vCPU · \(model.scenePlan?["manifest"]["nodes"][node]["memory_mb"].integer ?? 0) MiB").foregroundStyle(.secondary) }
+                    }
+                    ForEach(model.sceneNetworkIDs, id: \.self) { network in
+                        VStack(alignment: .leading) {
+                            let cidr = model.scenePlan?["manifest"]["networks"][network]["cidr"].text ?? ""
+                            Text(network + " · " + cidr).bold()
+                            Text(model.sceneMembers(network))
+                            Text("设计连接与地址，不代表实际互通；无物理局域网出口。").font(.caption).foregroundStyle(.secondary)
+                        }.padding(10).background(Color.blue.opacity(0.06)).cornerRadius(6)
+                    }
+                    ForEach(model.sceneAssetIDs, id: \.self) { id in
+                        HStack { Text("基盘 · " + id); Button(model.sceneAssets[id].map { URL(fileURLWithPath: $0).lastPathComponent } ?? "选择只读基盘…") { model.chooseSceneFile("asset", id: id) } }
+                    }
+                    ForEach(model.sceneUEFINodes, id: \.self) { node in
+                        HStack { Text(node + " · UEFI"); ForEach(model.sceneGeneric ? [1] : [0, 1], id: \.self) { role in
+                            Button((model.sceneFirmware[node]?[role]).flatMap { $0.isEmpty ? nil : URL(fileURLWithPath: $0).lastPathComponent } ?? (role == 0 ? "选择code固件…" : "选择vars模板…")) { model.chooseSceneFile("firmware", id: node, role: role) }
+                        } }
+                    }
+                    Toggle("明确允许本场景中的x86软件仿真（含x86节点时必选，ARM仍用原生加速）", isOn: $model.sceneEmulation)
+                    }
+                    if model.sceneGeneric && !configurationOnly {
+                        DisclosureGroup("节点、外部接入与操作记录") { TimelineView(.periodic(from: .now, by: 1)) { _ in genericControls } }
+                    }
+                    ForEach(Array((model.sceneReply?["reports"].items ?? []).enumerated()), id: \.offset) { _, report in
+                        VStack(alignment: .leading) {
+                            HStack { Text(report["instance_uuid"].text ?? "未知实例").font(.caption).textSelection(.enabled)
+                                Button("选择此实例") { model.sceneInstance = report["instance_uuid"].text ?? ""; model.sceneSnapshot = nil } }
+                            Text("代次 \(report["active"]["generation"].integer.map(String.init) ?? "未选定") · 节点：\(label(report["nodes"]["state"].text)) · 网络服务：\(label(report["services"]["state"].text))")
+                        }.padding(8).background(Color.secondary.opacity(0.08)).cornerRadius(6)
+                    }
+                }.disabled(model.sceneWorkspaceBusy)
+            }
+            if model.sceneWorkspaceBusy { ProgressView("正在处理本次请求；关闭面板不自动停止场景。") }
+            Text(model.sceneMessage).font(.callout).textSelection(.enabled)
+        }.padding(embedded ? 0 : 20).frame(minWidth: embedded ? 0 : 820, minHeight: embedded ? 0 : 650)
+            .sheet(isPresented: $model.sceneGraphOpen) { MacGraphSheet(model: model) }
+            .onChange(of: model.sceneInstance) { _, _ in model.sceneSnapshot = nil; model.sceneLocalView = nil }
+            .onChange(of: model.sceneGeneric) { _, _ in model.sceneSnapshot = nil; model.sceneLocalView = nil; model.scenePlan = nil; model.sceneSourceManifest = nil; model.sceneManifestSHA = ""; model.sceneInstance = UUID().uuidString.lowercased() }
+            .onChange(of: model.sceneInstance) { _, _ in model.sceneResetReadonly() }
+    }
+}
+
+/// 设计画布与运行状态分离，连接操作只更新值副本，后端校验后才开放导出。
+private struct MacGraphFramesKey: PreferenceKey {
+    static let defaultValue: [String:CGRect] = [:]
+    static func reduce(value: inout [String:CGRect],nextValue: () -> [String:CGRect]) { value.merge(nextValue()) { _,new in new } }
+}
+private final class MacGraphCanvasState: ObservableObject {
+    @Published var frames: [String:CGRect] = [:]
+    @Published var positions: [String:MacRemoteJSON] = [:]
+    @Published var origins: [String:MacRemoteJSON] = [:]
+}
+private struct MacGraphSheet: View {
+    @ObservedObject var model: GuiModel
+    var embedded = false
+    @Environment(\.dismiss) private var dismiss
+    @StateObject private var layoutState = MacGraphCanvasState()
+    private var positions: [String:MacRemoteJSON] { get { layoutState.positions } nonmutating set { layoutState.positions = newValue } }
+    private var origins: [String:MacRemoteJSON] { get { layoutState.origins } nonmutating set { layoutState.origins = newValue } }
+    @GestureState private var isDragging = false
+    private var draft: MacRemoteJSON { model.sceneDraft }
+    private func location(_ key: String, _ x: CGFloat, _ y: CGFloat) -> CGPoint {
+        let value = positions[key]; return CGPoint(x: value?["x"].integer.map { CGFloat($0) } ?? x, y: value?["y"].integer.map { CGFloat($0) } ?? y)
+    }
+    private func nodePoint(_ node: String) -> CGPoint { location("node:" + node, 18, y(node)) }
+    private func networkPoint(_ network: String) -> CGPoint { location("network:" + network, 590, 16 + CGFloat((networks.firstIndex(of: network) ?? 0) * 112)) }
+    private func allPositions() -> [String:MacRemoteJSON] {
+        var result: [String:MacRemoteJSON] = [:]
+        for node in nodes { let p = nodePoint(node); result["node:" + node] = try? MacGraphLayout.point(p.x,p.y) }
+        for network in networks { let p = networkPoint(network); result["network:" + network] = try? MacGraphLayout.point(p.x,p.y) }
+        return result
+    }
+    private var boardWidth: CGFloat { max(900, max(nodes.map { nodePoint($0).x + 390 }.max() ?? 0, networks.map { networkPoint($0).x + 300 }.max() ?? 0)) }
+    private func move(_ key: String, point: CGPoint, dx: CGFloat, dy: CGFloat) {
+        if let value = try? MacGraphLayout.point(point.x + dx,point.y + dy) { positions[key] = value }
+    }
+    private func grip(_ key: String, _ label: String, point: CGPoint) -> some View {
+        Text("⠿ " + label).bold().padding(4).contentShape(Rectangle()).accessibilityLabel("移动" + label)
+            .background(GeometryReader { proxy in Color.clear.preference(key:MacGraphFramesKey.self,value:[("grip:" + key):proxy.frame(in:.named("mac-graph-board"))]) })
+            .gesture(DragGesture(minimumDistance: 3,coordinateSpace: .named("mac-graph-board")).updating($isDragging) { _, active, _ in active = true }.onChanged { event in
+                if origins[key] == nil { origins[key] = try? MacGraphLayout.point(point.x,point.y) }
+                let origin = origins[key]; move(key,point: CGPoint(x: origin?["x"].integer.map { CGFloat($0) } ?? point.x, y: origin?["y"].integer.map { CGFloat($0) } ?? point.y), dx: event.translation.width, dy: event.translation.height)
+            }.onEnded { _ in origins.removeValue(forKey: key) })
+            .contextMenu { Button("向左移动") { move(key,point: point,dx: -10,dy: 0) }; Button("向右移动") { move(key,point: point,dx: 10,dy: 0) }; Button("向上移动") { move(key,point: point,dx: 0,dy: -10) }; Button("向下移动") { move(key,point: point,dx: 0,dy: 10) } }
+    }
+    private func saveLayout() {
+        let original = draft, panel = NSSavePanel(); panel.nameFieldStringValue = "ctflab-graph-layout.json"
+        guard panel.runModal() == .OK, let url = panel.url, draft == original else { return }
+        do { let value = try MacGraphLayout.export(draft,positions: allPositions()); try Data(value.encoded().utf8).write(to: url,options: .withoutOverwriting); model.sceneMessage = "布局已导出，实验配置保持原样。" }
+        catch { model.sceneMessage = "布局未导出，已有文件保留。" }
+    }
+    private func loadLayout() {
+        let original = draft, panel = NSOpenPanel(); panel.canChooseDirectories = false; panel.allowsMultipleSelection = false
+        guard panel.runModal() == .OK, let url = panel.url, draft == original else { return }
+        do { let file = try FileHandle(forReadingFrom: url); defer { try? file.close() }; let data = try file.read(upToCount: 65537) ?? Data()
+            guard data.count <= 65536, let text = String(data: data,encoding: .utf8) else { throw MacRemoteError.invalid }
+            let next = try MacGraphLayout.load(draft,text: text); origins = [:]; positions = next; model.sceneMessage = "布局已载入，实验配置保持原样。"
+        } catch { model.sceneMessage = "布局未载入：核对草稿标识、元素及坐标；当前布局保留。" }
+    }
+    private var nodes: [String] { MacGraphDraft.keys(draft["nodes"]) }
+    private var networks: [String] { MacGraphDraft.keys(draft["networks"]) }
+    private func height(_ node: String) -> CGFloat { layoutState.frames["card:" + node]?.height ?? CGFloat(178 + draft["nodes"][node]["interfaces"].items.count * 42) }
+    private func y(_ node: String) -> CGFloat { 16 + nodes.prefix(while: { $0 != node }).reduce(CGFloat(0)) { $0 + height($1) + 18 } }
+    private var boardHeight: CGFloat { max(200, max(nodes.map { nodePoint($0).y + height($0) + 18 }.max() ?? 0, networks.map { networkPoint($0).y + 112 }.max() ?? 0)) }
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack { Text("拓扑草稿").font(.title2).bold(); Spacer(); if !embedded { Button("关闭草稿") { dismiss() } } }
+            Group {
+            Text("设计连线不代表实测可达。编辑不改变当前清单、运行代次或虚拟机；完整后端校验通过后可导出，供新实例使用。").font(.caption)
+            HStack { Button("撤销配置") { model.sceneMoveDraft(false) }.disabled(model.sceneDraftHistory?.canUndo != true); Button("重做配置") { model.sceneMoveDraft(true) }.disabled(model.sceneDraftHistory?.canRedo != true); Text("保留最近20步配置编辑；布局单独导出").font(.caption) }
+            HStack { Button("自动排列") { positions = [:]; origins = [:] }; Button("导出布局") { saveLayout() }; Button("载入布局") { loadLayout() }; Text("拖动标题，或在标题菜单选择移动方向").font(.caption) }
+            ScrollView([.horizontal, .vertical]) {
+                ZStack(alignment: .topLeading) {
+                    Canvas { context, _ in
+                        for node in nodes {
+                            for nic in draft["nodes"][node]["interfaces"].items {
+                                guard let target = nic["network"].text, networks.contains(target) else { continue }
+                                guard let source = layoutState.frames["nic:" + node + "/" + (nic["id"].text ?? "")], let destination = layoutState.frames["grip:network:" + target] else { continue }
+                                let start = CGPoint(x:source.maxX,y:source.midY), end = CGPoint(x:destination.minX,y:destination.midY)
+                                var path = Path(); path.move(to: start); path.addCurve(to: end, control1: CGPoint(x: start.x + 62, y: start.y), control2: CGPoint(x: end.x - 60, y: end.y))
+                                context.stroke(path, with: .color(.blue.opacity(0.65)), lineWidth: 2)
+                            }
+                        }
+                    }.frame(width: boardWidth, height: boardHeight).accessibilityLabel("草稿中的设计连接，不代表实际网络")
+                    ForEach(nodes, id: \.self) { node in nodeCard(node).frame(width:360).fixedSize(horizontal:false,vertical:true)
+                        .background(GeometryReader { proxy in Color.clear.preference(key:MacGraphFramesKey.self,value:[("card:" + node):proxy.frame(in:.named("mac-graph-board"))]) })
+                        .offset(x:nodePoint(node).x,y:nodePoint(node).y) }
+                    ForEach(Array(networks.enumerated()), id: \.element) { index, network in
+                        VStack(alignment: .leading) {
+                            grip("network:" + network,network,point: networkPoint(network)); Text(draft["networks"][network]["cidr"].text ?? "")
+                            Text("无物理出口 · 设计网段").font(.caption)
+                            Button("移除空闲草稿网段") { model.sceneEditDraft { try MacGraphDraft.removeNetwork($0, name: network) } }
+                                .disabled(nodes.contains { node in draft["nodes"][node]["interfaces"].items.contains { $0["network"].text == network } })
+                        }.padding(10).frame(width: 270, height: 90, alignment: .leading).background(.green.opacity(0.08)).cornerRadius(8).offset(x: networkPoint(network).x, y: networkPoint(network).y)
+                    }
+                }.frame(width: boardWidth, height: boardHeight).coordinateSpace(name: "mac-graph-board")
+                    .onPreferenceChange(MacGraphFramesKey.self) { frames in if frames.count <= 512 && layoutState.frames != frames { layoutState.frames = frames } }
+            }.background(.gray.opacity(0.03))
+            HStack {
+                TextField("新节点标识", text: $model.sceneDraftNodeName).frame(width: 150)
+                Picker("已有资产", selection: $model.sceneDraftAsset) { Text("请选择").tag(""); ForEach(MacGraphDraft.keys(draft["assets"]), id: \.self) { Text($0).tag($0) } }.frame(width: 240)
+                Button("添加草稿节点") { model.sceneEditDraft { try MacGraphDraft.addNode($0, name: model.sceneDraftNodeName, asset: model.sceneDraftAsset) } }.disabled(model.sceneDraftNodeName.isEmpty || model.sceneDraftAsset.isEmpty)
+            }
+            HStack {
+                TextField("新网段标识", text: $model.sceneDraftNetworkName).frame(width: 150); TextField("私有网段，如10.90.0.0/24", text: $model.sceneDraftCIDR).frame(width: 240)
+                Button("添加草稿网段") { model.sceneEditDraft { try MacGraphDraft.addNetwork($0, name: model.sceneDraftNetworkName, cidr: model.sceneDraftCIDR) } }.disabled(model.sceneDraftNetworkName.isEmpty || model.sceneDraftCIDR.isEmpty)
+            }
+            HStack {
+                Button("重新载入当前清单") { model.sceneLoadDraft() }
+                Button("后端校验与差异") { model.sceneValidateDraft() }
+                Button("导出已校验草稿") { model.sceneExportDraft() }.disabled(model.sceneDraftDiff["manifest"] != draft)
+                Text("差异 \(model.sceneDraftDiff["changes"].items.count) 项").font(.caption)
+            }
+            ScrollView { VStack(alignment: .leading) {
+                ForEach(Array(model.sceneDraftDiff["changes"].items.enumerated()), id: \.offset) { _, change in
+                    Text((change["path"].text ?? "") + ": " + ((try? change["before"].encoded()) ?? "") + " → " + ((try? change["after"].encoded()) ?? "")).font(.caption).textSelection(.enabled)
+                }
+            } }.frame(maxHeight: 90)
+            Text(model.sceneMessage).font(.caption).foregroundStyle(.secondary)
+            }.disabled(model.sceneWorkspaceBusy || model.sceneDraftContext != model.sceneInstance || !model.sceneGeneric)
+        }.padding(18).frame(minWidth: embedded ? 0 : 950, minHeight: embedded ? 0 : 680)
+            .onChange(of: isDragging) { _, active in if !active { for (key,value) in origins { positions[key] = value }; origins = [:] } }
+            .onChange(of: draft["scenario_id"]) { _, _ in positions = [:]; origins = [:] }
+            .onChange(of: model.sceneInstance) { _, _ in positions = [:]; origins = [:] }
+            .onChange(of: MacGraphLayout.keys(draft)) { _, keys in positions = positions.filter { keys.contains($0.key) }; origins = [:] }
+    }
+    private func resourceControls(_ node: String) -> some View {
+        let cpus = draft["nodes"][node]["cpus"].integer ?? 1, memory = draft["nodes"][node]["memory_mb"].integer ?? 512
+        let selected = draft["nodes"][node]["depends_on"].items.compactMap(\.text)
+        return VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Stepper("CPU \(cpus)", value: Binding(get: { cpus }, set: { count in model.sceneEditDraft { try MacGraphDraft.resources($0, node: node, cpus: count, memory: memory) } }), in: 1...64)
+                Text("内存MiB").font(.caption)
+                Picker("内存MiB", selection: Binding(get: { memory }, set: { size in model.sceneEditDraft { try MacGraphDraft.resources($0, node: node, cpus: cpus, memory: size) } })) {
+                    ForEach(Array(Set([256,512,1024,2048,4096,8192,16384,32768,65536,131072,262144,memory])).sorted(), id: \.self) { Text(String($0)).tag($0) }
+                }.labelsHidden().frame(width: 100).accessibilityLabel(node + "内存MiB")
+            }
+            Menu("启动依赖（\(selected.count)）") {
+                ForEach(nodes.filter { $0 != node }, id: \.self) { dependency in
+                    Toggle(dependency, isOn: Binding(get: { selected.contains(dependency) }, set: { enabled in
+                        model.sceneEditDraft { try MacGraphDraft.dependencies($0, node: node, selected: enabled ? selected + [dependency] : selected.filter { $0 != dependency }) }
+                    }))
+                }
+            }
+        }
+    }
+    private func nodeCard(_ node: String) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack { grip("node:" + node,node,point: nodePoint(node)); Spacer(); Button("移除草稿节点") { model.sceneEditDraft { try MacGraphDraft.removeNode($0, name: node) } } }
+            resourceControls(node)
+            ForEach(Array(draft["nodes"][node]["interfaces"].items.enumerated()), id: \.offset) { _, nic in
+                HStack {
+                    Text(nic["id"].text ?? "")
+                    Picker("连接", selection: Binding(get: { nic["network"].text ?? "" }, set: { network in model.sceneEditDraft { try MacGraphDraft.connect($0, node: node, nic: nic["id"].text, network: network) } })) {
+                        ForEach(networks, id: \.self) { Text($0).tag($0) }
+                    }.labelsHidden()
+                    Button("断开") { model.sceneEditDraft { try MacGraphDraft.disconnect($0, node: node, nic: nic["id"].text ?? "") } }
+                    Text(nic["address"].text ?? "").font(.caption)
+                }.frame(height: 36)
+                    .background(GeometryReader { proxy in Color.clear.preference(key:MacGraphFramesKey.self,value:[("nic:" + node + "/" + (nic["id"].text ?? "")):proxy.frame(in:.named("mac-graph-board"))]) })
+            }
+            Picker("新增网卡到", selection: Binding(get: { "" }, set: { network in if !network.isEmpty { model.sceneEditDraft { try MacGraphDraft.connect($0, node: node, nic: nil, network: network) } } })) {
+                Text("选择网段").tag(""); ForEach(networks, id: \.self) { Text($0).tag($0) }
+            }
+        }.padding(10).background(.blue.opacity(0.06)).cornerRadius(8)
+    }
+}
+
+
+private final class MacGuestRecoverySelection: ObservableObject {
+    @Published var target = ""
+}
+private struct MacGuestRecoveryView: View {
+    @ObservedObject var model: GuiModel
+    let node: String
+    @StateObject private var selection = MacGuestRecoverySelection()
+    private var view: MacRemoteJSON { model.sceneLocalView ?? .null }
+    private var records: [MacRemoteJSON] { view["guest_agents"][node]["preparation_records"].items }
+    private var target: String { selection.target.isEmpty ? records.first?["operation_id"].text ?? "" : selection.target }
+    private var snapshot: MacRemoteJSON { view["guest_agents"][node]["last_action"].text == "preparation-inspect" ? view["guest_agents"][node]["last_result"] : .null }
+    private func enabled(_ resume: Bool) -> Bool { model.sceneGenericAllowed("guest") && (try? MacGuestRecovery.parameters(view,node: node,target: target,resume: resume)) != nil }
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("准备中断后，先恢复核验实验进程，再核对原准备记录。旧记录不代表来宾当前状态。").font(.caption)
+            if !records.isEmpty {
+                Picker("原准备记录",selection: Binding(get: { target },set: { selection.target = $0 })) {
+                    if !records.contains(where: { $0["operation_id"].text == target }) { Text("手动选择的记录").tag(target) }
+                    ForEach(records.compactMap { $0["operation_id"].text },id: \.self) { operation in Text(String(operation.prefix(8))).tag(operation) }
+                }
+            }
+            TextField("准备记录标识",text: Binding(get: { target },set: { selection.target = String($0.prefix(36)).trimmingCharacters(in: .whitespacesAndNewlines) }))
+                .accessibilityLabel(node + "准备记录标识")
+            HStack {
+                Button("核对容器准备现场") { model.sceneGuestPreparation(node,target: target,resume: false) }.disabled(!enabled(false))
+                Button("保留现场，继续准备") {
+                    let alert = NSAlert(); alert.messageText = "保留旧文件和数据，只续建已核对的未完成准备？"
+                    alert.informativeText = "可能创建缺少的容器，但保持停止；结果未知的装载或创建不会重发。"; alert.addButton(withTitle: "继续准备"); alert.addButton(withTitle: "取消")
+                    if alert.runModal() == .alertFirstButtonReturn { model.sceneGuestPreparation(node,target: target,resume: true) }
+                }.disabled(!enabled(true))
+            }
+            if snapshot["operation_id"].text == target {
+                if snapshot["state"].text == "completed" { Text("该准备操作已有完成记录；本次核对未重放操作，真实服务仍需另行验收。").font(.caption) }
+                if snapshot["state"].text == "preparation-observed" {
+                    Text(snapshot["can_resume"].flag == true ? "可以继续未完成的准备；不会启动容器。" : "当前现场不允许续建，请保留记录。").font(.caption)
+                    ForEach(Array(snapshot["steps"].items.enumerated()),id: \.offset) { _,step in
+                        Text((step["step"].text ?? "") + " · " + (["recorded":"身份与记录一致","observed-unrecorded":"资源存在，记录未闭合","not-started":"尚未开始","unknown-absent":"结果未知且未找到资源","recorded-missing":"已有记录但资源缺失"][step["state"].text ?? ""] ?? "待核对")).font(.caption)
+                    }
+                }
+            }
+        }.padding(8)
+    }
+}
+
+
+/// 只读运行拓扑：设计连线与已绑定进程采样分开，不推断地址或可达性。
+private struct MacRuntimeTopology: View {
+    let view: MacRemoteJSON
+    var expanded = false
+    private var nodes: [MacRemoteJSON] { view["topology"]["nodes"].items }
+    private var networks: [String] { MacGraphDraft.keys(view["topology"]["networks"]) }
+    private func height(_ node: MacRemoteJSON) -> CGFloat { CGFloat(62 + 22 * node["interfaces"].items.count) }
+    private func top(_ index: Int) -> CGFloat { 12 + nodes.prefix(index).reduce(CGFloat(0)) { $0 + height($1) + 16 } }
+    private var boardHeight: CGFloat { max(160,max(nodes.reduce(CGFloat(24)) { $0 + height($1) + 16 },CGFloat(100 * networks.count + 24))) }
+    var body: some View {
+        VStack(alignment: .leading,spacing: 5) {
+            Text("设计连接与现场采样").font(.headline)
+            Text("连线和地址来自计划；进程采样不代表来宾、服务或网络隔离已验收。").font(.caption)
+            ScrollView([.horizontal,.vertical]) {
+                ZStack(alignment: .topLeading) {
+                    Canvas { context,_ in
+                        for (index,node) in nodes.enumerated() {
+                            for (nicIndex,nic) in node["interfaces"].items.enumerated() {
+                                if let network = networks.firstIndex(of: nic["network"].text ?? "") {
+                                    var line = Path();line.move(to:CGPoint(x:350,y:top(index)+45+CGFloat(nicIndex*22)))
+                                    line.addLine(to:CGPoint(x:520,y:CGFloat(network*100)+42));context.stroke(line,with:.color(.secondary.opacity(0.5)),lineWidth:1)
+                                }
+                            }
+                        }
+                    }.frame(width:810,height:boardHeight)
+                    ForEach(Array(nodes.enumerated()),id: \.offset) { index,node in
+                        VStack(alignment:.leading,spacing:0) {
+                            let state = MacObservationWindow.fresh(view) ? node["state"].text : "unknown"
+                            Text((node["id"].text ?? "") + " · " + (["stopped":"已观测停止","process-running":"进程运行中"][state ?? ""] ?? "未取得当前状态")).bold().lineLimit(1).frame(height:24,alignment:.leading)
+                            ForEach(Array(node["interfaces"].items.enumerated()),id: \.offset) { _,nic in
+                                Text((nic["id"].text ?? "") + " → " + (nic["network"].text ?? "") + " · " + (nic["planned_address"].text ?? "") + "（设计）").font(.caption).lineLimit(1).frame(height:22,alignment:.leading)
+                            }
+                        }.padding(10).frame(width:338,height:height(node),alignment:.topLeading).background(.blue.opacity(0.06)).cornerRadius(6).offset(x:12,y:top(index))
+                    }
+                    ForEach(Array(networks.enumerated()),id: \.element) { index,network in
+                        VStack(alignment:.leading,spacing:5) { Text(network).bold().lineLimit(1);Text(view["topology"]["networks"][network]["cidr"].text ?? "").font(.caption);Text("隔离及可达性待实测").font(.caption2) }
+                            .padding(10).frame(width:270,height:82,alignment:.leading).background(.green.opacity(0.08)).cornerRadius(6).offset(x:520,y:CGFloat(index*100)+12)
+                    }
+                }.frame(width:810,height:boardHeight)
+            }.frame(maxHeight: expanded ? .infinity : 350)
+        }
+    }
+}
+
+/// 外部攻击机卡片：登记、环境检查、网段选择、连接、断开、材料、终端入口与恢复说明。
+/// 全部动作经 sceneGenericCall 走同一桥接契约；连接按前置条件开放，未知状态如实显示。
+struct MacExternalAttachCard: View {
+    let model: GuiModel
+    let summary: MacExternalAttachSummary?
+    private func field(_ key: String) -> Binding<String> {
+        Binding(get: { self.model.sceneAttachForm[key] ?? "" },
+                set: { self.model.sceneAttachForm[key] = $0 })
+    }
+    private var attachStatus: MacRemoteJSON { model.sceneExternalAttach ?? .null }
+    private var attachSessionState: String { attachStatus["session"]["state"].text ?? "idle" }
+
+    private func isAbsoluteInput(_ value: String) -> Bool {
+        return value.hasPrefix("/") || value.contains(":\\\\") || value.contains(":/")
+            || (value.count >= 3 && value[value.index(value.startIndex, offsetBy: 1)] == ":"
+                && (value[value.index(value.startIndex, offsetBy: 2)] == "/" || value[value.index(value.startIndex, offsetBy: 2)] == "\\"))
+    }
+
+    private var name: Binding<String> { field("name") }
+    private var host: Binding<String> { field("host") }
+    private var port: Binding<String> { field("port") }
+    private var user: Binding<String> { field("user") }
+    private var identity: Binding<String> { field("identity") }
+    private var machineUUID: Binding<String> { field("machineUUID") }
+    private var vendor: Binding<String> { field("vendor") }
+    private var product: Binding<String> { field("product") }
+    private var assistantSHA: Binding<String> { field("assistantSHA") }
+    private var selectedNetwork: Binding<String> { field("selectedNetwork") }
+    private var sshConfigPath: Binding<String> { field("sshConfigPath") }
+    private var materialsPath: Binding<String> { field("materialsPath") }
+
+    private func call(_ payload: [String: MacRemoteJSON], refresh: Bool = true) {
+        model.sceneGenericCall(payload)
+        if refresh {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+                model.sceneGenericCall(["action": .string("external-attach-status")])
+            }
+        }
+    }
+
+    private var registrationJSON: MacRemoteJSON? {
+        guard !name.wrappedValue.isEmpty, !identity.wrappedValue.isEmpty,
+              !machineUUID.wrappedValue.isEmpty,
+              let portValue = Int(port.wrappedValue), (1...65535).contains(portValue),
+              assistantSHA.wrappedValue.count == 64 else { return nil }
+        let ssh: [String: MacRemoteJSON] = ["host": .string(host.wrappedValue),
+                                            "port": .number(Double(portValue)),
+                                            "user": .string(user.wrappedValue),
+                                            "identity": .string(identity.wrappedValue)]
+        let registration: [String: MacRemoteJSON] = [
+            "schema": .number(1), "kind": .string("kali-l2-v1"), "name": .string(name.wrappedValue),
+            "node_uuid": .string(UUID().uuidString.lowercased()),
+            "machine_uuid": .string(machineUUID.wrappedValue), "vendor": .string(vendor.wrappedValue),
+            "product": .string(product.wrappedValue), "ssh": .object(ssh),
+            "assistant_sha256": .string(assistantSHA.wrappedValue.lowercased())]
+        return .object(registration)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("外部攻击机").font(.headline)
+                Button("读取状态") {
+                    model.sceneGenericCall(["action": .string("external-attach-status")])
+                }.disabled(model.sceneWorkspaceBusy)
+            }
+            Text("Kali 的启动、暂停、关机、快照和磁盘仍由原虚拟机软件管理；CTFLab 只提供指定实验网段的受控接入。普通桌面程序不进入实验网络。").font(.caption)
+            if let summary {
+                Text(summary.bindingText).font(.subheadline)
+                    .foregroundStyle(summary.bindingStale ? .orange : .primary)
+                if summary.slots.isEmpty {
+                    Text("当前计划未声明外部接入口；运行中的旧实验不热改，下次创建实验代次生效。").font(.caption)
+                } else {
+                    ForEach(Array(summary.slots.enumerated()), id: \.offset) { _, slot in
+                        HStack {
+                            Image(systemName: selectedNetwork.wrappedValue == slot.network ? "largecircle.fill.circle" : "circle")
+                                .onTapGesture { selectedNetwork.wrappedValue = slot.network }
+                            Text("\(slot.network) · \(slot.address) · \(slot.mac)（静态预约，\(slot.cidr)）").font(.caption)
+                        }
+                    }
+                    Text("实验地址（靶机回连目标）：\(summary.slots.first?.address ?? "-") · 仅对本网段有效").font(.caption).textSelection(.enabled)
+                }
+                if attachStatus["session"] != .null {
+                    let state = attachSessionState
+                    Text("会话：\(state)" + (attachStatus["session"]["identity_state"].text.map { " · 身份：\($0)" } ?? "")).font(.caption)
+                        .foregroundStyle(state == "unknown" ? .orange : .primary)
+                }
+                Text(summary.note).font(.caption2).foregroundStyle(.secondary)
+                if let note = model.sceneExternalAttach?["note"].text {
+                    Text(note).font(.caption2).foregroundStyle(.secondary)
+                }
+                DisclosureGroup("登记 / 连接 / 断开") {
+                    VStack(alignment: .leading, spacing: 6) {
+                        TextField("显示名称", text: name).textFieldStyle(.roundedBorder)
+                        HStack {
+                            TextField("SSH地址", text: host).textFieldStyle(.roundedBorder)
+                            TextField("端口", text: port).textFieldStyle(.roundedBorder).frame(width: 70)
+                            TextField("SSH用户", text: user).textFieldStyle(.roundedBorder).frame(width: 130)
+                        }
+                        TextField("本地私钥绝对路径（/… 或 C:/…）", text: identity).textFieldStyle(.roundedBorder)
+                        HStack {
+                            TextField("机器UUID（Kali内读取）", text: machineUUID).textFieldStyle(.roundedBorder)
+                            TextField("助手SHA-256", text: assistantSHA).textFieldStyle(.roundedBorder)
+                        }
+                        HStack {
+                            TextField("厂商", text: vendor).textFieldStyle(.roundedBorder)
+                            TextField("产品", text: product).textFieldStyle(.roundedBorder)
+                        }
+                        HStack {
+                            Button("保存登记") {
+                                guard let registration = registrationJSON, !selectedNetwork.wrappedValue.isEmpty else { return }
+                                call(["action": .string("external-attach-save"),
+                                      "registration": registration,
+                                      "network": .string(selectedNetwork.wrappedValue)])
+                            }
+                            .disabled(model.sceneWorkspaceBusy || selectedNetwork.wrappedValue.isEmpty || registrationJSON == nil)
+                            Button("清除登记") {
+                                call(["action": .string("external-attach-clear")])
+                            }.disabled(model.sceneWorkspaceBusy)
+                        }
+                        HStack {
+                            TextField("SSH配置JSON绝对路径", text: sshConfigPath).textFieldStyle(.roundedBorder)
+                            Button("连接") {
+                                call(["action": .string("external-attach-connect"),
+                                      "ssh_config": .string(sshConfigPath.wrappedValue)])
+                            }
+                            .disabled(model.sceneWorkspaceBusy || !isAbsoluteInput(sshConfigPath.wrappedValue)
+                                      || !summary.connectSupported
+                                      || attachStatus["binding"]["prepared"] == .null
+                                      || attachStatus["binding"]["prepared"]["used"] == .bool(true)
+                                      || !["idle", "disconnected", "unknown"].contains(attachSessionState))
+                            Button("断开") {
+                                call(["action": .string("external-attach-disconnect")])
+                            }.disabled(model.sceneWorkspaceBusy
+                                       || !["connecting", "connected", "unknown"].contains(attachSessionState))
+                        }
+                    }.padding(.vertical, 4)
+                }
+                if let setup = attachStatus["binding"]["prepared"]["setup_command"].text {
+                    Text("Kali 内管理员执行：\(setup)").font(.caption).textSelection(.enabled)
+                    if let shell = attachStatus["binding"]["prepared"]["shell_command"].text {
+                        Text("实验终端：\(shell)").font(.caption).textSelection(.enabled)
+                    }
+                    if let teardown = attachStatus["binding"]["prepared"]["teardown_command"].text {
+                        Text("撤网：\(teardown)").font(.caption).textSelection(.enabled)
+                    }
+                    // 设计§4.3持久批准：连接前须把登记摘要与本机材料清单绑定入账本。
+                    Text("连接前须完成助手安装批准（未批准会按身份未核验拒绝）：在终端运行 `ctflab external-attach approve --registration <登记JSON> --materials-manifest <材料目录>/manifest.json`。")
+                        .font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+                }
+                DisclosureGroup("Kali 助手材料与实验终端") {
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack {
+                            TextField("材料输出目录绝对路径", text: materialsPath).textFieldStyle(.roundedBorder)
+                            Button("生成材料") {
+                                call(["action": .string("external-attach-materials"),
+                                      "destination": .string(materialsPath.wrappedValue)])
+                            }.disabled(model.sceneWorkspaceBusy || materialsPath.wrappedValue.isEmpty)
+                        }
+                        Text("安装与账户准备见材料内 INSTALL.md；安装属独立部署动作。").font(.caption2)
+                        Text("会话创建（Kali 内 root）：先生成材料，按 manifest.json 的 prepared.setup_command 创建会话；prepared.shell_command 进入实验终端，prepared.teardown_command 撤网。").font(.caption2).textSelection(.enabled)
+                    }.padding(.vertical, 4)
+                }
+                Text("恢复说明：断开只撤中转通道，不停止 VM、不结束 Kali 内工具；残留进程与命名空间以助手 status 为准。会话 unknown 时先核对进程再重试或显式清除；快照/代次变化后旧接入失效，需重新预览。").font(.caption2).foregroundStyle(.secondary)
+            } else {
+                Text("状态未读取。点击「读取状态」获取登记、槽位与会话信息。").font(.caption)
+            }
+        }.padding(10).frame(maxWidth: .infinity, alignment: .leading)
+            .background(.blue.opacity(0.05)).cornerRadius(8)
     }
 }

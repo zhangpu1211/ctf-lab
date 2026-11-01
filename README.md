@@ -1,10 +1,28 @@
 # CTFLab for Mac M
 
+> 2026-10-30：**0.1.4-preview.20261030** 已发布Mac可执行预览，新增原生分栏与整体界面更新，并纳入近期共享源码。Windows同步提供最新版构建源码，**不是EXE安装器**；原生环境/安装验收仍缺。见[本轮说明](docs/ctflab-ui-release-2026-10-30.md)与[当前状态第139节](docs/ctflab-current-status.md)。旧版保留，43项/G0/G1未整体完成。
+
+2026-10-25 最新工作区增量：[桌面远程租约管理](docs/ctflab-desktop-leases-2026-10-25.md)补齐明确申请/续期/释放、服务器owner与期限门、停止策略额外确认和原标识手动重试；未知不自动重发，可显式保存不含连接配置的原请求。范围见[本轮验证](docs/verification-desktop-leases-2026-10-25.md)，剩余见[状态第93节](docs/ctflab-current-status.md)。前轮[远程目标](docs/ctflab-desktop-remote-2026-10-25.md)与[未决只读核验](docs/ctflab-audit-review-2026-10-25.md)保留；只有替身/代码检查，未连接真实SSH、操作用户VM、运行到期调度或覆盖旧包，集中实机验收尚未开始。
+
+2026-10-24 工作区候选：[通用场景 QEMU 后端与 Windows 恢复验收](docs/ctflab-production-driver-2026-10-24.md)已提供实际启动路径与独立退出观测；Windows 原生、来宾网络和显示验收仍待执行，未更新发布 App。
+
+> 2026-10-23 最新工作区入口：[本地可实施部分交付](docs/ctflab-offline-delivery-2026-10-23.md)。新增通用代次存储/协调基础、离线拓扑与网络检查计划、C05合成应急课程及Windows回传摘要工具；Windows真实查询/关机闭环已有回传，但G0/G1未完成。下方日期化记录保留历史范围，不能作为最新完整状态。跨平台离线入口：`python -B tools/ctflab_offline.py --help`；它不是Windows VM运行器或安装包。
+
 CTFLab 是面向 Apple Silicon Mac 的本地虚拟靶场运行器。它使用 QEMU 管理 ARM64 与 x86_64 客体，以不可变 QCOW2 基盘和可重置 overlay 保存运行状态，并通过仅绑定回环地址的用户态二层交换机连接 Kali 与靶机。
 
 当前仓库只包含运行器、候选配置、来宾修复模板、测试和设计文档，不包含虚拟磁盘、账号凭据、课程题库或成绩数据。
 
-> 2026-10-11 文档整理：当前发布为 **0.1.1-preview**，最低 macOS 26、Apple Silicon；工作区后续单镜像导入优化尚未重新打包。统一镜像库为 `/Users/pufei/Downloads/CTFLab-Library`：待处理输入、已处理三节点分发与软件分别保存。当前状态与历史证据入口见[文档总览](docs/ctflab-current-status.md)，接收者先看[使用教程](docs/ctflab-student-distribution-tutorial.md)。
+> 2026-10-28 Mac预览更新：**0.1.3-preview.20261028** 面向 Apple Silicon、macOS 26+，ad-hoc、未公证。本轮包含稳定性保护、通用架构拓扑、配置撤销/重做及差异导出；实际交付与验证见[当前状态第114节](docs/ctflab-current-status.md)和[本轮说明](docs/ctflab-stability-topology-2026-10-28.md)。旧包保留，Windows继续候选验证；43项、真实课程及G0/G1尚未完成。统一镜像库仍为 `/Users/pufei/Downloads/CTFLab-Library`。
+
+后续建设入口：[教学与跨平台产品规划](docs/ctflab-product-roadmap-2026-10-15.md)、[Windows x64 专项设计](docs/ctflab-windows-plan-2026-10-15.md)、[实施任务与验收清单](docs/ctflab-implementation-backlog-2026-10-15.md)。方向为教学与个人练习、Windows x64 优先，覆盖 Windows 渗透、内网多靶机和应急响应；规划不代表这些新增能力已经实现。
+
+2026-10-21 工作区进展：[平台基础第一阶段](docs/ctflab-platform-foundation-2026-10-21.md)已完成依赖清单、平台/加速器纯策略及 Mac 参数等价验证，另有本地协议草案和[Windows 原型清单](docs/ctflab-windows-prototype-checklist-2026-10-21.md)。Windows 运行器尚未实现/实机验收，当前发布 App 未重新打包。
+
+2026-10-21 后续工作区进展：[A03 本地契约与 W01 独立驱动](docs/ctflab-local-contract-w01-2026-10-21.md)已实现持久幂等、并发前置条件、恢复/取消与事件读取；独立驱动通过本地合成自测和隔离包测试。Windows 原生后端、受保护 IPC 和实机验收尚未完成，未更新发布 App。
+
+本机契约入口：`python3 -B tools/ctflab.py local-contract --root /absolute/private/contract-root`，读取标准输入中的 v1 JSON 行；默认只读，不创建目录或启动 VM。普通本机身份边界见[实施记录第7—8节](docs/ctflab-local-contract-w01-2026-10-21.md#8-windows-身份与私有存储接入2026-10-22)。
+
+2026-10-21 全路线图接续：[执行台账](docs/ctflab-roadmap-execution-2026-10-21.md)逐项记录43项差距。已新增通用场景离线计划、课程目录、Windows原生基础和诊断分享预览；仍非 Windows 可用运行器。用户负责 Windows 实机验证，当前 G0/G1 未通过。
 
 ## 当前能力
 
@@ -148,6 +166,8 @@ python3 -m unittest discover -s tools/tests -v
 python3 -m py_compile tools/ctflab.py tools/ctflab_inspect.py tools/ctflab_network.py
 ```
 
+未打包工作区的最新整批开发入口、验证范围和43项剩余判据见[连续开发记录](docs/ctflab-remaining-development-2026-10-26.md)与[当前状态](docs/ctflab-current-status.md)。Mac既有预览包与后续未打包源码分别记录，Windows仍是候选；不能将源码进展视为发布包已更新、跨平台实机或完整路线图完成。
+
 ## 文档
 
 - [当前状态、分发目录与文档阅读顺序（2026-10-11）](docs/ctflab-current-status.md)
@@ -200,5 +220,15 @@ python3 -m py_compile tools/ctflab.py tools/ctflab_inspect.py tools/ctflab_netwo
 - 导入过程中可“停止后续导入”：当前镜像安全处理完后停止，已完成节点保留；不是立即中断当前转换。
 - 详情显示本次配置与宿主 QEMU 进程的 CPU/RSS；停止后显示下次默认配置。CPU 可超过 100%，RSS 不是来宾内存压力，采样失败显示未知。
 - 文本剪贴板与拖入文件各自授权，默认关闭；清晰/流畅偏好不影响输入坐标策略。
-- “更多 → 导出脱敏诊断”保存状态与少量日志；路径可能包含个人信息，请检查后再分享，不覆盖已有文件。
+- 未打包工作区新增“更多 → 分享诊断摘要”：只显示白名单匿名摘要，先预览再排他保存同一份内容，不上传；快照可能过期。原含路径/日志报告保留为“完整本机诊断（私密）”，不用于公开分享。已发布旧App菜单未更新，范围见[Mac诊断分享说明](docs/ctflab-mac-diagnostics-2026-10-29.md)。
 - Kali 睡眠恢复尚未通过验收，暂用锁定屏幕或正常关机。提供可撤销的[睡眠避险工具与验证步骤](docs/ctflab-kali-sleep-guard.md)，需在派生来宾内显式应用，默认不会安装；不关闭锁屏，也不把防护称为唤醒支持。
+
+Mac与Windows的后端、界面、包和实机状态分别见[跨平台功能接入矩阵](docs/ctflab-mac-parity-2026-10-26.md)。Mac原App未自动获得全部后续功能；Windows桌面工作台仍为开发候选。
+
+Mac通用v2后端、原生工作区和可选完整运行时见[接入说明](docs/ctflab-mac-generic-2026-10-27.md)；这是未打包源码能力，真实来宾、最终包和G0/G1另行验收。
+
+2026-10-27 课程与审计双端管理源码见[接入说明](docs/ctflab-course-administration-2026-10-27.md)：教师登记课程配置、管理员终态观察和原请求恢复已接到React/原SwiftUI，配置不启动、审计不重放；未更新发布App，真实远程/完整课程验收仍未完成。
+
+Mac原生[拓扑草稿与差异导出](docs/ctflab-mac-topology-2026-10-27.md)已接通生产清单校验，编辑保留运行实例和原文件；需导出后按新实例配置；本轮Mac预览包含该入口，验证范围见状态第114节。
+
+第107节继续补Mac/React拓扑资源与启动依赖编辑、循环拒绝和空闲网段移除；只改草稿声明，完整后端校验后导出，不热改实例或宣称已具备硬配额。结果见[当前状态第107节](docs/ctflab-current-status.md)。

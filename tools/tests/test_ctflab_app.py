@@ -934,7 +934,7 @@ class RuntimeSelectionTests(unittest.TestCase):
             fake_tools = app / "Contents" / "Resources" / "ctflab" / "tools"
             fake_tools.mkdir(parents=True)
             for name in ("ctflab.py", "ctflab_inspect.py", "ctflab_network.py",
-                         "ctflab_utm.py", "ctflab_utm_fixture.json"):
+                         "ctflab_utm.py", "ctflab_utm_fixture.json", "ctflab_platform.py"):
                 shutil.copy2(TOOLS_DIR / name, fake_tools / name)
             shutil.copytree(TOOLS_DIR / "ctflab_profiles", fake_tools / "ctflab_profiles")
             fake_module = fake_tools / "ctflab.py"
@@ -1053,6 +1053,82 @@ class CliSurfaceTests(unittest.TestCase):
             self.assertIn("tools/ctflab_app.py", paths)
             ctflab_package.verify_release_bundle(pathlib.Path(result["bundle"]))
 
+    def test_packaged_w01_driver_selftest_without_repository_imports(self) -> None:
+        # 验证三份新模块确实随源码复制；只运行无 VM 的独立自检。
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            packaged = root / "packaged"
+            ctflab_app._copy_ctflab_sources(PROJECT_ROOT, packaged)
+            result = subprocess.run(
+                [sys.executable, "-I", str(packaged / "tools/ctflab_windows_probe.py"), "--self-test"],
+                cwd=root, capture_output=True, text=True, timeout=20)
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+            report = json.loads(result.stdout)
+            self.assertEqual(report["scope"], "synthetic-only")
+            self.assertFalse(report["g0_passed"])
+            adapter = subprocess.run(
+                [sys.executable, "-I", str(packaged / "tools/ctflab_local_adapter.py"), "--help"],
+                cwd=root, capture_output=True, text=True, timeout=10)
+            self.assertEqual(adapter.returncode, 0, adapter.stderr)
+
+
+class GenericRuntimeTests(AppTestCase):
+    def licenses(self):
+        import json
+        root=pathlib.Path(self.temp.name);entries={}
+        for name in ('cryptography','tcl','tk'):
+            path=root/(name+'.LICENSE');path.write_text('test-only license fixture '+name)
+            entries[name]={'path':str(path),'sha256':ctflab_app.sha256_file(path),'license':'test-fixture'}
+        manifest=root/'generic.json';manifest.write_text(json.dumps({'schema':1,'licenses':entries}))
+        return manifest
+
+    def test_generic_runtime_preserves_tk_and_records_dependency_proof_and_licenses(self):
+        import json
+        proof={'imports_from_bundle':True,'cryptography':'46.0.5','tcl':'8.6','tk':'8.6','tcl_library':'lib/tcl8.6','window_opened':False}
+        with mock.patch.object(ctflab_app,'probe_generic_runtime',return_value=proof) as probe:
+            result=self.build(generic_runtime_manifest=self.licenses())
+            report=ctflab_app.verify_app(pathlib.Path(result['app']),check_signature=False)
+        self.assertTrue(probe.called)
+        self.assertTrue(report['runtime']['python']['generic']['imports_from_bundle'])
+        self.assertEqual(set(report['runtime']['python']['generic']['licenses']),{'cryptography','tcl','tk'})
+        self.assertFalse(report['runtime']['python']['generic']['native_display_verified'])
+        self.assertTrue(any(c.get('name')=='cryptography' for c in result['sbom']['components']))
+        self.assertTrue(any(p.name=='tkinter' for p in (pathlib.Path(result['app'])/ctflab_app.PYTHON_RUNTIME_REL).rglob('tkinter')))
+
+    def test_generic_runtime_refuses_missing_or_tampered_license_before_probe(self):
+        import json
+        manifest=self.licenses();value=json.loads(manifest.read_text());value['licenses']['tk']['sha256']='0'*64;manifest.write_text(json.dumps(value))
+        destination=pathlib.Path(self.temp.name)/'licenses';destination.mkdir()
+        with self.assertRaises(ctflab_app.AppBuildError):ctflab_app.generic_runtime_licenses(manifest,destination)
+        self.assertFalse(self.out.exists())
+
+    def test_generic_probe_accepts_real_builtin_but_rejects_foreign_files_and_fake_builtin(self):
+        import ast, sys
+        from types import SimpleNamespace
+        with mock.patch.object(ctflab_app.subprocess,'run',return_value=SimpleNamespace(returncode=1,stdout='',stderr='')) as call:
+            with self.assertRaises(ctflab_app.AppBuildError):ctflab_app.probe_generic_runtime(pathlib.Path(self.temp.name))
+        script=call.call_args.args[0][-1]
+        function=next(n for n in ast.parse(script).body if isinstance(n,ast.FunctionDef) and n.name=='module_from_bundle')
+        root=pathlib.Path(self.temp.name).resolve();scope={'sys':sys,'Path':pathlib.Path,'root':root}
+        exec(compile(ast.Module(body=[function],type_ignores=[]),'probe-under-test','exec'),scope)
+        belongs=scope['module_from_bundle']
+        self.assertTrue(belongs(sys))
+        self.assertTrue(belongs(SimpleNamespace(__file__=str(root/'module.so'))))
+        self.assertFalse(belongs(SimpleNamespace(__file__='/outside/module.so')))
+        self.assertFalse(belongs(SimpleNamespace(__name__='not_a_builtin',__spec__=SimpleNamespace(origin='built-in'))))
+        self.assertFalse(belongs(SimpleNamespace(__name__='sys',__spec__=SimpleNamespace(origin='frozen'))))
+
+    def test_mac_sources_include_entire_shared_desktop_runtime(self):
+        from ctflab_desktop_package import TOOLS
+        self.assertTrue(set(TOOLS)<=set(ctflab_package.RELEASE_TOOL_FILES))
+
+    def test_generic_runtime_probe_is_isolated_and_rejects_foreign_imports(self):
+        from types import SimpleNamespace
+        root=pathlib.Path(self.temp.name)/'python'
+        with mock.patch.object(ctflab_app.subprocess,'run',return_value=SimpleNamespace(returncode=1,stdout='',stderr='private failure')) as call:
+            with self.assertRaises(ctflab_app.AppBuildError):ctflab_app.probe_generic_runtime(root)
+        self.assertIn('-I',call.call_args.args[0]);self.assertIn('-B',call.call_args.args[0])
+        self.assertNotIn('PYTHONPATH',call.call_args.kwargs['env'])
 
 if __name__ == "__main__":
     unittest.main()

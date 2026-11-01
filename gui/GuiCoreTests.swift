@@ -5,6 +5,168 @@
 
 import Foundation
 
+final class CLIProof: @unchecked Sendable {
+    private let lock = NSLock()
+    private var values: [CliOutcome] = []
+    private var exited = false
+    func record(_ value: CliOutcome) { lock.lock(); values.append(value); lock.unlock() }
+    func markExited() { lock.lock(); exited = true; lock.unlock() }
+    var outcomes: [CliOutcome] { lock.lock(); defer { lock.unlock() }; return values }
+    var exitSeen: Bool { lock.lock(); defer { lock.unlock() }; return exited }
+}
+
+// 仅测试二进制的显式夹具入口，最多等待2秒；不运行QEMU/Python或用户程序。
+func cliOutputFixture(_ mode: String, root: URL) {
+    if mode == "descendant" {
+        let child = Process(); child.executableURL = URL(fileURLWithPath: CommandLine.arguments[0])
+        child.arguments = ["--cli-output-fixture", "gate", root.path]
+        child.standardInput = FileHandle.nullDevice
+        child.standardOutput = FileHandle.standardOutput; child.standardError = FileHandle.standardError
+        try! child.run(); exit(0)
+    }
+    if mode == "gate" {
+        let until = Date().addingTimeInterval(2)
+        while !FileManager.default.fileExists(atPath: root.appendingPathComponent("release").path), Date() < until {
+            Thread.sleep(forTimeInterval: 0.005)
+        }
+    }
+    if mode == "flood" {
+        try! FileHandle.standardOutput.write(contentsOf: Data(repeating: 120, count: 1024 * 1024))
+        let marker = Data("候选配置已生成：".utf8)
+        try! FileHandle.standardOutput.write(contentsOf: marker.prefix(5))
+        try! FileHandle.standardOutput.write(contentsOf: marker.dropFirst(5))
+        try! Data("finished".utf8).write(to: root.appendingPathComponent("finished"))
+        exit(3)
+    }
+    if mode == "invalid" {
+        try! FileHandle.standardOutput.write(contentsOf: Data([255, 254]))
+    } else {
+        let bytes = Data("{\"text\":\"中文\"}".utf8)
+        try! FileHandle.standardOutput.write(contentsOf: bytes.prefix(11))
+        Thread.sleep(forTimeInterval: 0.01)
+        try! FileHandle.standardOutput.write(contentsOf: bytes.dropFirst(11))
+    }
+    try! Data("finished".utf8).write(to: root.appendingPathComponent("finished"))
+    exit(0)
+}
+
+func runCLIOutputChecks() {
+    let buffer = OutputBuffer(limit: 8)
+    buffer.append(Data("12345678".utf8))
+    check(buffer.snapshot().complete && buffer.snapshot().capturedBytes == 8, "输出恰好达到上限仍完整")
+    buffer.append(Data("9".utf8)); buffer.append(Data(repeating: 120, count: 10000))
+    check(!buffer.snapshot().complete && buffer.snapshot().capturedBytes == 8, "越限后不追加原始回复或解析截断JSON")
+    let marker = Data("候选配置已生成：".utf8)
+    buffer.append(marker.prefix(4)); buffer.append(marker.dropFirst(4))
+    check(buffer.snapshot().candidateCreated, "越限后跨UTF8块保留候选提示元数据")
+    let utf = OutputBuffer(limit: 32); let text = Data("中文".utf8)
+    utf.append(text.prefix(1)); check(!utf.snapshot().complete, "半个UTF8字符暂不当完整回复")
+    utf.append(text.dropFirst(1)); check(utf.snapshot().complete && utf.snapshot().text == "中文", "后续字节补全后恢复精确UTF8")
+    utf.markReadFailure(); check(!utf.snapshot().complete, "读取失败后不能仅凭合法前缀成功")
+
+    let updates = CLIOutputUpdates(); var schedules = 0
+    for _ in 0..<1000 { if updates.offer(Data(repeating: 120, count: 1024), progress: nil) { schedules += 1 } }
+    let p = ImportProgress.latest(in: "CTFLAB_IMPORT_PROGRESS {\"stage\":\"提交\",\"elapsed_seconds\":1,\"cancellable\":false}\n")!
+    _ = updates.offer(Data("tail".utf8), progress: p)
+    let batch = updates.take()
+    check(schedules == 1 && batch.text.utf8.count <= 65536 && batch.text.hasSuffix("tail"), "千次输出只排一个有界显示批次")
+    check(batch.progress?.cancellable == false, "合并通知保留最新不可取消状态")
+    check(updates.offer(Data("new".utf8), progress: nil), "消费批次后才安排下一通知")
+    _ = updates.take()
+    let largeProgress = ImportProgress.latest(in: "CTFLAB_IMPORT_PROGRESS {\"stage\":\"异常\",\"done\":9223372036854775807,\"total\":1,\"elapsed_seconds\":1e300,\"cancellable\":false}\n")!
+    check(largeProgress.label == "异常 100% · 耗时未知", "进度大整数先截断再转换，超大耗时明确未知")
+    let negativeProgress = ImportProgress(stage: "异常", done: Int64.min, total: 1, elapsed_seconds: -1, cancellable: false)
+    check(negativeProgress.label == "异常 0% · 耗时未知", "负进度归零但负耗时不伪装正常")
+    let infiniteProgress = ImportProgress(stage: "异常", done: nil, total: nil, elapsed_seconds: .infinity, cancellable: false)
+    check(infiniteProgress.label == "异常 · 耗时未知", "非有限耗时不能转Int崩溃")
+    let partialPipe = Pipe(); let partialBuffer = OutputBuffer(limit: 32)
+    let partialReader = CLIPipeCollector(handle: partialPipe.fileHandleForReading, buffer: partialBuffer)
+    let available = DispatchSemaphore(value: 0)
+    try! partialPipe.fileHandleForWriting.write(contentsOf: Data("ready".utf8))
+    DispatchQueue.global().async { _ = partialReader.receive({ _ in }); available.signal() }
+    let beforeEOF = available.wait(timeout: .now() + 1) == .success
+    check(beforeEOF, "有数据即返回有界读取，不等待满64KiB或EOF")
+    try! partialPipe.fileHandleForWriting.close()
+    if !beforeEOF { _ = available.wait(timeout: .now() + 1) }
+    check(partialReader.drain({ _ in }) && partialBuffer.snapshot().text == "ready", "分块读取结束后尾部完整收口")
+    let identityPipe = Pipe(); let identityBuffer = OutputBuffer(limit: 32)
+    let identityReader = CLIPipeCollector(handle: identityPipe.fileHandleForReading, buffer: identityBuffer)
+    try! identityPipe.fileHandleForReading.close()
+    let unrelated = Pipe()
+    try! unrelated.fileHandleForWriting.write(contentsOf: Data("other".utf8)); try! unrelated.fileHandleForWriting.close()
+    try! identityPipe.fileHandleForWriting.write(contentsOf: Data("owned".utf8)); try! identityPipe.fileHandleForWriting.close()
+    check(identityReader.drain({ _ in }) && identityBuffer.snapshot().text == "owned", "原句柄关闭后仍只读取独立绑定的旧管道")
+    check(try! unrelated.fileHandleForReading.read(upToCount: 32) == Data("other".utf8), "不会借描述符复用读取另一条管道")
+    let ioSlots = CLIRequestSlots(maximum: 1); let ioTicket = ioSlots.acquire()!
+    let lifetime = CLIRequestLifetime(ticket: ioTicket, hasInput: true)
+    lifetime.processFinished(outputClosed: true)
+    check(ioSlots.active == 1, "进程和输出结束仍须等待输入写端收口")
+    lifetime.inputFinished(); check(ioSlots.active == 0, "输入结束后统一释放进程与管道槽位")
+    let slots = CLIRequestSlots(maximum: 1); let first = slots.acquire()!
+    check(slots.acquire() == nil && slots.active == 1, "在途已满不发放新进程槽位")
+    first.release(); first.release(); check(slots.active == 0, "资源收口重复释放仍只计一次")
+    do { _ = slots.acquire() }
+    check(slots.active == 1, "未核验的票据离开作用域不静默释放")
+    let proof = CLIProof(); let response = CLIResponseOnce { proof.record($0) }
+    check(response.finish(.success("one")) && !response.finish(.failure("late")), "同步收口也只交付一次")
+    response.startTimeout(seconds: 0.001); Thread.sleep(forTimeInterval: 0.02)
+    check(proof.outcomes == [.success("one")], "已结束请求不新增迟到计时回复")
+
+    for mode in ["normal", "flood", "invalid", "gate", "descendant"] {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory()).resolvingSymlinksInPath()
+            .appendingPathComponent("ctflab-cli-proof-\(UUID().uuidString)")
+        try! FileManager.default.createDirectory(at: root, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+        let process = Process(); process.executableURL = URL(fileURLWithPath: CommandLine.arguments[0])
+        process.arguments = ["--cli-output-fixture", mode, root.path]
+        process.standardInput = FileHandle.nullDevice
+        let pipe = Pipe(); process.standardOutput = pipe; process.standardError = pipe
+        let captured = OutputBuffer(limit: mode == "flood" ? 64 : 4096)
+        let collector = CLIPipeCollector(handle: pipe.fileHandleForReading, buffer: captured)
+        let localSlots = CLIRequestSlots(maximum: 1); let ticket = localSlots.acquire()!
+        let localProof = CLIProof(); let replied = DispatchSemaphore(value: 0); let ended = DispatchSemaphore(value: 0)
+        let once = CLIResponseOnce { localProof.record($0); replied.signal() }
+        pipe.fileHandleForReading.readabilityHandler = { handle in
+            switch collector.receive({ _ in }) {
+            case .received: break
+            case .eof, .failed: handle.readabilityHandler = nil
+            }
+        }
+        process.terminationHandler = { finished in
+            localProof.markExited()
+            pipe.fileHandleForReading.readabilityHandler = nil
+            if collector.drain({ _ in }) { ticket.release() }
+            let value = captured.snapshot()
+            _ = once.finish(value.complete && finished.terminationStatus == 0 ? .success(value.text) : .failure(value.text))
+            ended.signal()
+        }
+        if mode == "gate" || mode == "descendant" { once.startTimeout(seconds: 0.01) }
+        do { try process.run() }
+        catch { check(false, "自有Swift子进程启动失败"); ticket.release(); continue }
+        if mode == "gate" || mode == "descendant" {
+            check(replied.wait(timeout: .now() + 3) == .success, "\(mode)等待超时先交付未知结果")
+            if mode == "descendant" {
+                let until = Date().addingTimeInterval(1)
+                while !localProof.exitSeen && Date() < until { Thread.sleep(forTimeInterval: 0.005) }
+                check(localProof.exitSeen, "父进程退出已观察，不能当stdout已结束")
+            }
+            check(localSlots.active == 1 && localSlots.acquire() == nil, "\(mode)未收口仍持槽且不停止后台")
+            try! Data("release".utf8).write(to: root.appendingPathComponent("release"))
+        }
+        let finished = ended.wait(timeout: .now() + 5) == .success
+        check(finished && localSlots.active == 0, "\(mode)真实退出及EOF后释放槽位")
+        guard finished else { continue } // 失败现场保留，不处理其他进程。
+        process.waitUntilExit()
+        check(FileManager.default.fileExists(atPath: root.appendingPathComponent("finished").path), "\(mode)后台完成标记仍写入")
+        check(localProof.outcomes.count == 1, "\(mode)迟到终态不重复交付")
+        if mode == "flood" {
+            check(!captured.snapshot().complete && captured.snapshot().candidateCreated && captured.snapshot().capturedBytes <= 64,
+                  "真实大输出排空且上限后候选标记仍可核对")
+        } else if mode == "invalid" { check(!captured.snapshot().complete, "真实非法编码不能冒充成功") }
+        else { check(captured.snapshot().text == "{\"text\":\"中文\"}" && captured.snapshot().complete, "\(mode)分块JSON原字节顺序完整") }
+        try? FileManager.default.removeItem(at: root)
+    }
+}
+
 var failureCount = 0
 var checkCount = 0
 
@@ -20,7 +182,217 @@ func check(_ condition: Bool, _ name: String) {
 
 // MARK: 测试主体（@main 入口，避免 main.swift 命名限制）
 
+// MARK: 外部攻击机卡片展示模型
+
+func runExternalAttachChecks() {
+    func json(_ text: String) -> MacRemoteJSON { (try? MacRemoteJSON.decode(text)) ?? .null }
+    let valid = json("""
+    {"state":"external-attach-status","instance_uuid":"0d1f7e57-7b1e-4c8e-9c8d-2f1a3b4c5d60","generation":3,
+     "connect_supported":false,"note":"材料先于连接。",
+     "binding":{"registration":{"name":"教室Kali"},"network_id":"lab0","generation":3},"binding_valid":true,
+     "slots":[{"network":"lab0","address":"192.168.50.9","mac":"02:aa:bb:cc:dd:ee","cidr":"192.168.50.0/24"}]}
+    """)
+    if let summary = try? MacExternalAttachSummary(valid) {
+        check(summary.bindingText.contains("已登记") && summary.bindingText.contains("教室Kali"), "有效登记显示名称与网段")
+        check(!summary.bindingStale, "有效登记不过期")
+        check(summary.slots.count == 1 && summary.slots[0].address == "192.168.50.9", "槽位静态地址展示")
+        check(!summary.connectSupported, "验收前不提供连接")
+    } else { check(false, "有效状态可解析") }
+    let stale = json("""
+    {"state":"external-attach-status","instance_uuid":"0d1f7e57-7b1e-4c8e-9c8d-2f1a3b4c5d60","generation":4,
+     "connect_supported":false,"note":"","binding":{"registration":{"name":"旧"}},"binding_valid":false,"slots":[]}
+    """)
+    if let summary = try? MacExternalAttachSummary(stale) {
+        check(summary.bindingStale && summary.bindingText.contains("过期"), "计划或代次变化标记过期")
+        check(summary.slots.isEmpty, "无槽位如实显示")
+    } else { check(false, "过期状态可解析") }
+    check((try? MacExternalAttachSummary(.null)) == nil, "缺失状态不可解析")
+    let badState = json("{\"state\":\"overview\",\"slots\":[]}")
+    check((try? MacExternalAttachSummary(badState)) == nil, "非接入状态拒绝")
+}
+
+// MARK: A03 持久操作账本（历史/原响应）只读模型
+
+func runSavedOperationChecks() {
+    func json(_ text: String) -> MacRemoteJSON { (try? MacRemoteJSON.decode(text)) ?? .null }
+    let instance = "0d1f7e57-7b1e-4c8e-9c8d-2f1a3b4c5d60"
+    let other = "11111111-2222-4333-8444-555555555555"
+    let summary = """
+    {"operation_id":"aaaaaaaa-1111-4222-8333-444444444444","request_id":"bbbbbbbb-1111-4222-8333-444444444444",
+     "operation":"prepare","expected_generation":null,"status":"completed","response_recorded":true,"cancel_requested":false}
+    """
+    let response = """
+    {"protocol":"ctflab-local","version":1,"request_id":"bbbbbbbb-1111-4222-8333-444444444444",
+     "instance_uuid":"\(instance)","operation_id":"aaaaaaaa-1111-4222-8333-444444444444","generation":1,
+     "state_revision":3,"state":"prepared","cursor":4,"result":"completed","cancelled":false,"error":null,"evidence_refs":[]}
+    """
+    let recordReply = """
+    {"state":"operation-recorded","instance_uuid":"\(instance)","record":\(summary),"response":\(response),
+     "historical":true,"current_runtime_verified":false,"automatic_replay":false}
+    """
+    if let record = try? MacSavedRecord(json(recordReply), instance: instance) {
+        check(record.record.operation == "prepare" && record.record.responseRecorded, "有效原响应记录可解析")
+        check(record.response["state"].text == "prepared", "历史响应状态按账本原样读取")
+    } else { check(false, "有效原响应记录可解析") }
+    check((try? MacSavedRecord(json(recordReply), instance: other)) == nil, "原响应拒绝其他实例")
+    check((try? MacSavedOperation(json(summary))) != nil, "有效账本摘要可解析")
+    // pending/executing 不允许携带已保存响应；completed 不允许缺失响应。
+    let pendingRecord = """
+    {"state":"operation-recorded","instance_uuid":"\(instance)","record":\(json(summary)),
+     "response":null,"historical":true,"current_runtime_verified":false,"automatic_replay":false}
+    """
+    check((try? MacSavedRecord(json(pendingRecord), instance: instance)) == nil, "completed缺响应拒绝")
+    var mutated = json(recordReply); if case .object(var fields) = mutated { fields["automatic_replay"] = .bool(true); mutated = .object(fields) }
+    check((try? MacSavedRecord(mutated, instance: instance)) == nil, "自动重放标记拒绝")
+    let pageReply = """
+    {"state":"operation-history","instance_uuid":"\(instance)","operations":[\(summary)],
+     "truncated":true,"next_before":"aaaaaaaa-1111-4222-8333-444444444444",
+     "historical":true,"current_runtime_verified":false,"automatic_replay":false}
+    """
+    if let page = try? MacHistoryPage(json(pageReply), instance: instance) {
+        check(page.truncated && page.nextBefore == "aaaaaaaa-1111-4222-8333-444444444444", "截断页给出原操作UUID游标")
+    } else { check(false, "有效历史页可解析") }
+    var truncatedPage = json(pageReply); if case .object(var fields) = truncatedPage { fields["next_before"] = .null; truncatedPage = .object(fields) }
+    check((try? MacHistoryPage(truncatedPage, instance: instance)) == nil, "截断页缺游标拒绝")
+    var missing = json(summary); if case .object(var fields) = missing { fields["cancel_requested"] = nil; missing = .object(fields) }
+    check((try? MacSavedOperation(missing)) == nil, "摘要缺字段拒绝")
+    var extra = json(summary); if case .object(var fields) = extra { fields["idempotency_key"] = .string("private"); extra = .object(fields) }
+    check((try? MacSavedOperation(extra)) == nil, "摘要不透出幂等键等私有字段")
+    check(!MacContractRules.uuid("AAAAAAAA-1111-4222-8333-444444444444"), "大写UUID拒绝")
+    check(MacContractRules.identifier("lab-0.node_1") && !MacContractRules.identifier("-leading") && !MacContractRules.identifier("空格 id"), "标识规则与Python一致")
+}
+
+// MARK: A03 严格事件游标（与 contract.merge_events 同判定）
+
+func runEventCursorChecks() {
+    func json(_ text: String) -> MacRemoteJSON { (try? MacRemoteJSON.decode(text)) ?? .null }
+    let instance = "0d1f7e57-7b1e-4c8e-9c8d-2f1a3b4c5d60"
+    func event(_ sequence: Int, state: String = "prepared", stage: String = "completed",
+               eventID: String? = nil) -> String {
+        let id = eventID ?? ("cccccccc-1111-4222-8333-44444444444" + String(sequence % 10))
+        return """
+        {"protocol":"ctflab-local","version":1,"event_id":"\(id)","sequence":\(sequence),
+         "timestamp":"2026-10-31T10:00:00+00:00","instance_uuid":"\(instance)","generation":1,
+         "operation_id":"aaaaaaaa-1111-4222-8333-444444444444","state_revision":\(sequence),"stage":"\(stage)","state":"\(state)"}
+        """
+    }
+    let three = "[" + [event(1), event(2, state: "process-running", stage: "executing"), event(3)].joined(separator: ",") + "]"
+    let kept = MacEventPage.consume(.number(0), json(three), instance: instance)
+    check(!kept.reload && kept.cursor == 3 && kept.events.count == 3, "三条连续事件全部消费")
+    let dedupe = MacEventPage.consume(.number(0), json("[\(event(1)),\(event(1))]"), instance: instance)
+    check(!dedupe.reload && dedupe.events.count == 1, "同序号同内容去重")
+    check(MacEventPage.consume(.number(0), json("[\(event(1)),\(event(1, state: "failed"))]"), instance: instance).reload, "同序号内容冲突拒绝")
+    check(MacEventPage.consume(.number(0), json("[\(event(1)),\(event(2, eventID: "cccccccc-1111-4222-8333-444444444441"))]"), instance: instance).reload, "事件ID跨序号复用拒绝")
+    check(MacEventPage.consume(.number(0), json("[\(event(2))]"), instance: instance).reload, "缺口拒绝")
+    check(MacEventPage.consume(.number(2), json("[\(event(1)),\(event(2)),\(event(3))]"), instance: instance).cursor == 3, "旧前缀跳过后续读")
+    check(MacEventPage.consume(.number(1), json("[\(event(1, state: "bogus"))]"), instance: instance).reload, "旧事件同样严格校验")
+    check(MacEventPage.consume(.number(0), json(three), instance: "11111111-2222-4333-8444-555555555555").reload, "跨实例混用拒绝")
+    check(MacEventPage.consume(.number(0), json(three), instance: nil).cursor == 3, "未绑定实例按首条绑定")
+    check(MacEventPage.consume(.string("0"), json(three), instance: instance).reload, "游标类型错误拒绝")
+    check(MacEventPage.consume(.number(-1), json("[]"), instance: instance).reload, "负游标拒绝")
+    check(MacEventPage.consume(.number(0), json("{\"events\":[]}"), instance: instance).reload, "未知回复形状拒绝")
+    let view = json("""
+    {"instance_uuid":"\(instance)","status":{"protocol":"ctflab-local","version":1,"instance_uuid":"\(instance)","cursor":5}}
+    """)
+    let relocated = MacEventPage.refresh(.number(0), json("{\"error\":{\"code\":\"cursor-expired\"}}"), view: view)
+    check(relocated.reload && relocated.cursor == 5, "游标过期按绑定状态重定位")
+    let unbound = MacEventPage.refresh(.number(0), json("[\(event(2))]"), view: json("{\"instance_uuid\":\"\(instance)\"}"))
+    check(unbound.reload && unbound.cursor == 0, "未绑定快照不决定游标")
+}
+
+// MARK: 跨语言向量模式：Python测试以相同输入驱动本模型并对照 merge_events 结果。
+// 输入：{"events":[{cursor,response,view}],"history":[{reply,instance}],"records":[{reply,instance}]}；不启动任何服务。
+
+func contractVectorMode() {
+    let raw = FileHandle.standardInput.readDataToEndOfFile()
+    guard let value = try? MacRemoteJSON.decode(String(data: raw, encoding: .utf8) ?? "") else { exit(2) }
+    var events: [MacRemoteJSON] = []
+    for row in value["events"].items {
+        let result = MacEventPage.refresh(row["cursor"], row["response"], view: row["view"] == .null ? nil : row["view"])
+        events.append(.object(["cursor": .number(Double(result.cursor)), "reload": .bool(result.reload),
+                               "count": .number(Double(result.events.count))]))
+    }
+    var history: [MacRemoteJSON] = [], records: [MacRemoteJSON] = []
+    for row in value["history"].items {
+        let accepted = (try? MacHistoryPage(row["reply"], instance: row["instance"].text ?? "")) != nil
+        history.append(.bool(accepted))
+    }
+    for row in value["records"].items {
+        let accepted = (try? MacSavedRecord(row["reply"], instance: row["instance"].text ?? "")) != nil
+        records.append(.bool(accepted))
+    }
+    let output = MacRemoteJSON.object(["events": .array(events), "history": .array(history), "records": .array(records)])
+    let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys]
+    guard let data = try? encoder.encode(output) else { exit(2) }
+    FileHandle.standardOutput.write(data)
+    FileHandle.standardOutput.write(Data("\n".utf8))
+    exit(0)
+}
+
+
+func runPublicDiagnosticsChecks() {
+    func node(_ phase: String = "network", stale: Int? = nil) -> StatusProfile {
+        StatusProfile(id: "private-user-secret", name: "10.22.33.44", builtin: false, imported: true,
+            importState: "registered", sourcePath: "/Users/private-user/source.qcow2", running: true,
+            pid: 123456789, logPath: "C:\\Users\\private-user\\password.log", baseSHA256: "secret-sha",
+            stalePid: stale,
+            boot: BootSummary(phase: phase, phaseLabel: "password=secret", overall: "secret-overall",
+                elapsedSeconds: 123456789, readinessTimeoutSeconds: 123456789,
+                stages: [BootStage(name: "secret-stage", ok: true, detail: "token=secret")],
+                diagnosis: BootDiagnosis(message: "secret", failedChecks: ["secret"], logPath: "/Users/private-user",
+                    clientLogPath: "secret", hint: "secret")), spiceClient: nil)
+    }
+    do {
+        let value = try MacPublicDiagnostics.preview([node()], version: "0.1.3-preview.20261028", machine: "arm64")
+        let decoded = try JSONSerialization.jsonObject(with: value.data) as! [String: Any]
+        let profiles = decoded["profiles"] as! [[String: String]]
+        check(profiles == [["node": "node-1", "state": "running", "boot_phase": "network"]], "分享摘要只保留匿名节点和白名单状态阶段")
+        check(Set(decoded.keys) == Set(["schema", "kind", "scope", "ctflab_version", "host", "profiles", "observation", "may_be_stale", "omitted", "uploaded"]), "分享摘要只生成固定顶层字段")
+        check(decoded["observation"] as? String == "displayed-snapshot" && decoded["may_be_stale"] as? Bool == true,
+            "分享摘要明确是可能过期的显示快照")
+        check(decoded["uploaded"] as? Bool == false, "分享摘要不上传")
+        check(value.data == Data(value.text.utf8) && value.data.last == 10, "预览显示与导出保留同一UTF8字节及换行")
+        for secret in ["private-user", "secret", "10.22.33.44", "123456789", "password", "token", "/Users/", "C:\\"] {
+            check(!value.text.contains(secret), "分享摘要不泄露 \(secret)")
+        }
+        let untrusted = try MacPublicDiagnostics.preview([node("secret-phase", stale: 123)], version: "password=secret", machine: "/Users/private-user")
+        check(!untrusted.text.contains("secret") && !untrusted.text.contains("private-user"), "分享摘要拒绝自由文本版本/架构/阶段")
+        let untrustedJSON = try JSONSerialization.jsonObject(with: untrusted.data) as! [String: Any]
+        check((untrustedJSON["profiles"] as! [[String: String]])[0]["state"] == "unknown", "陈旧进程登记不作为运行证明")
+        check((untrustedJSON["host"] as! [String: String])["machine"] == "unknown", "未知架构不回显")
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let path = directory.appendingPathComponent("summary.json")
+        try value.save(to: path)
+        check(try Data(contentsOf: path) == value.data, "分享摘要排他保存预览原字节")
+        let info = try FileManager.default.attributesOfItem(atPath: path.path)
+        check((info[.posixPermissions] as? NSNumber)?.intValue == 0o600, "分享摘要文件创建即0600")
+        do { try untrusted.save(to: path); check(false, "分享摘要不得覆盖") }
+        catch { check(try Data(contentsOf: path) == value.data, "再次保存拒绝覆盖且原字节不变") }
+        let link = directory.appendingPathComponent("link.json")
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: path)
+        do { try value.save(to: link); check(false, "分享摘要不得覆盖符号链接") }
+        catch { check(try Data(contentsOf: path) == value.data, "符号链接保存拒绝且原文件不变") }
+        do { try value.save(to: URL(string: "https://example.invalid/private")!); check(false, "分享摘要不得写网络URL") }
+        catch { check(true, "分享摘要拒绝网络URL且不执行网络请求") }
+        do { _ = try MacPublicDiagnostics.preview(Array(repeating: node(), count: 257), version: "1.2.3", machine: "arm64"); check(false, "分享节点数有界") }
+        catch { check(true, "分享摘要拒绝超过256个节点") }
+        let maximum = try MacPublicDiagnostics.preview(Array(repeating: node(), count: 256), version: "1.2.3", machine: "arm64")
+        check(maximum.data.count <= 65536 && maximum.text.contains("node-256"), "最大节点摘要有界且不截断")
+        let again = try MacPublicDiagnostics.preview([node()], version: "0.1.3-preview.20261028", machine: "arm64")
+        check(again.data == value.data && again.id != value.id, "同一快照字节稳定且窗口标识不写入分享内容")
+        let empty = try MacPublicDiagnostics.preview([], version: "1.2.3", machine: "arm64")
+        check((try JSONSerialization.jsonObject(with: empty.data) as! [String: Any])["profiles"] as? [String] == [], "空节点库可生成合法白名单摘要")
+    } catch { check(false, "分享摘要检查异常") }
+}
+
 func runAll() {
+    runCLIOutputChecks()
+    runPublicDiagnosticsChecks()
+    runExternalAttachChecks()
+    runSavedOperationChecks()
+    runEventCursorChecks()
     let progressLine = "CTFLAB_IMPORT_PROGRESS {\"stage\":\"来源校验\",\"done\":50,\"total\":100,\"elapsed_seconds\":2.0,\"cancellable\":true}"
     check(ImportProgress.latest(in: progressLine) == nil, "未完整的进度行等待下一批")
     check(ImportProgress.latest(in: progressLine + "\n")?.label == "来源校验 50% · 2 秒", "阶段字节百分比和耗时解析")
@@ -698,6 +1070,204 @@ check(!AppLayout.cliRelativePath.hasPrefix("/"), "CLI 相对路径不得以 / �
           && unknownReports?.first?.stateDetail.contains("kali") == true, "待恢复细节列出不明成员")
     check(ScenarioReport.decode("not json") == nil, "坏输出不解码为报告")
     print("---")
+    // Mac原生远程请求：原标识/当前状态/租约门，配置和载荷不进入命令行日志。
+    do {
+        let server = "00000000-0000-4000-8000-000000000001", instance = "00000000-0000-4000-8000-000000000002"
+        let saved = try MacSavedTarget(.object(["id": .string("00000000-0000-4000-8000-000000000003"),
+            "label": .string("课堂"), "target": .string(String(repeating: "a", count: 64)), "server_uuid": .string(server)]))
+        let connection: MacRemoteJSON = .object(["target": .string(saved.target), "result": .object([
+            "server_uuid": .string(server), "role": .string("student"), "instances": .array([.string(instance)]),
+            "resource_leases": .bool(true), "display_available": .bool(true)])])
+        let context = try MacRemoteContext(saved: saved, reply: connection)
+        check(context.display && !context.assets && !context.evidence, "远程旧服务器未声明的能力保持禁用")
+        check(!context.courses && !context.audit, "旧服务器管理能力默认关闭")
+        check((try? MacRemoteRules.administration("course-list", context: context, values: [:])) == nil, "学生不能请求课程管理")
+        let admin = try MacRemoteContext(saved: saved, reply: .object(["target": .string(saved.target), "result": .object([
+            "server_uuid": .string(server), "role": .string("administrator"), "instances": .array([.string(instance)]),
+            "resource_leases": .bool(false), "course_management": .bool(true), "audit_management": .bool(true)])]))
+        check(admin.courses && admin.audit, "管理员显式能力启用课程与审计")
+        let course = try MacRemoteRules.administration("course-preview", context: admin, values: ["offer_id": .string("web"), "instance_uuid": .string(instance)])
+        check(course["target"].text == saved.target && course["instance_uuid"].text == instance, "课程预览绑定目标实例")
+        check((try? MacRemoteRules.administration("course-preview", context: admin, values: ["offer_id": .string("web"), "instance_uuid": .string(instance), "path": .string("/outside")])) == nil, "课程管理拒绝客户端路径")
+        check((try? MacRemoteRules.administration("audit-settle", context: admin, values: ["attempt_id": .string(instance), "review_sha256": .string("bad")])) == nil, "审计结清要求预览摘要")
+        let auditPayload = try MacRemoteRules.administration("audit-settle", context: admin, values: ["attempt_id": .string(instance), "review_sha256": .string(String(repeating: "b", count: 64))])
+        check((try? MacRemoteRules.administrationResult(.object(["target": .string(saved.target), "result": .object(["attempt_id": .string(instance), "original_worker_result": .string("unknown"), "vm_observed": .bool(true), "automatic_replay": .bool(false)])]), payload: auditPayload, context: admin)) == nil, "审计不能冒称已观察虚拟机")
+        let status: MacRemoteJSON = .object(["instance_uuid": .string(instance), "state": .string("prepared"),
+            "generation": .number(1), "state_revision": .number(5), "result": .string("completed")])
+        let view: MacRemoteJSON = .object(["instance_uuid": .string(instance), "generation": .number(1), "status": status])
+        check(!MacRemoteRules.allowed("start", view: view, context: context, instance: instance, lease: "", busy: false, pending: false), "未选择租约不能启动")
+        let lease = "00000000-0000-4000-8000-000000000004"
+        check(MacRemoteRules.allowed("start", view: view, context: context, instance: instance, lease: lease, busy: false, pending: false), "核验状态和租约后开放启动请求")
+        check(!MacRemoteRules.allowed("reset", view: view, context: context, instance: instance, lease: lease, busy: false, pending: true), "未决请求阻止创建第二组变更标识")
+        let operation = try MacRemoteRules.operation("start", view: view, context: context, instance: instance, lease: lease)
+        check(operation["request"]["expected_state_revision"].integer == 5 && operation["request"]["expected_generation"].integer == 1, "远程变更绑定当前代次和版本")
+        check(operation["request"]["parameters"]["allow_emulation"] == .bool(false) && operation["request"]["parameters"]["display"].text == "headless", "固定运行参数不开放宿主任意命令")
+        check(MacRemoteRules.uuid(operation["request"]["request_id"].text ?? "") && MacRemoteRules.uuid(operation["request"]["idempotency_key"].text ?? ""), "新明确请求持独立UUID和幂等键")
+        let reply: MacRemoteJSON = .object(["target": .string(saved.target), "result": view])
+        check(try MacRemoteRules.overview(reply, context: context, instance: instance, previous: .null) == view, "当前目标的状态可接受")
+        var wrong = reply
+        wrong = .object(["target": .string(String(repeating: "b", count: 64)), "result": view])
+        check((try? MacRemoteRules.overview(wrong, context: context, instance: instance, previous: view)) == nil, "错绑目标不能覆盖状态")
+        let newer: MacRemoteJSON = .object(["instance_uuid": .string(instance), "generation": .number(1), "status": .object([
+            "state_revision": .number(6), "state": .string("stopped")])])
+        check(try MacRemoteRules.overview(reply, context: context, instance: instance, previous: newer) == newer, "旧修订回复不回退状态")
+        let leaseStatus: MacRemoteJSON = .object(["owner_actions": .bool(true), "max_ttl_seconds": .number(3600),
+            "expiry_action": .string("request-stop"), "leases": .array([])])
+        check((try? MacRemoteRules.lease("lease-acquire", status: leaseStatus, context: context, instance: instance, selected: "", ttl: 60, consent: false)) == nil, "到期停止策略须明确勾选")
+        let brokenLeases: MacRemoteJSON = .object(["owner_actions": .bool(true), "max_ttl_seconds": .number(3600), "expiry_action": .string("notify")])
+        check((try? MacRemoteRules.lease("lease-acquire", status: brokenLeases, context: context, instance: instance, selected: "", ttl: 60, consent: true)) == nil, "缺少租约数组时不能猜测额度空闲")
+        let acquire = try MacRemoteRules.lease("lease-acquire", status: leaseStatus, context: context, instance: instance, selected: "", ttl: 60, consent: true)
+        check(acquire["ttl_seconds"].integer == 60 && acquire["expiry_action"].text == "request-stop", "租约沿服务器固定策略和期限")
+        check((try? MacRemoteRules.lease("lease-acquire", status: leaseStatus, context: context, instance: instance, selected: "", ttl: 3601, consent: true)) == nil, "超服务器期限拒绝")
+        let activeStatus: MacRemoteJSON = .object(["owner_actions": .bool(true), "max_ttl_seconds": .number(3600), "leases": .array([
+            .object(["lease_id": .string(lease), "state": .string("active"), "time_state": .string("active")])])])
+        let currentLeases: MacRemoteJSON = .object(["leases": .array([.object(["instance_uuid": .string(instance), "lease_id": .string(lease), "state": .string("active"), "time_state": .string("active")])])])
+        check(MacRemoteRules.activeLease(currentLeases, selected: lease, instance: instance), "当前实例的活动租约可用于变更和显示")
+        check(!MacRemoteRules.activeLease(.null, selected: lease, instance: instance), "租约读取失败时旧UUID不能维持开放")
+        check(!MacRemoteRules.activeLease(currentLeases, selected: lease, instance: server), "其他实例租约不能开放当前操作")
+        let renew = try MacRemoteRules.lease("lease-renew", status: activeStatus, context: context, instance: instance, selected: lease, ttl: 60, consent: false)
+        check(renew["lease_id"].text == lease && MacRemoteRules.uuid(renew["renewal_id"].text ?? ""), "续期保留原租约并产生明确续期标识")
+        let release = try MacRemoteRules.lease("lease-release", status: activeStatus, context: context, instance: instance, selected: lease, ttl: 0, consent: false)
+        check(release["ttl_seconds"] == .null && release["lease_id"].text == lease, "释放不伪造TTL或停止请求")
+        let raw = try MacRemoteJSON.object(["action": .string("save-target"), "config": .string("/private/ssh-identity.json")]).encoded()
+        let action = CliAction.remoteClient(json: raw)
+        check(action.arguments(stateDir: "/tmp/state a") == ["--state-dir", "/tmp/state a", "remote-client"], "远程载荷只经标准输入不拼接到命令行")
+        check(action.privateRequest == raw.data(using: .utf8) && !action.displayCommand.contains("ssh-identity"), "远程命令日志不含配置或载荷")
+        check(action.preservesRawOutputOnFailure, "远程错误保留结构化回复供核验")
+        check(MacRemoteJSON.bool(true).integer == nil && MacRemoteJSON.number(1.5).integer == nil, "布尔和小数不能冒充修订整数")
+        check((try? MacRemoteJSON.string(String(repeating: "a", count: 65537)).encoded()) == nil, "远程请求有64KiB边界")
+    } catch { check(false, "Mac远程模型意外失败：\(error)") }
+
+    let sceneAction = CliAction.scenarioClient(json: "{\"private-path\":\"hidden\"}")
+    check(sceneAction.arguments() == ["scenario-client"], "本机场景固定命令")
+    check(sceneAction.privateRequest != nil, "本机场景使用stdin")
+    check(!sceneAction.displayCommand.contains("hidden"), "本机场景载荷不进入日志")
+    check(sceneAction.preservesRawOutputOnFailure, "本机场景保留结构化失败")
+    let genericAction = CliAction.genericClient(json: "{\"secret-path\":\"hidden\"}")
+    check(genericAction.arguments() == ["generic-client"], "Mac通用入口固定命令")
+    check(genericAction.privateRequest != nil, "Mac通用入口使用stdin")
+    check(!genericAction.displayCommand.contains("hidden"), "Mac通用载荷不进入日志")
+    check(genericAction.preservesRawOutputOnFailure, "Mac通用入口结构化失败")
+    do {
+        let source = try MacRemoteJSON.decode(#"{"schema":2,"scenario_id":"three-node-example","assets":{"linux":{"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","architecture":"x86_64","source":"local-test-fixture","license":"synthetic-only","verification":"unverified"}},"networks":{"outer":{"cidr":"10.80.0.0/24","uplink":"none"},"inner":{"cidr":"10.81.0.0/24","uplink":"none"}},"nodes":{"client":{"asset":"linux","cpus":1,"memory_mb":512,"firmware":"bios","disk_bus":"ide","interfaces":[{"id":"eth0","network":"outer","address":"10.80.0.10","mac":"derived","model":"e1000"}],"depends_on":["middle"]},"middle":{"asset":"linux","cpus":1,"memory_mb":512,"firmware":"bios","disk_bus":"ide","interfaces":[{"id":"eth0","network":"outer","address":"10.80.0.20","mac":"derived","model":"e1000"},{"id":"eth1","network":"inner","address":"10.81.0.20","mac":"derived","model":"e1000"}],"depends_on":["server"]},"server":{"asset":"linux","cpus":1,"memory_mb":512,"firmware":"bios","disk_bus":"ide","interfaces":[{"id":"eth0","network":"inner","address":"10.81.0.30","mac":"derived","model":"e1000"}],"depends_on":[]}},"policy":{"internet":false,"host_forwards":[],"failure":"preserve"}}"#)
+        check(try MacGraphDraft.checked(source) == source, "原生图保留完整原清单")
+        let design = MacDesignTopology.project(source) ?? .null
+        check(design["topology"]["nodes"].items.count == 3, "设计总览保留真实三节点")
+        check(design["topology"]["networks"] == source["networks"], "设计总览保留网段")
+        check(design["topology"]["nodes"].items.first?["interfaces"].items.first?["planned_address"].text == "10.80.0.10", "设计地址映射不丢失")
+        check(!MacObservationWindow.fresh(design), "设计总览不伪造当前运行采样")
+        check(MacDesignTopology.project(.null) == nil, "无效设计不生成关系图")
+
+        let recoveryTarget = "11111111-1111-4111-8111-111111111111"
+        let recoveryView = try MacRemoteJSON.decode("{\"status\":{\"state\":\"process-running\",\"result\":\"completed\"},\"observations\":{\"middle\":{\"state\":\"process-running\"}},\"guest_agents\":{\"middle\":{\"containers\":true,\"last_action\":\"preparation-inspect\",\"last_result\":{\"state\":\"preparation-observed\",\"operation_id\":\"" + recoveryTarget + "\",\"can_resume\":true,\"automatic_replay\":false,\"resume_sha256\":\"" + String(repeating:"a",count:64) + "\"}}}}")
+        let recoveryParams = try MacGuestRecovery.parameters(recoveryView,node:"middle",target:recoveryTarget,resume:true)
+        check(recoveryParams["target_operation_id"].text == recoveryTarget && recoveryParams["expected_sha256"].text == String(repeating:"a",count:64), "来宾续建绑定当前核对摘要和原操作")
+        check(try MacGuestRecovery.parameters(recoveryView,node:"middle",target:recoveryTarget,resume:false)["expected_sha256"] == .null, "只读核对不携带续建摘要")
+        check((try? MacGuestRecovery.parameters(recoveryView,node:"middle",target:"bad",resume:true)) == nil, "拒绝错误原操作标识")
+        check((try? MacGuestRecovery.parameters(recoveryView,node:"missing",target:recoveryTarget,resume:true)) == nil, "拒绝缺失来宾节点")
+        check((try? MacGuestRecovery.parameters(recoveryView,node:"middle",target:"22222222-2222-4222-8222-222222222222",resume:true)) == nil, "不能借用其他准备记录的摘要")
+        for pair in [("process-running","recovery-required"),("completed","accepted"),("preparation-inspect","status"),(String(repeating:"a",count:64),"bad")] {
+            let changed = try MacRemoteJSON.decode(recoveryView.encoded().replacingOccurrences(of:pair.0,with:pair.1))
+            check((try? MacGuestRecovery.parameters(changed,node:"middle",target:recoveryTarget,resume:true)) == nil, "拒绝过期状态或错误续建来源")
+        }
+
+        var editHistory = try MacGraphHistory(source);try editHistory.edit(.string("下一步"));editHistory.undo()
+        check(editHistory.present == source && editHistory.canRedo,"撤销恢复精确配置原件")
+        editHistory.redo();check(editHistory.present == .string("下一步"),"重做恢复已撤销配置")
+        editHistory.undo();try editHistory.edit(.string("新分支"));check(!editHistory.canRedo,"新配置编辑清空重做")
+        for number in 0..<40 { try editHistory.edit(.string(String(number))) }
+        check(editHistory.past.count == 20,"配置历史最多20步")
+        for _ in 0..<40 { editHistory.undo() };check(editHistory.future.count == 20,"撤销到历史边界不增加记录")
+        let preservedHistory = editHistory
+        do { try editHistory.edit(.string(String(repeating:"字",count:22000)));check(false,"超大草稿应拒绝") } catch { check(editHistory == preservedHistory,"超大草稿拒绝并保留原历史") }
+        let windowStart = Date(timeIntervalSince1970:1793145600), formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime,.withFractionalSeconds]
+        let timedView: MacRemoteJSON = .object(["freshness":.object(["schema":.number(1),"complete":.bool(true),"sampled_at":.string(formatter.string(from:windowStart)),"valid_until":.string(formatter.string(from:windowStart.addingTimeInterval(60)))])])
+        check(MacObservationWindow.fresh(timedView,now:windowStart.addingTimeInterval(1)),"当前完整采样可显示现场状态")
+        check(!MacObservationWindow.fresh(timedView,now:windowStart.addingTimeInterval(61)),"过期采样不冒充现场状态")
+        check(!MacObservationWindow.fresh(timedView,now:windowStart.addingTimeInterval(-1)),"未来采样拒绝")
+        check(!MacObservationWindow.fresh(MacObservationWindow.invalidated(timedView),now:windowStart.addingTimeInterval(1)),"查询失败使旧采样失效")
+        check(!MacObservationWindow.fresh(.null),"缺失采样窗口拒绝")
+        var mixedView = timedView
+        if case .object(var value) = timedView, case .object(var window) = value["freshness"] { window["coherent"] = .bool(false); value["freshness"] = .object(window); mixedView = .object(value) }
+        check(!MacObservationWindow.fresh(mixedView,now:windowStart.addingTimeInterval(1)),"采样期间发生变化即使complete为真也拒绝")
+        let point = try MacGraphLayout.point(12,34), positions = Dictionary(uniqueKeysWithValues: MacGraphLayout.keys(source).map { ($0,point) })
+        let layout = try MacGraphLayout.export(source,positions: positions)
+        check(try MacGraphLayout.load(source,text: layout.encoded()) == positions, "布局旁车无损往返，不包含执行资产")
+        check(layout["assets"] == .null && layout["scope"]["scenario_id"] == source["scenario_id"], "布局只绑定草稿标识及元素")
+        check(try MacGraphLayout.point(-12,100000) == MacRemoteJSON.object(["x":.number(0),"y":.number(32000)]), "布局移动夹紧边界")
+        check((try? MacGraphLayout.point(.nan,1)) == nil, "拒绝非有限布局坐标")
+        var missing = positions; missing.removeValue(forKey: "node:client")
+        check((try? MacGraphLayout.export(source,positions: missing)) == nil, "拒绝缺失布局元素")
+        var outside = positions; outside["node:client"] = .object(["x":.number(4001),"y":.number(0)])
+        check((try? MacGraphLayout.export(source,positions: outside)) == nil, "拒绝越界布局坐标")
+        outside["node:client"] = .object(["x":.number(1.5),"y":.number(0)])
+        check((try? MacGraphLayout.export(source,positions: outside)) == nil, "拒绝小数布局坐标")
+        let foreign = try layout.encoded().replacingOccurrences(of: "three-node-example",with: "foreign")
+        check((try? MacGraphLayout.load(source,text: foreign)) == nil, "拒绝其他草稿的布局")
+        check((try? MacGraphLayout.load(source,text: String(repeating:" ",count:65537))) == nil, "布局载入64KiB边界")
+
+        let added = try MacGraphDraft.addNode(source, name: "analysis", asset: "linux")
+        check(source["nodes"]["analysis"] == .null && added["nodes"]["analysis"]["interfaces"].items.isEmpty, "新增节点只改草稿副本，待补全连接")
+        let network = try MacGraphDraft.addNetwork(added, name: "analysis-net", cidr: "10.90.0.0/24")
+        let linked = try MacGraphDraft.connect(network, node: "analysis", nic: nil, network: "analysis-net")
+        check(linked["nodes"]["analysis"]["interfaces"].items.first?["address"].text == "10.90.0.1", "新网卡分配首个可用设计地址")
+        check(linked["nodes"]["analysis"]["interfaces"].items.first?["mac"].text == "derived", "新增网卡保留派生MAC声明")
+        check((try? MacGraphDraft.connect(linked, node: "analysis", nic: nil, network: "analysis-net")) == nil, "拒绝同节点重复网段连接")
+        let moved = try MacGraphDraft.connect(linked, node: "analysis", nic: "eth0", network: "outer")
+        check(moved["nodes"]["analysis"]["interfaces"].items.first?["address"].text == "10.80.0.1", "重新连线更新设计地址")
+        let detached = try MacGraphDraft.disconnect(moved, node: "analysis", nic: "eth0")
+        check(detached["nodes"]["analysis"]["interfaces"].items.isEmpty, "最后网卡可在草稿断开，完整后端再拒绝不完整清单")
+        check((try? MacGraphDraft.addNetwork(source, name: "overlap", cidr: "10.80.0.0/25")) == nil, "拒绝重叠实验网段")
+        check((try? MacGraphDraft.addNetwork(source, name: "public", cidr: "8.8.8.0/24")) == nil, "拒绝物理公网网段")
+        check((try? MacGraphDraft.addNetwork(source, name: "host-bits", cidr: "10.90.0.1/24")) == nil, "拒绝非网段地址")
+        check((try? MacGraphDraft.addNode(source, name: "Bad Name", asset: "linux")) == nil, "原生图拒绝错误标识")
+        let removed = try MacGraphDraft.removeNode(source, name: "server")
+        check(removed["nodes"]["middle"]["depends_on"].items.isEmpty && source["nodes"]["server"] != .null, "移除草稿节点清理依赖且保留原节点")
+        check(linked["policy"] == source["policy"] && linked["assets"] == source["assets"], "拓扑编辑保留原资产与网络边界策略")
+        var arm = source
+        if case .object(var root) = arm, case .object(var assets) = root["assets"], case .object(var asset) = assets["linux"] {
+            asset["architecture"] = .string("aarch64"); assets["linux"] = .object(asset); root["assets"] = .object(assets); arm = .object(root)
+        }
+        let armAdded = try MacGraphDraft.addNode(arm, name: "arm-node", asset: "linux")
+        let armLinked = try MacGraphDraft.connect(armAdded, node: "arm-node", nic: nil, network: "outer")
+        check(armLinked["nodes"]["arm-node"]["firmware"].text == "uefi" && armLinked["nodes"]["arm-node"]["interfaces"].items.first?["model"].text == "virtio-net-pci", "ARM新节点使用UEFI与VirtIO声明")
+        var exhausted = try MacGraphDraft.addNetwork(source, name: "small", cidr: "10.90.0.0/30")
+        exhausted = try MacGraphDraft.connect(exhausted, node: "client", nic: nil, network: "small")
+        exhausted = try MacGraphDraft.connect(exhausted, node: "server", nic: nil, network: "small")
+        check((try? MacGraphDraft.connect(exhausted, node: "middle", nic: nil, network: "small")) == nil, "网段地址耗尽时拒绝连接")
+        let sized = try MacGraphDraft.resources(source, node: "client", cpus: 64, memory: 262144)
+        check(sized["nodes"]["client"]["cpus"].integer == 64 && source["nodes"]["client"]["cpus"].integer == 1, "资源编辑只改副本且接受生产上界")
+        check((try? MacGraphDraft.resources(source, node: "client", cpus: 0, memory: 512)) == nil && (try? MacGraphDraft.resources(source, node: "client", cpus: 65, memory: 512)) == nil, "CPU越界拒绝")
+        check((try? MacGraphDraft.resources(source, node: "client", cpus: 1, memory: 255)) == nil && (try? MacGraphDraft.resources(source, node: "client", cpus: 1, memory: 262145)) == nil, "内存越界拒绝")
+        check((try? MacGraphDraft.dependencies(source, node: "server", selected: ["client"])) == nil, "拒绝三节点间接依赖循环")
+        check((try? MacGraphDraft.dependencies(source, node: "client", selected: ["client"])) == nil, "拒绝自依赖")
+        check((try? MacGraphDraft.dependencies(source, node: "client", selected: ["server", "server"])) == nil, "拒绝重复依赖")
+        check((try? MacGraphDraft.dependencies(source, node: "client", selected: ["missing"])) == nil, "拒绝不存在的依赖")
+        let independent = try MacGraphDraft.dependencies(source, node: "client", selected: [])
+        check(independent["nodes"]["client"]["depends_on"].items.isEmpty && source["nodes"]["client"]["depends_on"].items.count == 1, "移除启动依赖保留原件")
+        check((try? MacGraphDraft.removeNetwork(source, name: "outer")) == nil, "已连接网段不能隐式断开或移除")
+        let emptyNetwork = try MacGraphDraft.addNetwork(source, name: "empty", cidr: "10.91.0.0/24")
+        check(try MacGraphDraft.removeNetwork(emptyNetwork, name: "empty") == source, "空闲网段移除语义完整往返")
+        if let file = ProcessInfo.processInfo.environment["CTFLAB_GRAPH_TEST_EXPORT"], file.hasPrefix("/") {
+            let configured = try MacGraphDraft.resources(linked, node: "analysis", cpus: 2, memory: 1024)
+            let dependent = try MacGraphDraft.dependencies(configured, node: "analysis", selected: ["server"])
+            try dependent.encoded().write(to: URL(fileURLWithPath: file), atomically: false, encoding: .utf8)
+        }
+    } catch { check(false, "原生拓扑草稿用例：\(error)") }
+    do {
+        let start = Date(timeIntervalSince1970: 1793200000)
+        let formatter = ISO8601DateFormatter()
+        let view = MacRemoteJSON.object(["generation":.number(1),"status":.object(["generation":.number(1),"result":.string("completed")]),
+            "freshness":.object(["schema":.number(1),"complete":.bool(false),"coherent":.bool(true),"sampled_at":.string(formatter.string(from:start)),"valid_until":.string(formatter.string(from:start.addingTimeInterval(60)))]),
+            "manifest":.object(["nodes":.object(["server":.object([:])])]),
+            "supervision":.object(["server":.object(["logs":.object(["kind":.string("posix-fifo-v1"),"rearm_allowed":.bool(true),"source_identity":.string("running"),"receiver":.string("not-receiving")])])])])
+        check(MacLogRecovery.allowed(view,node:"server",busy:false,now:start.addingTimeInterval(1)),"日志背压时仅重接日志可使用一致但不完整窗口")
+        check(!MacObservationWindow.fresh(view,now:start.addingTimeInterval(1)),"日志恢复不开放其他依赖完整采样的操作")
+        check(!MacLogRecovery.allowed(view,node:"server",busy:true,now:start.addingTimeInterval(1)),"并发时拒绝日志重接")
+        check(!MacLogRecovery.allowed(view,node:"outside",busy:false,now:start.addingTimeInterval(1)),"拒绝其他节点日志重接")
+        check(!MacLogRecovery.allowed(view,node:"server",busy:false,now:start.addingTimeInterval(61)),"过期日志恢复窗口拒绝")
+    }
     print("共 \(checkCount) 项检查，失败 \(failureCount) 项")
     exit(failureCount == 0 ? 0 : 1)
     }
@@ -705,6 +1275,12 @@ check(!AppLayout.cliRelativePath.hasPrefix("/"), "CLI 相对路径不得以 / �
 @main
 struct GuiCoreTestRunner {
     static func main() {
+        if CommandLine.arguments.count == 4, CommandLine.arguments[1] == "--cli-output-fixture" {
+            cliOutputFixture(CommandLine.arguments[2], root: URL(fileURLWithPath: CommandLine.arguments[3])); return
+        }
+        if CommandLine.arguments.count == 2, CommandLine.arguments[1] == "--contract-vectors" {
+            contractVectorMode(); return
+        }
         runAll()
     }
 }

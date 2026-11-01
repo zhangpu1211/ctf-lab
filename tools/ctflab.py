@@ -40,6 +40,7 @@ import urllib.request
 from ctflab_inspect import (IMPORT_CONTROL, import_session, InspectionError, PreparedOva, inspect_image, prepare_ova,
                             profile_from_report, report_text, require_free_space, source_identity)
 from ctflab_utm import PublishError, UTMExportError, exclusive_rename, export_utm_package
+from ctflab_platform import PlatformPolicyError, macos_execution_plan
 
 try:
     import yaml
@@ -80,7 +81,7 @@ BUILTIN_PROFILE_DIR = PROJECT_ROOT / "tools" / "ctflab_profiles"
 PROFILE_DIR = BUILTIN_PROFILE_DIR
 DEFAULT_STATE_DIR = Path.home() / "Library" / "Application Support" / "CTFLab"
 # 版本是打包（Task 6.1）、内容包版本门禁与 SBOM 的单一来源。
-CTFLAB_VERSION = "0.1.2"
+CTFLAB_VERSION = "0.1.4"
 # 最低 Python 版本（与 tools/ctflab_package.py 的 MIN_PYTHON 一致；doctor 实际校验）。
 MIN_PYTHON = (3, 10)
 QEMU_X86_NAMES = ("qemu-system-x86_64",)
@@ -1212,10 +1213,39 @@ class LabManager:
         self.locks_dir = self.state_dir / "locks"
         self._operation_lock_depth = 0
         self._operation_lock_handle: TextIO | None = None
+        self._operation_storage_bytes: bytes | None = None
         self.state_dir.mkdir(parents=True, exist_ok=True)
 
+    def _storage_guard(self) -> tuple[bytes | None, dict[str, Any] | None]:
+        path = self.state_dir / "storage-boundary.json"
+        if self._operation_storage_bytes is None and not path.exists() and not path.is_symlink():
+            return None, None
+        try:
+            from ctflab_macos_storage import check_state
+            return check_state(self.state_dir, self._operation_storage_bytes)
+        except (OSError, ValueError, RuntimeError, KeyError, TypeError, subprocess.SubprocessError) as exc:
+            raise CTFLabError("存储容量绑定无法核验；已有磁盘和实例已保留，请检查专用APFS卷及原登记。") from exc
+
+    def configure_storage_limit(self, policy_path: Path, expected: str) -> dict[str, Any]:
+        """只向新空状态根独占登记已核验描述，不创建卷、改配额或迁移既有资产。"""
+        from ctflab_macos_storage import read_policy, verify, POLICY
+        with self.operation_lock("登记存储容量"):
+            if any(p.name != "locks" for p in self.state_dir.iterdir()):
+                raise CTFLabError("容量绑定只能登记到新的空状态目录；已有资产不会迁移或覆盖。")
+            raw, value = read_policy(policy_path)
+            if value["sha256"] != expected:
+                raise CTFLabError("容量描述摘要已变化，请重新核对。")
+            verify(value, self.state_dir)
+            target = self.state_dir / POLICY
+            fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(raw); stream.flush(); os.fsync(stream.fileno())
+            verify(value, self.state_dir)
+            return {"state": "storage-limit-configured", "policy_sha256": expected,
+                    "volume_created": False, "quota_modified": False, "assets_migrated": False}
+
     @contextmanager
-    def operation_lock(self, action: str, timeout_seconds: float = 10.0) -> Iterator[None]:
+    def operation_lock(self, action: str, timeout_seconds: float = 10.0, *, storage_check: bool = True) -> Iterator[None]:
         """串行化会修改镜像、overlay、状态或实验网络的操作。
 
         锁文件会保留在状态目录中，但真正的所有权由内核 ``flock`` 维护；
@@ -1260,15 +1290,31 @@ class LabManager:
         handle.write(json.dumps({"pid": os.getpid(), "action": action, "acquired_at": now_iso()}, ensure_ascii=False))
         handle.flush()
         try:
+            if storage_check:
+                self._operation_storage_bytes, _ = self._storage_guard()
             yield
+            if storage_check:
+                self._storage_guard()
         finally:
+            self._operation_storage_bytes = None
             self._operation_lock_depth = 0
             self._operation_lock_handle = None
-            handle.seek(0)
-            handle.truncate()
-            handle.flush()
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-            handle.close()
+            try:
+                try:
+                    handle.seek(0)
+                    handle.truncate()
+                    handle.flush()
+                except OSError:
+                    # 容量/介质异常时诊断元数据可能写失败；不覆盖原操作异常或泄漏内核门。
+                    pass
+            finally:
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                finally:
+                    try:
+                        handle.close()
+                    except OSError:
+                        pass
 
     def image_state_path(self, profile_id: str) -> Path:
         profile_id = PROFILE_ALIASES.get(profile_id, profile_id)
@@ -1967,6 +2013,7 @@ class LabManager:
         kernel_path: Path | None = None,
         initrd_path: Path | None = None,
     ) -> list[str]:
+        compute = macos_execution_plan("aarch64").compute_arguments()
         qemu = which_any(QEMU_ARM_NAMES)
         code_path = find_firmware("edk2-aarch64-code.fd")
         if not qemu or not code_path:
@@ -1976,8 +2023,7 @@ class LabManager:
             qemu,
             "-name", f"CTFLab-{profile_id}-Installer",
             "-machine", str(guest.get("machine", "virt")),
-            "-accel", "hvf",
-            "-cpu", "host",
+            *compute,
             "-smp", str(guest.get("cpus", 4)),
             "-m", str(guest.get("memory_mb", 5120)),
             "-drive", f"if=pflash,format=raw,unit=0,file={code_path},readonly=on",
@@ -2127,6 +2173,7 @@ class LabManager:
             )
             log_handle = log_path.open("a", encoding="utf-8")
             try:
+                self._storage_guard()
                 process = subprocess.Popen(
                     command,
                     stdin=subprocess.DEVNULL,
@@ -2198,7 +2245,7 @@ class LabManager:
         return result
 
     def stop_install(self, profile_id: str) -> bool:
-        with self.operation_lock(f"停止安装 {profile_id}"):
+        with self.operation_lock(f"停止安装 {profile_id}", storage_check=False):
             state = self.installer_state(profile_id)
             if not state:
                 return False
@@ -2459,6 +2506,7 @@ class LabManager:
             listener.close()
             raise
         try:
+            self._storage_guard()
             process = subprocess.Popen(
                 command,
                 stdin=subprocess.DEVNULL,
@@ -2683,6 +2731,12 @@ class LabManager:
         disk = profile.get("disk", {})
         network = profile.get("network", {})
         architecture = guest.get("architecture", "x86_64")
+        try:
+            execution = macos_execution_plan(architecture)
+        except PlatformPolicyError as exc:
+            raise CTFLabError(str(exc)) from exc
+        architecture = execution.guest_architecture
+        compute = execution.compute_arguments()
         if architecture == "aarch64":
             qemu = which_any(QEMU_ARM_NAMES)
             if not qemu:
@@ -2692,8 +2746,7 @@ class LabManager:
                 qemu,
                 "-name", f"CTFLab-{profile_id}",
                 "-machine", str(guest.get("machine", "virt")),
-                "-accel", "hvf",
-                "-cpu", "host",
+                *compute,
                 "-smp", str(guest.get("cpus", 2)),
                 "-m", str(guest.get("memory_mb", 4096)),
                 "-drive", f"if=pflash,format=raw,unit=0,file={code_path},readonly=on",
@@ -2714,8 +2767,7 @@ class LabManager:
                 qemu,
                 "-name", f"CTFLab-{profile_id}",
                 "-machine", str(guest.get("machine", "pc")),
-                "-accel", "tcg,thread=multi",
-                "-cpu", "max",
+                *compute,
                 "-smp", str(guest.get("cpus", 1)),
                 "-m", str(guest.get("memory_mb", 1024)),
             ]
@@ -2947,6 +2999,7 @@ class LabManager:
             log_path.parent.mkdir(parents=True, exist_ok=True)
             log_handle = log_path.open("a", encoding="utf-8")
             try:
+                self._storage_guard()
                 process = subprocess.Popen(
                     command,
                     stdin=subprocess.DEVNULL,
@@ -3121,7 +3174,7 @@ class LabManager:
 
     def stop(self, profile_ids: list[str], stop_all: bool = False, graceful: bool = False) -> list[str]:
         description = "停止全部实例" if stop_all else "停止 " + ",".join(profile_ids)
-        with self.operation_lock(description):
+        with self.operation_lock(description, storage_check=False):
             return self._stop_unlocked(profile_ids, stop_all=stop_all, graceful=graceful)
 
     def _stop_unlocked(self, profile_ids: list[str], stop_all: bool = False, graceful: bool = False) -> list[str]:
@@ -3505,7 +3558,12 @@ class LabManager:
                 entry["snapshots"] = []
             entry["backups"] = self.backups_list(profile_id)
             profiles.append(entry)
-        return {"schema": 1, "state_dir": str(self.state_dir), "profiles": profiles}
+        try:
+            _, capacity = self._storage_guard()
+            capacity = capacity or {"state": "not-configured", "automatic_cleanup": False}
+        except CTFLabError as exc:
+            capacity = {"state": "unverified", "message": str(exc), "automatic_cleanup": False}
+        return {"schema": 1, "state_dir": str(self.state_dir), "profiles": profiles, "capacity_limit": capacity}
 
     def health(self, profile_id: str) -> list[dict[str, Any]]:
         profile_id = PROFILE_ALIASES.get(profile_id, profile_id)
@@ -4571,6 +4629,7 @@ def cmd_app_build(_manager: LabManager, args: argparse.Namespace) -> int:
             spice_client=args.spice_client,
             python_runtime=args.python_runtime,
             python_runtime_sha256=args.python_runtime_sha256,
+            generic_runtime_manifest=getattr(args, "generic_runtime_manifest", None),
             pyyaml_source=args.pyyaml,
             pyyaml_sha256=args.pyyaml_sha256,
             sign_identity=args.sign_identity,
@@ -5975,6 +6034,13 @@ def cmd_storage(manager: LabManager, args: argparse.Namespace) -> int:
     if getattr(args, "json", False):
         print(json.dumps(report, ensure_ascii=False, indent=2))
         return 0
+    capacity = report["capacity_limit"]
+    if capacity["state"] == "apfs-quota-observed":
+        print(f"专用APFS卷上限 {capacity['quota_bytes'] / 1024 ** 3:.2f} GiB，当前可用 {capacity['available_bytes'] / 1024 ** 3:.2f} GiB；未自动清理。")
+    elif capacity["state"] == "unverified":
+        print("容量限制未能核验：" + capacity["message"])
+    else:
+        print("未配置专用卷容量限制；存储报告不会自动添加配额或清理。")
     for entry in report["profiles"]:
         state = "运行中" if entry["running"] else ("已导入" if entry["imported"] else "未导入")
         print(f"{entry['id']}: {state}")
@@ -5993,6 +6059,182 @@ def cmd_storage(manager: LabManager, args: argparse.Namespace) -> int:
             print(f"    整盘备份 {backup['name']}"
                   f"（{(backup['overlay_bytes'] or 0) / (1024 ** 2):.1f} MiB）")
     return 0
+
+
+def cmd_storage_limit(manager: LabManager, args: argparse.Namespace) -> int:
+    try:
+        result = manager.configure_storage_limit(args.policy, args.policy_sha256)
+    except (OSError, ValueError, RuntimeError, KeyError, TypeError, subprocess.SubprocessError) as exc:
+        raise CTFLabError("容量登记失败或未完成；已有材料保留，没有创建卷或修改配额。") from exc
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_generic_client(manager: LabManager, args: argparse.Namespace) -> int:
+    """原Mac通用v2工作区，固定UUID私有根；不更换原运行链或更新器。"""
+    from ctflab_remote import decode
+    from ctflab_contract import MAX_MESSAGE_BYTES, require, uuid_text, ContractError, public_error
+    from ctflab_generation_store import private_directory, GenerationStore, digest
+    import ctflab_desktop_bridge as bridge
+    import sqlite3
+    try:
+        value = decode(sys.stdin.buffer.read(MAX_MESSAGE_BYTES+1))
+        require(type(value) is dict and set(value)=={'instance_uuid','payload'})
+        instance = uuid_text(value['instance_uuid']); payload = value['payload']
+        require(type(payload) is dict and payload.get('action') in
+                ('instances','configure','preview','overview','submit','query-request','events','display','draft','rearm-observer','rearm-log','resume-dispatch','restart-preparation','operation-history','operation-result','template-qualify'))
+        manager._storage_guard()
+        parent=manager.state_dir/'generic-instances'; root=parent/instance
+        if payload['action']=='instances':
+            require(set(payload)=={'action'})
+            reports=[]
+            if parent.exists():
+                entries=list(parent.iterdir());require(len(entries)<=256)
+                for path in sorted(entries):
+                    uuid_text(path.name);store=GenerationStore(path)
+                    require(store.config['instance_uuid']==path.name,'identity-unknown')
+                    reports.append({'instance_uuid':path.name,'active':{'generation':store.snapshot()['active_generation']},
+                                    'runtime_verified':False})
+            result={'state':'listed','reports':reports,'automatic_replay':False}
+        elif payload['action']=='preview':
+            from ctflab_scenario_v2 import parse_manifest, instance_plan, MAX_BYTES as MANIFEST_MAX_BYTES
+            require(set(payload)=={'action','manifest'} and Path(payload['manifest']).is_absolute())
+            with Path(payload['manifest']).open('rb') as stream: raw=stream.read(MANIFEST_MAX_BYTES+1)
+            require(len(raw)<=MANIFEST_MAX_BYTES)
+            import hashlib
+            manifest=parse_manifest(raw.decode('utf-8'))
+            result={'state':'design','plan':instance_plan(manifest,instance),'source_manifest':manifest,
+                    'manifest_sha256':hashlib.sha256(raw).hexdigest(),'runtime_verified':False,'isolation_verified':False}
+        elif payload['action']=='configure':
+            require(set(payload)=={'action','manifest','manifest_sha256','assets','profile','nvram'})
+            require(Path(payload['manifest']).is_absolute())
+            require(digest(payload['manifest'])==payload['manifest_sha256'],'state-conflict')
+            require(type(payload['profile']) is dict or type(payload['profile']) is str and Path(payload['profile']).is_absolute())
+            profile=payload['profile'] if type(payload['profile']) is dict else bridge.read(Path(payload['profile']))
+            require(type(profile) is dict and profile.get('host')=='darwin-arm64','capability-unverified')
+            raw,_=manager._storage_guard()
+            if raw is not None:profile=dict(profile,macos_storage=json.loads(raw))
+            with manager.operation_lock('通用场景配置'):
+                if not parent.exists():private_directory(parent)
+                item={k:v for k,v in payload.items() if k!='manifest_sha256'}
+                item.update(instance_uuid=instance,profile=profile)
+                result=bridge.dispatch(root,item)
+                require(digest(payload['manifest'])==payload['manifest_sha256'],'state-conflict')
+        elif payload['action']=='overview' and not root.exists():
+            require(set(payload)=={'action'})
+            result={'configured':False,'instance_uuid':instance,'generation':0,'automatic_replay':False}
+        else:
+            require(GenerationStore(root).config['instance_uuid']==instance,'permission-denied')
+            result=bridge.dispatch(root,payload,spawn=bridge.launch)
+        manager._storage_guard()
+        print(json.dumps(result,ensure_ascii=False));return 0
+    except (OSError,ValueError,RuntimeError,TypeError,KeyError,sqlite3.Error) as error:
+        print(json.dumps({'error':public_error(error.code if isinstance(error,ContractError) else 'backend-failed'),
+                          'preserved':True,'automatic_replay':False},ensure_ascii=False));return 2
+
+
+def cmd_scenario_client(manager: LabManager, args: argparse.Namespace) -> int:
+    """原Mac三节点场景的固定stdin入口；根固定，不接受命令、socket根或释放操作。"""
+    import contextlib
+    import io
+    import hashlib
+    from ctflab_remote import decode
+    from ctflab_contract import MAX_MESSAGE_BYTES, require, uuid_text, identifier, integer, canonical, public_error, ContractError
+    try:
+        value = decode(sys.stdin.buffer.read(MAX_MESSAGE_BYTES + 1))
+        common = {'action', 'instance_uuid'}
+        require(type(value) is dict and common <= set(value))
+        action = value['action']; instance = value['instance_uuid']
+        require(action in ('status', 'preview', 'prepare', 'start', 'stop', 'reset', 'recover'))
+        if instance is not None: uuid_text(instance)
+        require(action == 'status' or instance is not None)
+        extra = {'status': set(), 'preview': {'manifest'},
+                 'prepare': {'manifest', 'manifest_sha256', 'assets', 'firmware', 'expected_sha256'},
+                 'start': {'expected_sha256', 'allow_emulation'}, 'stop': {'expected_sha256'},
+                 'reset': {'expected_sha256', 'new_generation'}, 'recover': {'expected_sha256'}}[action]
+        require(set(value) == common | extra)
+        manager._storage_guard()
+        state_root = manager.state_dir/'scenario-state'
+        def report():
+            scene = state_root/'scenarios'
+            if instance is not None:
+                return [scenario_status_report(state_root, instance)] if (scene/instance).is_dir() else []
+            if not scene.is_dir(): return []
+            entries = list(scene.iterdir()); require(len(entries) <= 256)
+            return [scenario_status_report(state_root, uuid_text(p.name)) for p in sorted(entries) if p.is_dir()]
+        def snapshot():
+            reports = report()
+            return reports, hashlib.sha256(canonical(reports).encode()).hexdigest()
+        if action == 'preview':
+            import ctflab_scenario
+            path = Path(value['manifest']); require(path.is_absolute())
+            with path.open('rb') as stream: raw = stream.read(MAX_MESSAGE_BYTES + 1)
+            require(len(raw) <= MAX_MESSAGE_BYTES)
+            manifest = ctflab_scenario.parse_manifest(raw.decode('utf-8'), available_capabilities=scenario_capabilities())
+            result = {'state': 'design', 'plan': ctflab_scenario.instance_plan(manifest, instance, available_capabilities=scenario_capabilities()),
+                      'source_manifest': manifest,
+                      'manifest_sha256': hashlib.sha256(raw).hexdigest(),
+                      'runtime_verified': False, 'isolation_verified': False}
+        elif action == 'status':
+            reports, checksum = snapshot()
+            result = {'state': 'observed', 'reports': reports, 'snapshot_sha256': checksum, 'automatic_replay': False}
+        else:
+            with manager.operation_lock('场景工作区'):
+                reports, checksum = snapshot()
+                require(value['expected_sha256'] == checksum, 'state-conflict')
+                ns = argparse.Namespace(state_dir=manager.state_dir, state_root=state_root, socket_root=None,
+                    instance=instance, json=True, close_reset=False, release_orphan=False,
+                    per_node_timeout=120.0, service_timeout=60.0)
+                if action == 'prepare':
+                    require(not reports, 'state-conflict')
+                    ns.manifest = Path(value['manifest']); require(ns.manifest.is_absolute())
+                    with ns.manifest.open('rb') as stream: source = stream.read(MAX_MESSAGE_BYTES + 1)
+                    require(len(source) <= MAX_MESSAGE_BYTES and hashlib.sha256(source).hexdigest() == value['manifest_sha256'], 'state-conflict')
+                    require(type(value['assets']) is dict and type(value['firmware']) is dict)
+                    require(len(value['assets']) <= 32 and len(value['firmware']) <= 32)
+                    ns.asset = []; ns.firmware = []; ns.generation = 1
+                    for key, path in value['assets'].items():
+                        identifier(key); require(type(path) is str and Path(path).is_absolute())
+                        ns.asset.append(key+'='+path)
+                    for key, pair in value['firmware'].items():
+                        identifier(key); require(type(pair) is list and len(pair) == 2 and all(type(p) is str and Path(p).is_absolute() and ',' not in p for p in pair))
+                        ns.firmware.append(key+'='+','.join(pair))
+                if action == 'start': require(value['allow_emulation'] is True, 'capability-unverified')
+                if action == 'reset': ns.new_generation = integer(value['new_generation'], 2)
+                if action == 'recover': ns.close_reset = True
+                handlers = {'prepare': cmd_scenario_prepare, 'start': cmd_scenario_start, 'stop': cmd_scenario_stop,
+                            'reset': cmd_scenario_reset, 'recover': cmd_scenario_recover}
+                # 原处理器保持自己的身份/并发/正常关机/原子重置门禁；文本不混入JSON。
+                with contextlib.redirect_stdout(io.StringIO()) as messages, contextlib.redirect_stderr(messages):
+                    code = handlers[action](None, ns)
+                require(code == 0, 'backend-failed')
+                if action == 'prepare': require(sha256_file(ns.manifest) == value['manifest_sha256'], 'state-conflict')
+                result = {'state': 'returned', 'reports': report(), 'notes': messages.getvalue()[-8192:],
+                          'automatic_replay': False, 'runtime_verified': False, 'isolation_verified': False}
+        manager._storage_guard()
+        print(json.dumps(result, ensure_ascii=False)); return 0
+    except (OSError, ValueError, RuntimeError, KeyError, TypeError) as error:
+        print(json.dumps({'error': public_error(error.code if isinstance(error, ContractError) else 'backend-failed'),
+                          'preserved': True, 'automatic_replay': False}, ensure_ascii=False)); return 2
+
+
+def cmd_remote_client(manager: LabManager, args: argparse.Namespace) -> int:
+    """原生Mac界面的固定标准输入桥接；独立门允许连接取消，不占本机VM操作门。"""
+    from ctflab_client_store import ClientStore
+    from ctflab_remote import decode
+    from ctflab_contract import MAX_MESSAGE_BYTES, ContractError, public_error
+    import sqlite3
+    try:
+        manager._storage_guard()
+        value = decode(sys.stdin.buffer.read(MAX_MESSAGE_BYTES + 1))
+        result = ClientStore(manager.state_dir / "remote-client").handle(value)
+        manager._storage_guard()
+        print(json.dumps(result, ensure_ascii=False)); return 0
+    except ContractError as error:
+        code = error.code
+    except (OSError, ValueError, RuntimeError, KeyError, TypeError, sqlite3.Error):
+        code = "persistence-failed"
+    print(json.dumps({"error": public_error(code), "automatic_replay": False}, ensure_ascii=False)); return 2
 
 
 def cmd_health(manager: LabManager, args: argparse.Namespace) -> int:
@@ -6090,6 +6332,41 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--state-dir", type=Path, default=DEFAULT_STATE_DIR, help="运行时状态目录")
     parser.add_argument("--version", action="version", version=f"%(prog)s {CTFLAB_VERSION}")
     subparsers = parser.add_subparsers(dest="command", required=True)
+    external_parser = subparsers.add_parser("external-attach", help="外部攻击机接入：材料生成与登记/槽位校验（只读本地操作）")
+    external_sub = external_parser.add_subparsers(dest="external_command", required=True)
+    external_materials = external_sub.add_parser("materials", help="只生成Kali助手材料目录；不安装、不改网络")
+    external_materials.add_argument("--destination", required=True)
+    external_materials.add_argument("--attachment")
+    external_materials.add_argument("--policy")
+    external_materials.add_argument("--session")
+    external_check = external_sub.add_parser("check", help="校验登记/槽位/策略JSON并输出摘要（只读）")
+    external_check.add_argument("--registration", required=True)
+    external_check.add_argument("--attachment", required=True)
+    external_check.add_argument("--policy", required=True)
+    external_approve = external_sub.add_parser(
+        "approve", help="持久批准助手安装摘要：绑定登记与材料清单，写入用户私有账本")
+    external_approve.add_argument("--registration", required=True)
+    external_approve.add_argument("--materials-manifest", required=True)
+    external_approve.add_argument(
+        "--ledger-dir",
+        help="批准账本目录；默认 用户profile目录/external-attach（私有0700）")
+
+    local_parser = subparsers.add_parser("local-contract", help="本地契约只读 JSON 行入口，不执行 VM")
+    local_parser.add_argument("--root", type=Path, required=True, help="已创建的私有契约目录")
+    local_parser.add_argument("--history", help="只读查询实例的持久操作历史")
+    local_parser.add_argument("--operation", help="与--history一起读取指定原操作结果")
+    local_parser.add_argument("--limit", type=int, default=20)
+    local_parser.add_argument("--before", help="只读历史分页的原操作UUID")
+    scenario_plan = subparsers.add_parser("scenario-plan-v2", help="通用场景离线计划，不执行 VM")
+    scenario_plan.add_argument("manifest", type=Path)
+    scenario_plan.add_argument("--instance", required=True)
+    scenario_plan.add_argument("--generation", type=int, default=1)
+    catalog_parser = subparsers.add_parser("course-catalog", help="离线课程目录与资产只读校验")
+    catalog_parser.add_argument("catalog", type=Path)
+    catalog_parser.add_argument("--course", required=True)
+    catalog_parser.add_argument("--host-architecture", required=True, choices=("x86_64", "aarch64"))
+    catalog_parser.add_argument("--variant")
+    catalog_parser.add_argument("--asset-root", type=Path)
     profile_choices = available_profiles() + sorted(PROFILE_ALIASES)
 
     update_parser = subparsers.add_parser("update", help="本地校验更新槽位与回退；不下载或覆盖现用 App")
@@ -6309,6 +6586,12 @@ def build_parser() -> argparse.ArgumentParser:
         "network", help="实验网拓扑、联网策略与端口映射的只读视图（不做变更）")
     network_parser.add_argument("--json", action="store_true", help="输出机器可读 JSON")
     storage_parser.add_argument("--json", action="store_true", help="输出机器可读 JSON")
+    storage_limit = subparsers.add_parser("storage-limit", help="仅向新空状态根登记已核验的专用APFS卷配额；不创建卷或改配额")
+    storage_limit.add_argument("--policy", type=Path, required=True, help="私有容量描述文件")
+    storage_limit.add_argument("--policy-sha256", required=True, help="明确接受的描述sha256字段")
+    subparsers.add_parser("remote-client", help="原Mac界面的固定JSON标准输入桥接；不接受远程命令")
+    subparsers.add_parser("scenario-client", help="原Mac本机三节点场景的固定JSON入口")
+    subparsers.add_parser("generic-client", help="原Mac通用v2场景的固定私有根JSON入口")
 
     health_parser = subparsers.add_parser("health", help="检查进程和已配置的端口")
     health_parser.add_argument("profile", choices=profile_choices)
@@ -6379,6 +6662,8 @@ def build_parser() -> argparse.ArgumentParser:
                                 "（必填：app 必须内置解释器，不回退系统 Python）")
     app_build.add_argument("--python-runtime-sha256",
                            help="期望的 Python 运行时归档 SHA-256（可选，强制校验来源）")
+    app_build.add_argument("--generic-runtime-manifest", type=Path,
+                           help="可选完整通用运行时许可证清单；保留并核验cryptography/Tcl/Tk，不下载依赖")
     app_build.add_argument("--pyyaml", type=Path, required=True,
                            help="PyYAML wheel（.whl）或解包目录（必填：随包分发，接收者无需 pip）")
     app_build.add_argument("--pyyaml-sha256",
@@ -6477,6 +6762,10 @@ def main(argv: list[str] | None = None) -> int:
         "health": cmd_health,
         "snapshot": cmd_snapshot,
         "storage": cmd_storage,
+        "storage-limit": cmd_storage_limit,
+        "remote-client": cmd_remote_client,
+        "scenario-client": cmd_scenario_client,
+        "generic-client": cmd_generic_client,
         "network": cmd_network,
         "probe": cmd_probe,
         "utm-export": cmd_utm_export,
@@ -6495,6 +6784,43 @@ def main(argv: list[str] | None = None) -> int:
     try:
         # 纯打包/校验命令不需要运行状态；避免仅执行 package/content 时在默认
         # 状态目录创建 locks/ 等运行时目录，保持该类操作的只读/构建边界。
+        if args.command == "scenario-plan-v2":
+            import ctflab_scenario_v2
+            return ctflab_scenario_v2.main([str(args.manifest), "--instance", args.instance,
+                                           "--generation", str(args.generation)])
+        if args.command == "course-catalog":
+            import ctflab_catalog
+            arguments = [str(args.catalog), "--course", args.course,
+                         "--host-architecture", args.host_architecture]
+            if args.variant is not None:
+                arguments.extend(["--variant", args.variant])
+            if args.asset_root is not None:
+                arguments.extend(["--asset-root", str(args.asset_root)])
+            return ctflab_catalog.main(arguments)
+        if args.command == "external-attach":
+            import ctflab_external_attach
+            if args.external_command == "materials":
+                material_args = ["materials", "--destination", args.destination]
+                for field in ("attachment", "policy", "session"):
+                    if getattr(args, field):
+                        material_args.extend(["--" + field, getattr(args, field)])
+                return ctflab_external_attach.main(material_args)
+            if args.external_command == "approve":
+                ledger = args.ledger_dir or str(ctflab_external_attach.approval_ledger_dir())
+                return ctflab_external_attach.main(["approve", "--registration", args.registration,
+                                                    "--materials-manifest", args.materials_manifest,
+                                                    "--ledger-dir", ledger])
+            return ctflab_external_attach.main(["check", "--registration", args.registration,
+                                                "--attachment", args.attachment, "--policy", args.policy])
+        if args.command == "local-contract":
+            import ctflab_local_adapter
+            adapter_args = ["--root", str(args.root)]
+            if args.limit != 20:
+                adapter_args.extend(["--limit", str(args.limit)])
+            for field in ("history", "operation", "before"):
+                if getattr(args, field) is not None:
+                    adapter_args.extend(["--" + field, getattr(args, field)])
+            return ctflab_local_adapter.main(adapter_args)
         if args.command == "package":
             return package_handlers[args.package_command](None, args)  # type: ignore[arg-type]
         if args.command == "content":

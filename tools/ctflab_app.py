@@ -75,7 +75,7 @@ QEMU_SOURCE_SHA256 = {
 # 内置 Python 运行时（python-build-standalone，见 docs/ctflab-task6-app-runtime-design.md §11）。
 PYTHON_RUNTIME_REL = f"{RUNTIME_REL}/python"
 # 裁剪清单：只保留 CTFLab CLI 运行所需（stdlib + 内置扩展）。每一项在构建时记录，
-# 裁剪内容与理由见设计文档；tkinter/Tcl/Tk 不随包（无许可证文本缺口）、pip/ensurepip 不随包
+# 默认裁剪沿历史；只有显式提供完整运行时许可证清单时保留Tcl/Tk并做导入核验，pip/ensurepip仍不随包
 # （学生机不需要安装包）、idle/lib2to3/2to3 等开发工具与 include/config 头文件不随包。
 PYTHON_PRUNE_GLOBS = (
     "include",
@@ -546,7 +546,7 @@ def _python_version(python_root: Path) -> str | None:
 
 
 def copy_python_runtime(source: Path, destination: Path, *,
-                        expected_sha256: str | None = None) -> dict[str, Any]:
+                        expected_sha256: str | None = None, generic_runtime: bool = False) -> dict[str, Any]:
     """把 python-build-standalone 发行版（.tar.gz 或已解包目录）复制进 app。
 
     复制后：按 PYTHON_PRUNE_GLOBS 裁剪、符号链接解引用为硬链接、断言无符号链接残留。
@@ -583,7 +583,10 @@ def copy_python_runtime(source: Path, destination: Path, *,
 
     try:
         shutil.copytree(source_root, destination, symlinks=True)
-        pruned = _prune_python_tree(destination)
+        retained = {'lib/libtcl*','lib/libtk*','lib/tcl*','lib/tk*','lib/itcl*','lib/thread*',
+                    'lib/python*/tkinter','lib/python*/lib-dynload/_tkinter*'}
+        patterns = tuple(p for p in PYTHON_PRUNE_GLOBS if not generic_runtime or p not in retained)
+        pruned = _prune_python_tree(destination, patterns)
         replaced = _dereference_symlinks(destination)
         leftovers = [path.relative_to(destination).as_posix()
                      for path in sorted(destination.rglob("*")) if path.is_symlink()]
@@ -607,6 +610,88 @@ def copy_python_runtime(source: Path, destination: Path, *,
         "symlinks_dereferenced": replaced,
         "pruned": pruned,
     }
+
+
+def generic_runtime_licenses(manifest: Path, destination: Path) -> dict[str, Any]:
+    """只接受管理员明确提供、逐文件摘要匹配的依赖许可证；不下载或安装。"""
+    manifest = Path(manifest)
+    _expect(manifest.is_file() and manifest.stat().st_size <= 65536, "完整运行时许可证清单无效。")
+    with manifest.open('rb') as stream: raw = stream.read(65537)
+    _expect(len(raw)<=65536, "完整运行时许可证清单过大。")
+    try:
+        def unique(pairs):
+            value={}
+            for key,item in pairs:
+                _expect(key not in value, "完整运行时许可证清单含重复字段。")
+                value[key]=item
+            return value
+        value = json.loads(raw.decode('utf-8'), object_pairs_hook=unique)
+    except (ValueError,UnicodeError):raise AppBuildError("完整运行时许可证清单无法解析。") from None
+    _expect(type(value) is dict and set(value) == {"schema", "licenses"} and type(value["schema"]) is int and value["schema"] == 1,
+            "完整运行时许可证清单结构无效。")
+    entries = value["licenses"]
+    _expect(type(entries) is dict and set(entries) == {"cryptography", "tcl", "tk"}, "须提供cryptography/Tcl/Tk三份许可证。")
+    result = {}
+    for name, entry in entries.items():
+        _expect(type(entry) is dict and set(entry) == {"path", "sha256", "license"}, "依赖许可证字段无效。")
+        _expect(type(entry["path"]) is str, "许可证路径无效。")
+        path = Path(entry["path"])
+        _expect(path.is_absolute() and path.is_file() and not path.is_symlink() and path.stat().st_size <= 2*1024**2,
+                "依赖许可证必须为明确选择的普通文件。")
+        _expect(type(entry["license"]) is str and re.fullmatch(r'[A-Za-z0-9.() -]{1,128}', entry["license"]) is not None,
+                "依赖许可证标识无效。")
+        with path.open('rb') as stream: data=stream.read(2*1024**2+1)
+        _expect(0<len(data)<=2*1024**2 and hashlib.sha256(data).hexdigest()==entry['sha256'], "依赖许可证摘要不一致或文件过大。")
+        try: text=data.decode('utf-8')
+        except UnicodeError:raise AppBuildError("许可证必须是UTF-8文本。") from None
+        _expect('\x00' not in text and bool(text.strip()), "许可证必须是非空文本。")
+        directory = destination/("python-"+name); directory.mkdir()
+        target = directory/"LICENSE.txt"
+        with target.open('xb') as stream:stream.write(data)
+        _expect(sha256_file(target) == entry["sha256"] and sha256_file(path) == entry["sha256"], "复制期间许可证变化。")
+        result[name] = {"license": entry["license"], "sha256": entry["sha256"],
+                        "license_file": "python-"+name+"/LICENSE.txt"}
+    return result
+
+
+def probe_generic_runtime(root: Path) -> dict[str, Any]:
+    """隔离环境加载控制/显示依赖，不创建窗口、VM、套接字或写入App。"""
+    root = Path(root).resolve()
+    script = '''import sys,json,ssl,_ssl,tkinter,_tkinter,cryptography
+from pathlib import Path
+from cryptography.hazmat.bindings import _rust
+from cryptography.hazmat.primitives.asymmetric import ec
+root=Path(sys.executable).resolve().parent.parent
+assert cryptography.__version__=="46.0.5"
+ec.generate_private_key(ec.SECP256R1())
+mods=[ssl,_ssl,tkinter,_tkinter,cryptography,_rust]
+if "_cffi_backend" in sys.modules:mods.append(sys.modules["_cffi_backend"])
+def module_from_bundle(module):
+ location=getattr(module,"__file__",None)
+ if location is not None:return Path(location).resolve().is_relative_to(root)
+ return (module.__name__ in sys.builtin_module_names
+         and getattr(getattr(module,"__spec__",None),"origin",None)=="built-in")
+assert all(module_from_bundle(m) for m in mods)
+interpreter=tkinter.Tcl()
+library=Path(interpreter.eval("info library")).resolve()
+assert library.is_relative_to(root)
+print(json.dumps({"imports_from_bundle":True,"cryptography":cryptography.__version__,"tcl":_tkinter.TCL_VERSION,"tk":_tkinter.TK_VERSION,"tcl_library":library.relative_to(root).as_posix(),"window_opened":False}))'''
+    try:
+        reply = subprocess.run([str(root/"bin/python3"), "-I", "-B", "-c", script],
+            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=20,
+            env={"PATH":"/usr/bin:/bin:/usr/sbin:/sbin", "LANG":"C", "HOME":str(root)})
+    except (OSError,subprocess.SubprocessError):raise AppBuildError("完整Mac运行时依赖探测未能完成。") from None
+    _expect(reply.returncode == 0 and len(reply.stdout) <= 65536, "完整Mac运行时的认证控制/Tcl/Tk导入核验失败。")
+    try:result = json.loads(reply.stdout)
+    except ValueError:raise AppBuildError("完整Mac运行时依赖探测未返回有效JSON。") from None
+    _expect(type(result) is dict and result.get("imports_from_bundle") is True and result.get("cryptography") == "46.0.5"
+            and result.get("window_opened") is False and all(type(result.get(k)) is str for k in ("tcl","tk","tcl_library")),
+            "完整Mac运行时核验结果无效。")
+    location=PurePosixPath(result['tcl_library'])
+    _expect(not location.is_absolute() and '..' not in location.parts and bool(location.parts)
+            and all(re.fullmatch(r'\d+(?:\.\d+){1,2}',result[k]) is not None for k in ('tcl','tk')),
+            "完整Mac运行时的Tcl路径或版本无效。")
+    return result
 
 
 def copy_pyyaml(source: Path, site_packages: Path, licenses_dir: Path, *,
@@ -1238,6 +1323,7 @@ def build_app(
     spice_client: Path | None = None,
     python_runtime: Path | None = None,
     python_runtime_sha256: str | None = None,
+    generic_runtime_manifest: Path | None = None,
     pyyaml_source: Path | None = None,
     pyyaml_sha256: str | None = None,
     generated_at: str | None = None,
@@ -1348,7 +1434,8 @@ def build_app(
         licenses_dir.mkdir()
         runtime_python = runtime / "python"
         python_meta = copy_python_runtime(python_runtime, runtime_python,
-                                          expected_sha256=python_runtime_sha256)
+                                          expected_sha256=python_runtime_sha256,
+                                          generic_runtime=generic_runtime_manifest is not None)
         python_meta["root"] = PYTHON_RUNTIME_REL
         site_candidates = sorted(runtime_python.glob("lib/python3.*/site-packages"))
         _expect(len(site_candidates) == 1,
@@ -1357,6 +1444,7 @@ def build_app(
         pyyaml_meta = copy_pyyaml(pyyaml_source, site_packages, licenses_dir / "pyyaml",
                                   expected_sha256=pyyaml_sha256)
         pyyaml_meta["package_rel"] = (site_packages / "yaml").relative_to(temp_app).as_posix()
+        generic_licenses = generic_runtime_licenses(generic_runtime_manifest, licenses_dir) if generic_runtime_manifest else None
 
         # 5) 签名 Mach-O（install_name_tool 之后必须重新签名；没有身份时 ad-hoc）
         if not unsigned:
@@ -1373,6 +1461,12 @@ def build_app(
                         "（键和值都必须原样保留，虚拟化能力不能被降级）")
 
         bundled_entitlements: dict[str, dict[str, Any]] = {}
+        generic_meta = None
+        if generic_licenses is not None:
+            generic_meta = probe_generic_runtime(runtime_python)
+            _expect(not verify_runtime_references(temp_app), "完整运行时含未闭合或非相对动态库引用。")
+            generic_meta = dict(generic_meta, licenses=generic_licenses, native_display_verified=False,
+                                guest_runtime_verified=False, source_verified=False)
         for name in source_entitlements:
             directory = runtime_bin if name in runtime_binary_sources else runtime_lib
             actual = read_entitlements(directory / name)
@@ -1462,6 +1556,11 @@ def build_app(
                 "bundled": True,
                 "license": KNOWN_LICENSES["spice-gtk"],
             })
+        if generic_meta:
+            for name, item in generic_licenses.items():
+                sbom["components"].append({"name":name,"version":generic_meta[name],"license":item["license"],
+                    "license_file":"licenses/"+item["license_file"],"sha256":item["sha256"],
+                    "source":"管理员提供的固定Python运行时；文本摘要登记不替代来源/法律核验"})
         (resources / "SBOM.json").write_text(json.dumps(sbom, ensure_ascii=False, indent=2) + "\n",
                                              encoding="utf-8")
         (resources / "THIRD_PARTY_LICENSES.md").write_text(third_party_markdown(sbom), encoding="utf-8")
@@ -1512,6 +1611,7 @@ def build_app(
                     "archive_sha256": python_meta.get("archive_sha256"),
                     "symlinks_dereferenced": python_meta.get("symlinks_dereferenced"),
                     "pruned": python_meta.get("pruned", []),
+                    **({"generic":generic_meta} if generic_meta else {}),
                     "pyyaml": {
                         "version": pyyaml_meta["version"],
                         "wheel_sha256": pyyaml_meta.get("wheel_sha256"),
@@ -1828,6 +1928,17 @@ def verify_app(app_path: Path, *, check_signature: bool = True) -> dict[str, Any
         _expect(not name.lower().endswith(FORBIDDEN_APP_SUFFIXES), f"app 内出现禁止文件：{rel}")
         for pattern in FORBIDDEN_APP_NAMES:
             _expect(not pattern.match(name), f"app 内出现凭据类文件：{rel}")
+
+    if python_section.get("generic") is not None:
+        generic = python_section["generic"]
+        _expect(type(generic) is dict and type(generic.get("licenses")) is dict
+                and set(generic["licenses"]) == {"cryptography","tcl","tk"}, "完整运行时登记无效。")
+        proof = probe_generic_runtime(app_path/python_section["root"])
+        _expect(all(generic.get(k) == v for k,v in proof.items()), "完整运行时导入或Tcl路径与登记不一致。")
+        for name, item in generic["licenses"].items():
+            _expect(type(item) is dict and item.get("license_file") == "python-"+name+"/LICENSE.txt", "完整运行时许可证路径无效。")
+            license_path = app_path/"Contents/Resources/licenses"/item["license_file"]
+            _expect(license_path.is_file() and sha256_file(license_path) == item.get("sha256"), "完整运行时许可证摘要不一致。")
 
     try:
         sbom = json.loads((app_path / SBOM_REL).read_text(encoding="utf-8"))

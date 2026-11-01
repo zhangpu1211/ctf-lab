@@ -1,5 +1,7 @@
 # CTFLab Mac M 跨架构靶场实施方案
 
+> 2026-10-15 接续入口：本文件保留 Mac MVP 设计和日期化阶段记录，下方旧状态不代表最新发布。当前软件与资产入口见[当前状态](ctflab-current-status.md)第 50、52 节；新增工作的优先级与实施门槛见[教学与跨平台产品规划](ctflab-product-roadmap-2026-10-15.md)、[Windows 专项](ctflab-windows-plan-2026-10-15.md)和[任务表](ctflab-implementation-backlog-2026-10-15.md)。其中 Wintermute 已有特定场景实现与历史验收，通用场景编辑、Docker、Windows/Linux 与远程运行仍待实施。
+
 > 状态（2026-10-11 整理）：Phase 1 核心课堂主路径已交付，当前公开软件为 0.1.1-preview（最低 macOS 26、Apple Silicon，ad-hoc、未公证）。10 月 11 日工作区已加入单镜像导入进度/取消重试与受控矩阵候选保存，尚未重新构建到发布 ZIP；GUI 向导人工链路与真实新镜像专项不因回归测试通过而升级。最新使用/分发入口见 `docs/ctflab-current-status.md`，历史测试数只属于各自记录日期；外接屏、跨 Mac、Mac 睡眠和干净长时闲置/持续负载仍按发布门槛保留。验收状态只使用四类标签：**已验证 / 部分验证 / 未验证 / 后续任务**（定义见第 7 节）。
 
 ## 1. 目标与边界

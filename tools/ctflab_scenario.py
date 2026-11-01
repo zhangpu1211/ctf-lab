@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 import re
 import uuid
+from ctflab_platform import macos_execution_plan
 
 REQUIRED_CAPABILITIES = frozenset({"scenario-v1", "multi-nic", "isolated-dhcp-v1", "transactional-reset-v1"})
 # 这里只描述可解析的契约，不能作为当前运行器的能力声明。
@@ -242,7 +243,8 @@ def qemu_command(manifest, instance_uuid, node_id, *, generation, state_root, so
     qmp, spice = str(endpoint / "qmp.sock"), str(endpoint / "spice.sock")
     socket_paths = (qmp,) if include_spice else (qmp, spice)
     _require(max(len(p.encode()) for p in socket_paths) <= 103, "UNIX socket 路径过长")
-    command = [_path(qemu_binary), "-name", f"CTFLab-{instance_uuid}-{node_id}-g{generation}", "-nodefaults", "-machine", "virt" if node["architecture"] == "aarch64" else "pc", "-accel", "hvf" if node["architecture"] == "aarch64" else "tcg,thread=multi", "-cpu", "host" if node["architecture"] == "aarch64" else "max", "-smp", str(node["cpus"]), "-m", str(node["memory_mb"])]
+    compute = macos_execution_plan(node["architecture"]).compute_arguments()
+    command = [_path(qemu_binary), "-name", f"CTFLab-{instance_uuid}-{node_id}-g{generation}", "-nodefaults", "-machine", "virt" if node["architecture"] == "aarch64" else "pc", *compute, "-smp", str(node["cpus"]), "-m", str(node["memory_mb"])]
     if node["firmware"] == "uefi":
         _require(firmware_code is not None, "UEFI 需要调用方提供只读固件")
         command += ["-drive", f"if=pflash,format=raw,unit=0,file={_path(firmware_code)},readonly=on", "-drive", f"if=pflash,format=raw,unit=1,file={runtime / 'nvram.fd'}"]

@@ -61,7 +61,7 @@ class ScenarioPackTests(unittest.TestCase):
         self.assertEqual(entries["wintermute.json"], "scenario-manifest")
         self.assertEqual(sorted(name for name, role in entries.items() if role == "scenario-base"),
                          ["kali-base.qcow2", "neuromancer-base.qcow2", "straylight-base.qcow2"])
-        report = ctflab_dist.verify_distribution(self.root / "pack", runner_version="0.1.2")
+        report = ctflab_dist.verify_distribution(self.root / "pack", runner_version=ctflab.CTFLAB_VERSION)
         self.assertTrue(report["ok"], report["problems"])
         summary = report["pack"]
         self.assertEqual(summary["scenario"]["id"], "wintermute")
