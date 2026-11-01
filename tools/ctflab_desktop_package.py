@@ -20,6 +20,10 @@ from ctflab_windows_recovery import record
 
 TOOLS=tuple(sorted({n for n in RECOVERY_FILES if n.startswith('tools/') and '/tests/' not in n} | {
     'tools/ctflab_windows_storage.py','tools/ctflab_storage_bind.py','tools/ctflab_pe_dependencies.py',
+    'tools/ctflab_external_attach.py','tools/ctflab_external_l2.py','tools/ctflab_kali_attach.py',
+    'tools/ctflab_scenario_runtime.py','tools/ctflab_scenario.py','tools/ctflab_scenario_registry.py',
+    'tools/ctflab_scenario_resources.py','tools/ctflab_scenario_services.py','tools/ctflab_network.py',
+    'tools/ctflab_platform.py','tools/ctflab_darwin_native.py','tools/ctflab_macos_storage.py',
     'tools/ctflab_ir_course.py','tools/ctflab_windows_course_events.py',
     'tools/ctflab_waf_course.py',
     'tools/ctflab_server_storage.py',

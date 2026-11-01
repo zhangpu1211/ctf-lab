@@ -15,6 +15,26 @@ from ctflab_runtime_inventory import inventory
 import ctflab_desktop_package as package
 
 
+class SourceClosureTests(unittest.TestCase):
+    def test_all_local_python_imports_are_in_package(self):
+        """检查延迟导入，防止窗口可开但实际功能缺少模块。"""
+        import ast
+        source = Path(__file__).resolve().parents[2]
+        known = {p.stem for p in (source/'tools').glob('ctflab*.py')}
+        included = {Path(name).stem for name in package.TOOLS}
+        missing = set()
+        for name in package.TOOLS:
+            for node in ast.walk(ast.parse((source/name).read_text())):
+                if isinstance(node, ast.ImportFrom) and node.module:
+                    modules = [node.module.split('.')[0]]
+                elif isinstance(node, ast.Import):
+                    modules = [alias.name.split('.')[0] for alias in node.names]
+                else:
+                    continue
+                missing.update(module for module in modules if module in known and module not in included)
+        self.assertEqual(missing, set())
+
+
 class PackageTests(unittest.TestCase):
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup)
