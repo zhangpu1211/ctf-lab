@@ -27,6 +27,8 @@
 
 ## 2. `.app` 结构
 
+下面保留 Task 6.2 的早期启动器结构示意，不作为当前 GUI bundle 的逐键定义。当前主入口是 `Contents/MacOS/CTFLabGUI`，CLI 在 `Contents/Resources/bin/ctflab-cli`（兼容名 `CTFLab`），另含受控显示客户端；以构建器与具体包 MANIFEST/Info.plist 为准。最新发布版本与用户目录见[当前状态](ctflab-current-status.md)。
+
 ```
 CTFLab.app/
 ├── Contents/
@@ -111,6 +113,13 @@ CTFLab.app/
   `SOURCE_OFFER.md` 内容确实包含所声明的版本/URL/哈希，防止文档过期。
 
 ## 7. 签名分级
+
+2026-10-08 显示窗口原生集成：含 SPICE 的构建增加受控 `CTFLabDisplay.app`（固定标识
+`local.ctflab.display`），把同一客户端置于 `Contents/MacOS/spicy`，依赖相对指向本包
+`runtime/lib`；不使用宿主动态库、不包含网络端点或凭据。先签名该子应用，再签名外层 App。
+MANIFEST 登记固定路径，SBOM 登记两份二进制，引用与最低版本检查覆盖子应用。
+运行器优先使用子应用入口，旧包仍可回退已有 `runtime/bin/spicy`。原生包使窗口与 Dock
+可以识别，但不能据此直接宣称桌面输入、全屏、动态分辨率已通过实机验收。
 
 | 级别 | 触发条件 | 记录方式 |
 |---|---|---|

@@ -22,7 +22,7 @@ import shutil
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 DISTRIBUTION_FORMAT = "ctflab-distribution"
 MANIFEST_NAME = "DISTRIBUTION.json"
@@ -33,6 +33,37 @@ COMPRESSION_NONE = "none"
 BASE_ROLE = "base"
 NVRAM_ROLE = "nvram"
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+
+# ---- 内容包（schema 2）：在分发目录格式上扩展 profile/doc 角色与包元数据 ----
+# 设计边界：目录式内容包不引入新的压缩归档格式；包必须自包含（base/nvram 引用的
+# profile 必须随包提供 YAML），导入后由状态目录管理，不依赖原包路径。
+PACK_SCHEMA = 2
+PROFILE_ROLE = "profile"
+DOC_ROLE = "doc"
+PACK_ROLES = (BASE_ROLE, NVRAM_ROLE, PROFILE_ROLE, DOC_ROLE)
+PACK_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
+VERSION_RE = re.compile(r"^\d+\.\d+\.\d+$")
+DOC_SUFFIXES = (".md", ".txt", ".pdf", ".png", ".jpg", ".jpeg")
+
+# ---- 场景内容包（schema 3）：一个场景清单 + 可选随包基盘/固件/说明 ----
+# 设计边界：schema 2 面向单机 profile（base/nvram 必须绑定随包 profile）；
+# 场景资产由 scenario prepare 消费而非单机 run，因此独立成 schema。随包基盘
+# 必须与场景清单声明的 SHA-256 完全一致（包不能运输与清单矛盾的资产）；
+# 不随包的基盘由接收方按清单哈希自备（分发等级按许可另行决定）。
+SCENARIO_PACK_SCHEMA = 3
+SCENARIO_MANIFEST_ROLE = "scenario-manifest"
+SCENARIO_BASE_ROLE = "scenario-base"
+SCENARIO_FIRMWARE_ROLE = "scenario-firmware-vars"
+SCENARIO_PACK_ROLES = (SCENARIO_MANIFEST_ROLE, SCENARIO_BASE_ROLE,
+                       SCENARIO_FIRMWARE_ROLE, DOC_ROLE)
+# 内容包 profile 允许的顶层键：运行器读取的白名单字段 + 纯声明的附属块。
+PACK_PROFILE_TOP_KEYS = frozenset({
+    "schema", "id", "name", "version", "guest", "disk", "network",
+    "readiness", "shutdown", "verification", "description",
+})
+PACK_PROFILE_GUEST_KEYS = frozenset({"architecture", "firmware", "machine", "memory_mb", "cpus"})
+PACK_PROFILE_DISK_KEYS = frozenset({"format", "bus", "controller"})
+PACK_PROFILE_NETWORK_KEYS = frozenset({"adapter", "mac", "lab_ip", "segment", "internet", "host_forwards"})
 
 
 class DistError(Exception):
@@ -280,10 +311,21 @@ def prepare_nvram_entry(out_dir: Path, *, profile_id: str, source: Path,
     return entry
 
 
-def verify_distribution(out_dir: Path) -> dict[str, Any]:
-    """复核分发目录：清单内每个文件存在、大小与 SHA-256 与清单一致。"""
+def verify_distribution(out_dir: Path, *, profile_status: "Callable[[str], dict[str, Any]] | None" = None,
+                        runner_version: str | None = None) -> dict[str, Any]:
+    """复核分发目录：清单内每个文件存在、大小与 SHA-256 与清单一致。
+
+    schema 2 内容包额外做结构校验（角色白名单、自包含、路径/符号链接安全），
+    并在报告中附 `pack` 摘要；schema 1 分发目录行为保持不变。
+    """
     out_dir = Path(out_dir)
     manifest = load_manifest(out_dir)
+    schema = int(manifest.get("schema", 1))
+    parsed_pack: dict[str, Any] | None = None
+    if schema == PACK_SCHEMA:
+        parsed_pack = parse_pack(manifest, runner_version=runner_version)
+    elif schema == SCENARIO_PACK_SCHEMA:
+        parsed_pack = parse_scenario_pack(out_dir, manifest, runner_version=runner_version)
     problems: list[str] = []
     checked: list[dict[str, Any]] = []
     for entry in manifest["entries"]:
@@ -298,7 +340,17 @@ def verify_distribution(out_dir: Path) -> dict[str, Any]:
             "expected_size": entry.get("size"),
             "expected_sha256": entry["sha256"],
         }
-        path = out_dir / name
+        path: Path
+        if parsed_pack is not None:
+            try:
+                path = resolve_pack_file(out_dir, name)
+            except DistError as exc:
+                problems.append(f"{name}: {exc}")
+                row.update({"status": "invalid-path", "problem": str(exc)})
+                checked.append(row)
+                continue
+        else:
+            path = out_dir / name
         if not path.is_file():
             problems.append(f"清单登记但文件缺失：{name}")
             row.update({"status": "missing", "problem": "文件缺失"})
@@ -326,7 +378,7 @@ def verify_distribution(out_dir: Path) -> dict[str, Any]:
             row.update({"status": "size-mismatch", "problem": size_problem})
         checked.append(row)
     ok_count = sum(1 for row in checked if row.get("status") == "ok")
-    return {
+    report = {
         "ok": not problems,
         "entries": checked,
         "problems": problems,
@@ -334,3 +386,677 @@ def verify_distribution(out_dir: Path) -> dict[str, Any]:
         "dir": str(out_dir),
         "summary": {"total": len(checked), "ok": ok_count, "failed": len(problems)},
     }
+    if parsed_pack is not None:
+        report["pack"] = pack_summary(out_dir, manifest, parsed_pack,
+                                      profile_status=profile_status,
+                                      runner_version=runner_version)
+    return report
+
+
+# ---------------------------------------------------------------------------
+# 内容包（schema 2）解析与制作
+# ---------------------------------------------------------------------------
+
+
+def _pack_error(message: str) -> DistError:
+    return DistError(message)
+
+
+def _pack_common_meta(manifest: dict[str, Any], *, runner_version: str | None = None) -> dict[str, Any]:
+    """校验 schema 2/3 共用的 pack 元数据；返回 {id,name,version,requires_runner,notes}。"""
+    pack = manifest.get("pack")
+    if not isinstance(pack, dict):
+        raise _pack_error("内容包清单缺少 pack 元数据对象")
+    pack_id = str(pack.get("id", ""))
+    if not PACK_ID_RE.match(pack_id):
+        raise _pack_error(f"内容包 id 不合法（小写字母/数字/短横线）：{pack_id!r}")
+    version = str(pack.get("version", ""))
+    if not VERSION_RE.match(version):
+        raise _pack_error(f"内容包版本必须形如 X.Y.Z：{version!r}")
+    requires = str(pack.get("requires_runner", ""))
+    if not _RUNNER_CONSTRAINT_RE.match(requires):
+        raise _pack_error(f"requires_runner 必须是 '>=X.Y.Z'、'>X.Y.Z' 或 '==X.Y.Z'：{requires!r}")
+    if runner_version is not None and not _runner_satisfied(runner_version, requires):
+        raise _pack_error(f"内容包要求运行器 {requires}，当前 {runner_version} 不满足")
+    notes = pack.get("notes", [])
+    if not isinstance(notes, list) or any(not isinstance(item, str) for item in notes):
+        raise _pack_error("pack.notes 必须是字符串数组")
+    return {"id": pack_id, "name": str(pack.get("name") or pack_id), "version": version,
+            "requires_runner": requires, "notes": [str(item) for item in notes]}
+
+
+def _validated_entry_name(entry: dict[str, Any], seen_files: set[str]) -> str:
+    """登记条目共用的文件名/哈希/大小校验；返回文件名。"""
+    if not isinstance(entry, dict):
+        raise _pack_error("entries 含非对象条目")
+    name = str(entry.get("file", ""))
+    if not name or Path(name).name != name or name in {".", ".."}:
+        raise _pack_error(f"清单条目文件名不能包含路径：{name!r}")
+    if name in seen_files:
+        raise _pack_error(f"清单重复登记同一文件：{name}")
+    seen_files.add(name)
+    if not _SHA256_RE.match(str(entry.get("sha256", ""))):
+        raise _pack_error(f"清单条目哈希不合法：{name}")
+    size = entry.get("size")
+    if not isinstance(size, int) or isinstance(size, bool) or size <= 0:
+        raise _pack_error(f"清单条目大小必须是正整数：{name}")
+    return name
+
+
+def parse_scenario_pack(out_dir: Path, manifest: dict[str, Any], *,
+                        runner_version: str | None = None) -> dict[str, Any]:
+    """解析并校验 schema 3 场景内容包；不符合直接抛 DistError。
+
+    交叉校验在读取场景清单全文（严格 schema 校验）后进行：随包基盘必须
+    与清单声明的 SHA-256 完全一致；固件 vars 只能挂在清单中的 UEFI 节点；
+    文件本体大小/哈希由 verify_distribution 逐个实测。
+    """
+    meta = _pack_common_meta(manifest, runner_version=runner_version)
+    scenario_block = manifest.get("pack", {}).get("scenario")
+    if not isinstance(scenario_block, dict) or set(scenario_block) != {"id", "manifest"}:
+        raise _pack_error("pack.scenario 必须是只含 id/manifest 的对象")
+    scenario_id = str(scenario_block["id"])
+    if not PACK_ID_RE.match(scenario_id):
+        raise _pack_error(f"场景 id 不合法（小写字母/数字/短横线）：{scenario_id!r}")
+    manifest_name = str(scenario_block["manifest"])
+    if not manifest_name or Path(manifest_name).name != manifest_name or manifest_name in {".", ".."}:
+        raise _pack_error(f"场景清单登记文件名不能包含路径：{manifest_name!r}")
+
+    entries = manifest.get("entries")
+    if not isinstance(entries, list) or not entries:
+        raise _pack_error("内容包清单 entries 不能为空")
+    manifest_entry: dict[str, Any] | None = None
+    bases: dict[str, dict[str, Any]] = {}
+    firmware_vars: dict[str, dict[str, Any]] = {}
+    docs: list[dict[str, Any]] = []
+    seen_files: set[str] = set()
+    for entry in entries:
+        role = str(entry.get("role", ""))
+        if role not in SCENARIO_PACK_ROLES:
+            raise _pack_error(f"内容包不支持的角色：{role!r}（允许：{', '.join(SCENARIO_PACK_ROLES)}）")
+        name = _validated_entry_name(entry, seen_files)
+        if role == SCENARIO_MANIFEST_ROLE:
+            if manifest_entry is not None:
+                raise _pack_error("场景内容包只能有一个 scenario-manifest 条目")
+            if name != manifest_name:
+                raise _pack_error(f"场景清单条目文件名与 pack.scenario.manifest 不一致：{name!r}")
+            manifest_entry = entry
+        elif role == SCENARIO_BASE_ROLE:
+            asset = str(entry.get("asset", ""))
+            if not asset:
+                raise _pack_error(f"scenario-base 条目缺少 asset 绑定：{name}")
+            if asset in bases:
+                raise _pack_error(f"清单重复登记场景资产：{asset}")
+            bases[asset] = entry
+        elif role == SCENARIO_FIRMWARE_ROLE:
+            node = str(entry.get("node", ""))
+            if not node:
+                raise _pack_error(f"scenario-firmware-vars 条目缺少 node 绑定：{name}")
+            if node in firmware_vars:
+                raise _pack_error(f"清单重复登记节点固件：{node}")
+            firmware_vars[node] = entry
+        else:
+            if not name.lower().endswith(DOC_SUFFIXES):
+                raise _pack_error(f"说明文件只允许 {'、'.join(DOC_SUFFIXES)}：{name}")
+            docs.append(entry)
+    if manifest_entry is None:
+        raise _pack_error("场景内容包缺少 scenario-manifest 条目")
+
+    from ctflab_scenario import REQUIRED_CAPABILITIES, parse_manifest  # noqa: PLC0415
+    manifest_path = resolve_pack_file(out_dir, manifest_name)
+    if not manifest_path.is_file():
+        raise _pack_error(f"场景清单文件缺失：{manifest_name}")
+    try:
+        scenario_manifest = parse_manifest(manifest_path.read_text(encoding="utf-8"),
+                                           available_capabilities=REQUIRED_CAPABILITIES)
+    except (OSError, ValueError) as exc:
+        raise _pack_error(f"场景清单无法读取或校验失败：{exc}") from exc
+    if scenario_manifest["scenario_id"] != scenario_id:
+        raise _pack_error(
+            f"场景清单 scenario_id 与 pack.scenario.id 不一致：{scenario_manifest['scenario_id']!r}")
+    for asset, entry in bases.items():
+        if asset not in scenario_manifest["assets"]:
+            raise _pack_error(f"随包基盘引用了清单外资产：{asset}")
+        if str(entry["sha256"]) != str(scenario_manifest["assets"][asset]["sha256"]):
+            raise _pack_error(f"随包基盘与场景清单声明的 SHA-256 不一致：{asset}")
+    for node in firmware_vars:
+        node_spec = scenario_manifest["nodes"].get(node)
+        if not isinstance(node_spec, dict) or node_spec.get("firmware") != "uefi":
+            raise _pack_error(f"固件 vars 只能绑定清单中的 UEFI 节点：{node}")
+
+    claims = manifest.get("claims", {})
+    if not isinstance(claims, dict):
+        raise _pack_error("claims 必须是对象（场景 id -> 声明）")
+    for key in claims:
+        if key != scenario_id:
+            raise _pack_error(f"claims 引用了包外场景：{key}")
+        if not isinstance(claims[key], dict):
+            raise _pack_error(f"claims.{key} 必须是对象")
+    return {**meta, "schema": SCENARIO_PACK_SCHEMA,
+            "scenario": {"id": scenario_id, "manifest_file": manifest_name,
+                         "manifest": scenario_manifest, "bases": bases,
+                         "firmware_vars": firmware_vars},
+            "docs": docs, "claims": claims}
+
+
+def parse_pack(manifest: dict[str, Any], *, runner_version: str | None = None) -> dict[str, Any]:
+    """解析并校验 schema 2 内容包结构；不符合直接抛 DistError。
+
+    校验内容：包元数据（id/版本/最低运行器约束）、角色白名单、每条登记的
+    文件名与哈希格式、base/nvram 的自包含（必须随包带 profile）、声明块归属。
+    这里只看清单数据；文件本体的大小/哈希由 verify_distribution 逐个实测。
+    """
+    meta = _pack_common_meta(manifest, runner_version=runner_version)
+
+    entries = manifest.get("entries")
+    if not isinstance(entries, list) or not entries:
+        raise _pack_error("内容包清单 entries 不能为空")
+
+    profiles: dict[str, dict[str, Any]] = {}
+    docs: list[dict[str, Any]] = []
+    seen_roles: set[tuple[str, str]] = set()
+    seen_files: set[str] = set()
+    for entry in entries:
+        role = str(entry.get("role", ""))
+        if role not in PACK_ROLES:
+            raise _pack_error(f"内容包不支持的角色：{role!r}（允许：{', '.join(PACK_ROLES)}）")
+        name = _validated_entry_name(entry, seen_files)
+        if role in (BASE_ROLE, NVRAM_ROLE, PROFILE_ROLE):
+            profile_id = str(entry.get("profile", ""))
+            if not PACK_ID_RE.match(profile_id):
+                raise _pack_error(f"条目 {name} 的 profile id 不合法：{profile_id!r}")
+            key = (profile_id, role)
+            if key in seen_roles:
+                raise _pack_error(f"清单重复登记 {profile_id} 的 {role} 条目")
+            seen_roles.add(key)
+            slot = profiles.setdefault(profile_id, {"profile": profile_id,
+                                                    BASE_ROLE: None, NVRAM_ROLE: None,
+                                                    PROFILE_ROLE: None})
+            slot[role] = entry
+            if role == PROFILE_ROLE and name != f"{profile_id}.yaml":
+                raise _pack_error(f"profile 登记文件名必须是 <id>.yaml：{name}")
+        else:
+            if not name.lower().endswith(DOC_SUFFIXES):
+                raise _pack_error(f"说明文件只允许 {'、'.join(DOC_SUFFIXES)}：{name}")
+            docs.append(entry)
+
+    for profile_id, slot in profiles.items():
+        if slot[PROFILE_ROLE] is None:
+            raise _pack_error(
+                f"内容包必须自包含：{profile_id} 有 base/nvram 登记但没有随包 profile 条目")
+
+    claims = manifest.get("claims", {})
+    if not isinstance(claims, dict):
+        raise _pack_error("claims 必须是对象（profile id -> 声明）")
+    for profile_id, claim in claims.items():
+        if profile_id not in profiles:
+            raise _pack_error(f"claims 引用了包外 profile：{profile_id}")
+        if not isinstance(claim, dict):
+            raise _pack_error(f"claims.{profile_id} 必须是对象")
+
+    return {
+        "id": meta["id"],
+        "name": meta["name"],
+        "version": meta["version"],
+        "requires_runner": meta["requires_runner"],
+        "notes": meta["notes"],
+        "profiles": profiles,
+        "docs": docs,
+        "claims": claims,
+    }
+
+
+def resolve_pack_file(out_dir: Path, name: str) -> Path:
+    """把清单登记名解析为包目录内的普通文件；拒绝穿越、绝对路径与符号链接。"""
+    if not isinstance(name, str) or not name or name in {".", ".."}:
+        raise _pack_error(f"清单条目文件名不合法：{name!r}")
+    if "\x00" in name or "\\" in name or Path(name).name != name:
+        raise _pack_error(f"清单条目文件名不能包含路径分隔符：{name!r}")
+    root = Path(out_dir).resolve()
+    candidate = root / name
+    if candidate.is_symlink():
+        raise _pack_error(f"包内文件不允许是符号链接：{name}")
+    resolved = candidate.resolve()
+    if resolved != root and root not in resolved.parents:
+        raise _pack_error(f"清单条目解析后越出包目录：{name}")
+    return candidate
+
+
+def _version_tuple(text: str) -> tuple[int, int, int]:
+    match = VERSION_RE.match(str(text))
+    _expect(match is not None, f"版本号必须形如 X.Y.Z：{text!r}")
+    return tuple(int(part) for part in str(text).split("."))  # type: ignore[return-value]
+
+
+def _runner_constraint_parts(constraint: str) -> tuple[str, tuple[int, int, int]]:
+    """把 '>=X.Y.Z' / '>X.Y.Z' / '==X.Y.Z' 拆成运算符与版本三元组（容忍空格）。"""
+    match = _RUNNER_CONSTRAINT_RE.match(str(constraint))
+    _expect(match is not None, f"不支持的运行器版本约束：{constraint!r}")
+    return match.group(1), _version_tuple(match.group(2))
+
+
+def _runner_satisfied(current: str, constraint: str) -> bool:
+    operator, target = _runner_constraint_parts(constraint)
+    value = _version_tuple(current)
+    if operator == ">=":
+        return value >= target
+    if operator == ">":
+        return value > target
+    return value == target
+
+
+_RUNNER_CONSTRAINT_RE = re.compile(r"^(>=|>|==)\s*(\d+\.\d+\.\d+)$")
+
+
+def _scenario_pack_summary(parsed: dict[str, Any], *, runner_version: str | None = None) -> dict[str, Any]:
+    """场景内容包摘要：资产是否随包、固件 vars 与清单文件；nodes 保持空列表以兼容摘要形状。"""
+    scenario = parsed["scenario"]
+    manifest = scenario["manifest"]
+    assets: list[dict[str, Any]] = []
+    for asset_id in sorted(manifest["assets"]):
+        entry = scenario["bases"].get(asset_id)
+        assets.append({"asset": asset_id, "shipped": entry is not None,
+                       "sha256": str(manifest["assets"][asset_id]["sha256"]),
+                       "size": int(entry["size"]) if entry else None})
+    firmware_vars = [{"node": node, "file": str(scenario["firmware_vars"][node]["file"])}
+                     for node in sorted(scenario["firmware_vars"])]
+    runner_satisfied: bool | None = None
+    if runner_version is not None:
+        runner_satisfied = _runner_satisfied(runner_version, parsed["requires_runner"])
+    return {
+        "id": parsed["id"],
+        "name": parsed["name"],
+        "version": parsed["version"],
+        "requires_runner": parsed["requires_runner"],
+        "runner": runner_version,
+        "runner_satisfied": runner_satisfied,
+        "notes": parsed["notes"],
+        "nodes": [],
+        "scenario": {"id": scenario["id"], "manifest": scenario["manifest_file"],
+                     "assets": assets, "firmware_vars": firmware_vars},
+        "docs": [str(entry.get("file")) for entry in parsed["docs"]],
+        "claims": sorted(str(key) for key in parsed["claims"]),
+        "claims_note": "包内验收声明由制作者提供，仅供参考；导入后本机验收状态不变，仍需实际验收。",
+    }
+
+
+def pack_summary(out_dir: Path, manifest: dict[str, Any], parsed: dict[str, Any], *,
+                 profile_status: "Callable[[str], dict[str, Any]] | None" = None,
+                 runner_version: str | None = None) -> dict[str, Any]:
+    """生成给人/GUI 看的包摘要：节点资源、说明文件、声明与配置冲突预览。"""
+    if "scenario" in parsed:
+        return _scenario_pack_summary(parsed, runner_version=runner_version)
+    del manifest
+    nodes: list[dict[str, Any]] = []
+    for profile_id in sorted(parsed["profiles"]):
+        slot = parsed["profiles"][profile_id]
+        node: dict[str, Any] = {
+            "profile": profile_id,
+            "has_base": slot[BASE_ROLE] is not None,
+            "has_nvram": slot[NVRAM_ROLE] is not None,
+        }
+        yaml_path = out_dir / slot[PROFILE_ROLE]["file"]
+        data: dict[str, Any] | None = None
+        try:
+            import yaml  # noqa: PLC0415
+            data = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                data = None
+        except Exception:  # noqa: BLE001  摘要尽力展示；权威校验在导入时进行
+            data = None
+        if data:
+            guest = data.get("guest") or {}
+            node.update({
+                "name": data.get("name"),
+                "architecture": guest.get("architecture"),
+                "firmware": guest.get("firmware"),
+                "memory_mb": guest.get("memory_mb"),
+                "cpus": guest.get("cpus"),
+            })
+        if profile_status is not None:
+            node["local"] = profile_status(profile_id)
+        nodes.append(node)
+    runner_satisfied: bool | None = None
+    if runner_version is not None:
+        runner_satisfied = _runner_satisfied(runner_version, parsed["requires_runner"])
+    return {
+        "id": parsed["id"],
+        "name": parsed["name"],
+        "version": parsed["version"],
+        "requires_runner": parsed["requires_runner"],
+        "runner": runner_version,
+        "runner_satisfied": runner_satisfied,
+        "notes": parsed["notes"],
+        "nodes": nodes,
+        "docs": [str(entry.get("file")) for entry in parsed["docs"]],
+        "claims": sorted(str(key) for key in parsed["claims"]),
+        "claims_note": "包内验收声明由制作者提供，仅供参考；导入后本机验收状态不变，仍需实际验收。",
+    }
+
+
+def _write_pack_readme(out_dir: Path, manifest: dict[str, Any]) -> None:
+    pack = manifest["pack"]
+    entries = manifest["entries"]
+    lines = [
+        f"# CTFLab 内容包：{pack.get('name')}（{pack.get('id')} v{pack.get('version')}）",
+        "",
+        f"由 `ctflab dist make-pack` 生成；清单时间：{manifest.get('generated_at')}。",
+        f"最低运行器要求：`{pack.get('requires_runner')}`。",
+        "",
+        "## 包内文件",
+        "",
+        "| 文件 | 角色 | 大小 | SHA-256 |",
+        "|---|---|---|---|",
+    ]
+    role_names = {BASE_ROLE: "基盘镜像", NVRAM_ROLE: "UEFI NVRAM 模板",
+                  PROFILE_ROLE: "节点配置", DOC_ROLE: "使用说明"}
+    for entry in entries:
+        lines.append(f"| `{entry['file']}` | {role_names.get(entry.get('role'), entry.get('role'))} | "
+                     f"{human_size(int(entry.get('size', 0)))} | `{entry['sha256']}` |")
+    lines += [
+        "",
+        "## 接收者步骤",
+        "",
+        "1. 校验哈希：`shasum -a 256 -c SHA256SUMS`（与文件同目录执行）；",
+        "2. 导入（先整体校验，再安装配置并导入基盘，不自动启动）：",
+        "",
+        "   ```bash",
+        "   ctflab dist install --dir <本目录>",
+        "   ```",
+        "",
+        f"3. 启动：`ctflab run <profile>`（GUI 中选中本文件夹后同样会先校验再导入）。",
+        "",
+        "## 注意",
+        "",
+        "- `claims`/配置中的 `verification` 段是制作者的验收声明，仅供参考；",
+        "  导入不会把任何节点标记为本机已验证，实际验收以本机 probe/matrix 证据为准。",
+        "- 导入后的配置与基盘由状态目录管理；本目录移走或删除后已导入节点仍可启动。",
+        "",
+    ]
+    (Path(out_dir) / README_NAME).write_text("\n".join(lines), encoding="utf-8")
+
+
+def make_pack(out_dir: Path, *, pack_id: str, profile_yaml: Path, base_image: Path,
+              name: str | None = None, version: str = "1.0.0",
+              requires_runner: str | None = None, nvram: Path | None = None,
+              docs: "list[Path] | tuple[Path, ...]" = (),
+              profile_data: dict[str, Any] | None = None) -> dict[str, Any]:
+    """制作 schema 2 内容包目录（复制文件 + 写清单/校验/说明）。
+
+    只复制、不改写来源；目标目录必须不存在或为空（拒绝覆盖已有内容）。
+    `profile_data` 由调用方在完整校验（白名单+内容包约束）后传入，避免这里
+    重复实现运行器校验；未传时按原始 YAML 复制但仍要求 id/文件名一致。
+    """
+    out_dir = Path(out_dir)
+    if not PACK_ID_RE.match(str(pack_id)):
+        raise _pack_error(f"内容包 id 不合法（小写字母/数字/短横线）：{pack_id!r}")
+    if not VERSION_RE.match(str(version)):
+        raise _pack_error(f"内容包版本必须形如 X.Y.Z：{version!r}")
+    if requires_runner is None:
+        import ctflab  # noqa: PLC0415  函数内导入，取当前运行器版本作为默认约束
+        requires_runner = f">={ctflab.CTFLAB_VERSION}"
+    if not _RUNNER_CONSTRAINT_RE.match(str(requires_runner)):
+        raise _pack_error(f"requires_runner 必须是 '>=X.Y.Z'、'>X.Y.Z' 或 '==X.Y.Z'：{requires_runner!r}")
+
+    profile_yaml = Path(profile_yaml)
+    base_image = Path(base_image)
+    _expect(profile_yaml.is_file() and not profile_yaml.is_symlink(),
+            f"profile YAML 不存在或是符号链接：{profile_yaml}")
+    _expect(base_image.is_file() and not base_image.is_symlink(),
+            f"基盘镜像不存在或是符号链接：{base_image}")
+    if profile_data is None:
+        import yaml  # noqa: PLC0415
+        profile_data = yaml.safe_load(profile_yaml.read_text(encoding="utf-8"))
+    _expect(isinstance(profile_data, dict), f"profile 不是有效的 YAML 映射：{profile_yaml}")
+    profile_id = str(profile_data.get("id", ""))
+    if profile_id != Path(profile_yaml.name).stem:
+        raise _pack_error(f"profile id 与文件名不一致：{profile_yaml.name}（id={profile_id!r}）")
+    if profile_id == pack_id:
+        raise _pack_error("内容包 id 与节点 profile id 相同；包 id 描述整个包，请换一个名字")
+
+    if out_dir.exists():
+        _expect(out_dir.is_dir() and not out_dir.is_symlink(), f"目标不是普通目录：{out_dir}")
+        _expect(not any(out_dir.iterdir()), f"目标目录非空，拒绝覆盖：{out_dir}")
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    def _copy_into(source: Path, file_name: str) -> dict[str, Any]:
+        target = out_dir / file_name
+        temporary = out_dir / f".{file_name}.partial-{os.getpid()}"
+        try:
+            shutil.copy2(source, temporary)
+            os.replace(temporary, target)
+        finally:
+            temporary.unlink(missing_ok=True)
+        return {
+            "file": file_name,
+            "size": target.stat().st_size,
+            "sha256": sha256_file(target),
+        }
+
+    entries: list[dict[str, Any]] = []
+    profile_entry = _copy_into(profile_yaml, f"{profile_id}.yaml")
+    entries.append({"role": PROFILE_ROLE, "profile": profile_id, **profile_entry,
+                    "compression": COMPRESSION_NONE})
+    base_suffix = base_image.suffix.lower() or ".qcow2"
+    base_entry = _copy_into(base_image, f"{profile_id}-base{base_suffix}")
+    entries.append({"role": BASE_ROLE, "profile": profile_id, **base_entry,
+                    "compression": COMPRESSION_NONE, "content_verified": "copied-as-is"})
+    if nvram is not None:
+        nvram_path = Path(nvram)
+        _expect(nvram_path.is_file() and not nvram_path.is_symlink(),
+                f"NVRAM 模板不存在或是符号链接：{nvram_path}")
+        entries.append({"role": NVRAM_ROLE, "profile": profile_id,
+                        **_copy_into(nvram_path, f"{profile_id}-uefi-vars.fd"),
+                        "compression": COMPRESSION_NONE})
+    used_names = {entry["file"] for entry in entries}
+    doc_files: list[str] = []
+    for doc in docs:
+        doc_path = Path(doc)
+        doc_name = doc_path.name
+        _expect(doc_path.is_file() and not doc_path.is_symlink(), f"说明文件不存在或是符号链接：{doc_path}")
+        _expect(doc_name.lower().endswith(DOC_SUFFIXES),
+                f"说明文件只允许 {'、'.join(DOC_SUFFIXES)}：{doc_name}")
+        _expect(doc_name not in used_names, f"说明文件名与包内文件冲突：{doc_name}")
+        _expect(doc_name not in {MANIFEST_NAME, SUMS_NAME, README_NAME},
+                f"说明文件名保留：{doc_name}")
+        used_names.add(doc_name)
+        doc_files.append(doc_name)
+        entries.append({"role": DOC_ROLE, "file": doc_name, **{
+            key: value for key, value in _copy_into(doc_path, doc_name).items()}})
+
+    claims: dict[str, Any] = {}
+    verification = profile_data.get("verification")
+    if isinstance(verification, dict):
+        claims[profile_id] = verification
+    generated_at = now_iso()
+    manifest = {
+        "schema": PACK_SCHEMA,
+        "format": DISTRIBUTION_FORMAT,
+        "generated_at": generated_at,
+        "pack": {
+            "id": pack_id,
+            "name": str(name or pack_id),
+            "version": version,
+            "requires_runner": requires_runner,
+            "notes": ["由 ctflab dist make-pack 生成；包内验收声明仅为制作者声明，不代表接收方本机验收。"],
+        },
+        "entries": entries,
+        **({"claims": claims} if claims else {}),
+    }
+    (out_dir / MANIFEST_NAME).write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    _write_sums(out_dir, entries)
+    _write_pack_readme(out_dir, manifest)
+    parse_pack(manifest)  # 制作者侧也走同一解析器，防止生成即非法的清单
+    return {"dir": str(out_dir), "manifest": manifest, "entries": entries}
+
+
+def make_scenario_pack(out_dir: Path, *, pack_id: str, scenario_manifest: Path,
+                       bases: "dict[str, Path] | None" = None,
+                       firmware_vars: "dict[str, Path] | None" = None,
+                       docs: "list[Path] | tuple[Path, ...]" = (),
+                       name: str | None = None, version: str = "1.0.0",
+                       requires_runner: str | None = None) -> dict[str, Any]:
+    """制作 schema 3 场景内容包（复制文件 + 写清单/校验/说明）。
+
+    场景清单必带；基盘/固件 vars/说明按需随包。随包基盘复制后逐个断言与
+    场景清单声明的 SHA-256 一致（引用式分发由接收方按清单哈希自备）。
+    只复制、不改写来源；目标目录必须不存在或为空。
+    """
+    out_dir = Path(out_dir)
+    if not PACK_ID_RE.match(str(pack_id)):
+        raise _pack_error(f"内容包 id 不合法（小写字母/数字/短横线）：{pack_id!r}")
+    if not VERSION_RE.match(str(version)):
+        raise _pack_error(f"内容包版本必须形如 X.Y.Z：{version!r}")
+    if requires_runner is None:
+        import ctflab  # noqa: PLC0415  函数内导入，取当前运行器版本作为默认约束
+        requires_runner = f">={ctflab.CTFLAB_VERSION}"
+    if not _RUNNER_CONSTRAINT_RE.match(str(requires_runner)):
+        raise _pack_error(f"requires_runner 必须是 '>=X.Y.Z'、'>X.Y.Z' 或 '==X.Y.Z'：{requires_runner!r}")
+
+    scenario_manifest = Path(scenario_manifest)
+    _expect(scenario_manifest.is_file() and not scenario_manifest.is_symlink(),
+            f"场景清单不存在或是符号链接：{scenario_manifest}")
+    from ctflab_scenario import REQUIRED_CAPABILITIES, parse_manifest  # noqa: PLC0415
+    try:
+        scenario_data = parse_manifest(scenario_manifest.read_text(encoding="utf-8"),
+                                       available_capabilities=REQUIRED_CAPABILITIES)
+    except (OSError, ValueError) as exc:
+        raise _pack_error(f"场景清单无法读取或校验失败：{exc}") from exc
+    scenario_id = str(scenario_data["scenario_id"])
+    if pack_id == scenario_id:
+        raise _pack_error("内容包 id 与场景 id 相同；包 id 描述整个包，请换一个名字")
+
+    bases = dict(bases or {})
+    firmware_vars = dict(firmware_vars or {})
+    unknown = sorted(set(bases) - set(scenario_data["assets"]))
+    if unknown:
+        raise _pack_error(f"随包基盘引用了清单外资产：{', '.join(unknown)}")
+    uefi_nodes = {node for node, spec in scenario_data["nodes"].items()
+                  if spec.get("firmware") == "uefi"}
+    unknown_firmware = sorted(set(firmware_vars) - uefi_nodes)
+    if unknown_firmware:
+        raise _pack_error(f"固件 vars 只能绑定清单中的 UEFI 节点：{', '.join(unknown_firmware)}")
+
+    if out_dir.exists():
+        _expect(out_dir.is_dir() and not out_dir.is_symlink(), f"目标不是普通目录：{out_dir}")
+        _expect(not any(out_dir.iterdir()), f"目标目录非空，拒绝覆盖：{out_dir}")
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    def _copy_into(source: Path, file_name: str) -> dict[str, Any]:
+        target = out_dir / file_name
+        temporary = out_dir / f".{file_name}.partial-{os.getpid()}"
+        try:
+            shutil.copy2(source, temporary)
+            os.replace(temporary, target)
+        finally:
+            temporary.unlink(missing_ok=True)
+        return {
+            "file": file_name,
+            "size": target.stat().st_size,
+            "sha256": sha256_file(target),
+        }
+
+    manifest_name = f"{scenario_id}.json"
+    entries: list[dict[str, Any]] = [
+        {"role": SCENARIO_MANIFEST_ROLE, **_copy_into(scenario_manifest, manifest_name),
+         "compression": COMPRESSION_NONE}]
+    for asset in sorted(bases):
+        suffix = Path(bases[asset]).suffix.lower() or ".qcow2"
+        entry = _copy_into(Path(bases[asset]), f"{asset}-base{suffix}")
+        if entry["sha256"] != scenario_data["assets"][asset]["sha256"]:
+            raise _pack_error(f"随包基盘与场景清单声明的 SHA-256 不一致：{asset}")
+        entries.append({"role": SCENARIO_BASE_ROLE, "asset": asset, **entry,
+                        "compression": COMPRESSION_NONE, "content_verified": "manifest-sha256"})
+    for node in sorted(firmware_vars):
+        entries.append({"role": SCENARIO_FIRMWARE_ROLE, "node": node,
+                        **_copy_into(Path(firmware_vars[node]), f"{node}-uefi-vars.fd"),
+                        "compression": COMPRESSION_NONE})
+    used_names = {entry["file"] for entry in entries}
+    for doc in docs:
+        doc_path = Path(doc)
+        doc_name = doc_path.name
+        _expect(doc_path.is_file() and not doc_path.is_symlink(), f"说明文件不存在或是符号链接：{doc_path}")
+        _expect(doc_name.lower().endswith(DOC_SUFFIXES),
+                f"说明文件只允许 {'、'.join(DOC_SUFFIXES)}：{doc_name}")
+        _expect(doc_name not in used_names, f"说明文件名与包内文件冲突：{doc_name}")
+        _expect(doc_name not in {MANIFEST_NAME, SUMS_NAME, README_NAME},
+                f"说明文件名保留：{doc_name}")
+        used_names.add(doc_name)
+        entries.append({"role": DOC_ROLE, **_copy_into(doc_path, doc_name)})
+
+    manifest = {
+        "schema": SCENARIO_PACK_SCHEMA,
+        "format": DISTRIBUTION_FORMAT,
+        "generated_at": now_iso(),
+        "pack": {
+            "id": pack_id,
+            "name": str(name or pack_id),
+            "version": version,
+            "requires_runner": requires_runner,
+            "notes": ["由 ctflab dist make-scenario-pack 生成；包内验收声明仅为制作者声明，不代表接收方本机验收。"],
+            "scenario": {"id": scenario_id, "manifest": manifest_name},
+        },
+        "entries": entries,
+    }
+    (out_dir / MANIFEST_NAME).write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    _write_sums(out_dir, entries)
+    _write_scenario_pack_readme(out_dir, manifest, scenario_data)
+    parse_scenario_pack(out_dir, manifest)  # 制作者侧同一解析器，防止生成即非法
+    return {"dir": str(out_dir), "manifest": manifest, "entries": entries,
+            "scenario_id": scenario_id}
+
+
+def _write_scenario_pack_readme(out_dir: Path, manifest: dict[str, Any],
+                                scenario_data: dict[str, Any]) -> None:
+    pack = manifest["pack"]
+    entries = manifest["entries"]
+    lines = [
+        f"# CTFLab 场景内容包：{pack.get('name')}（{pack.get('id')} v{pack.get('version')}）",
+        "",
+        f"场景：`{scenario_data['scenario_id']}`；由 `ctflab dist make-scenario-pack` 生成；"
+        f"清单时间：{manifest.get('generated_at')}。",
+        f"最低运行器要求：`{pack.get('requires_runner')}`。",
+        "",
+        "## 包内文件",
+        "",
+        "| 文件 | 角色 | 大小 | SHA-256 |",
+        "|---|---|---|---|",
+    ]
+    role_names = {SCENARIO_MANIFEST_ROLE: "场景清单", SCENARIO_BASE_ROLE: "场景基盘",
+                  SCENARIO_FIRMWARE_ROLE: "UEFI vars 模板", DOC_ROLE: "使用说明"}
+    for entry in entries:
+        binding = ""
+        if entry.get("role") == SCENARIO_BASE_ROLE:
+            binding = f"（资产 {entry.get('asset')}）"
+        elif entry.get("role") == SCENARIO_FIRMWARE_ROLE:
+            binding = f"（节点 {entry.get('node')}）"
+        lines.append(f"| `{entry['file']}` | {role_names.get(entry.get('role'), entry.get('role'))}{binding} | "
+                     f"{human_size(int(entry.get('size', 0)))} | `{entry['sha256']}` |")
+    shipped = {entry.get("asset") for entry in entries if entry.get("role") == SCENARIO_BASE_ROLE}
+    missing = [asset for asset in sorted(scenario_data["assets"]) if asset not in shipped]
+    lines += [
+        "",
+        "## 接收者步骤",
+        "",
+        "1. 校验哈希：`shasum -a 256 -c SHA256SUMS`（与文件同目录执行）；",
+        "2. 安装（先整体校验，复制到状态目录，不自动准备场景）：",
+        "",
+        "   ```bash",
+        "   ctflab dist install --dir <本目录>",
+        "   ```",
+        "",
+        "3. 按安装输出的命令执行 `scenario prepare`（需要本机 QEMU 的 UEFI code 固件）；",
+        "4. `scenario start` 启动双网与三节点；验收、停止、重置、释放见 `scenario --help`。",
+        "",
+        "## 注意",
+        "",
+        "- `claims` 是制作者的验收声明，仅供参考；本机验收以本机证据为准。",
+    ]
+    if missing:
+        lines.append(f"- 未随包资产：{', '.join(missing)}——按场景清单内 SHA-256 自备基盘后再执行 prepare"
+                     "（分发等级由许可决定）。")
+    lines.append("- 安装后的场景文件由状态目录管理；本目录移走或删除后已安装副本仍可用。")
+    lines.append("")
+    (Path(out_dir) / README_NAME).write_text("\n".join(lines), encoding="utf-8")

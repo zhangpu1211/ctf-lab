@@ -1,0 +1,21 @@
+[package]
+name = "ctflab-desktop"
+version = "0.1.4"
+description = "CTFLab 本地实验工作台"
+edition = "2021"
+rust-version = "1.90"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde_json = "1"
+
+[target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
+rfd = { version = "=0.15.4", default-features = false }
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1

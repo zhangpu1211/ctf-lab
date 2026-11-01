@@ -39,6 +39,10 @@ class PackageTestCase(unittest.TestCase):
     """构造一个最小但完整的源码根，避免依赖仓库当前的无关文件。"""
 
     def setUp(self) -> None:
+        # 固定归档测试版本，避免产品升级改变模拟归档的路径与断言。
+        version_patch = mock.patch.object(ctflab_package, "ctflab_version", return_value="0.1.0")
+        version_patch.start()
+        self.addCleanup(version_patch.stop)
         self.temp = tempfile.TemporaryDirectory()
         self.root = pathlib.Path(self.temp.name) / "src"
         self.out = pathlib.Path(self.temp.name) / "out"

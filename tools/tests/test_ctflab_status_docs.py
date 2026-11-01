@@ -208,7 +208,7 @@ class PlanDocumentTests(unittest.TestCase):
         self.assertIn("仅是经授权的文本剪贴板路径", line)
         self.assertIn("SPICE 显示与动态分辨率", line)
         self.assertIn("已完成当前 App 主路径", line)
-        self.assertIn("仍是单独的未验证边界", line)
+        self.assertIn("仍是单独的待验收边界", line)
 
 
 class VerificationRecordTests(unittest.TestCase):
@@ -528,6 +528,102 @@ class SpiceDisplayCliTests(unittest.TestCase):
             with self.assertRaisesRegex(ctflab.CTFLabError, "只能单独启动 kali-arm64"):
                 manager.run(["smoke"], display="spice")
 
+    def test_tcp_listen_mode_builds_loopback_secret_command(self) -> None:
+        """TCP 回退模式：只绑 127.0.0.1 受控端口，ticket 经 0600 文件注入。"""
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            manager = ctflab.LabManager(root)
+            profile = {"guest": {"architecture": "aarch64"}, "network": {}}
+            with mock.patch.object(manager, "ensure_uefi_vars",
+                                   return_value=(root / "code", root / "vars")), \
+                    mock.patch("ctflab.which_any", return_value="qemu"), \
+                    mock.patch.object(manager, "probe_spice",
+                                      return_value={"spice_display": True, "spicevmc": True,
+                                                    "virtserialport": True, "client": True,
+                                                    "supported": True, "errors": []}):
+                command, _ = manager.qemu_command(
+                    "kali-arm64", profile, root / "disk.qcow2", 23400, False,
+                    display="spice", spice_listen="tcp", spice_port=5930)
+                # ticket 明文不得出现在命令行参数中；文件本身在 0700 目录内为 0600
+                ticket_path = root / "runtime" / "kali-arm64" / "spice" / "ticket"
+                self.assertTrue(ticket_path.is_file())
+                self.assertEqual(oct(ticket_path.stat().st_mode & 0o777), "0o600")
+                ticket_text = ticket_path.read_text(encoding="utf-8").strip()
+                self.assertTrue(ticket_text)
+                self.assertNotIn(ticket_text, " ".join(command))
+                secret_arg = next(arg for arg in command if "file=" in arg and "ticket" in arg)
+                self.assertIn(str(ticket_path), secret_arg)
+        joined = " ".join(command)
+        self.assertIn("addr=127.0.0.1,port=5930", joined)
+        self.assertIn("disable-ticketing=off", joined)
+        self.assertIn("password-secret=ctflab_spice_ticket", joined)
+        self.assertIn("-object", joined)
+        self.assertIn("secret,id=ctflab_spice_ticket", joined)
+        self.assertNotIn("0.0.0.0", joined)
+
+    def test_unix_listen_stays_default_and_has_no_port(self) -> None:
+        """UNIX socket 模式保持默认：命令含 unix=on，不含 port= 与 ticket 设施。"""
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            manager = ctflab.LabManager(root)
+            profile = {"guest": {"architecture": "aarch64"}, "network": {}}
+            with mock.patch.object(manager, "ensure_uefi_vars",
+                                   return_value=(root / "code", root / "vars")), \
+                    mock.patch("ctflab.which_any", return_value="qemu"), \
+                    mock.patch.object(manager, "probe_spice",
+                                      return_value={"spice_display": True, "spicevmc": True,
+                                                    "virtserialport": True, "client": True,
+                                                    "supported": True, "errors": []}):
+                command, _ = manager.qemu_command(
+                    "kali-arm64", profile, root / "disk.qcow2", 23400, False,
+                    display="spice")
+        joined = " ".join(command)
+        self.assertIn("unix=on,addr=", joined)
+        self.assertNotIn("port=", joined)
+        self.assertNotIn("password-secret", joined)
+        self.assertNotIn("-object", joined)
+
+    def test_tcp_listen_requires_spice_display(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = ctflab.LabManager(pathlib.Path(directory))
+            with self.assertRaisesRegex(ctflab.CTFLabError, "只能与 --display spice"):
+                manager.run(["kali-arm64"], display="cocoa", spice_listen="tcp")
+
+    def test_tcp_listen_client_command_carries_password_file(self) -> None:
+        uri = "spice://127.0.0.1:5930"
+        ticket = pathlib.Path("/tmp/ctflab/spice/ticket")
+        plain = ctflab.spice_client_command("/tmp/spicy", uri)
+        authed = ctflab.spice_client_command("/tmp/spicy", uri,
+                                             password_file=ticket)
+        monitored = ctflab.spice_client_command("/tmp/ctflab-spicy-20260925", uri,
+                                                password_file=ticket, qemu_pid=4311)
+        self.assertEqual(plain[:2], ["/tmp/spicy", "--uri"])
+        self.assertIn("--password-file", authed)
+        self.assertIn(str(ticket), authed)
+        self.assertEqual(monitored[:2], ["/tmp/ctflab-spicy-20260925", "--uri"])
+        self.assertEqual(monitored[-2:], ["--qemu-pid", "4311"])
+        with self.assertRaisesRegex(ctflab.CTFLabError, "受控客户端"):
+            ctflab.spice_client_command("/usr/bin/remote-viewer", uri,
+                                        password_file=ticket)
+        source = (pathlib.Path(__file__).resolve().parents[2] / "tools" / "spice_client" / "ctflab_spicy.c").read_text(encoding="utf-8")
+        self.assertIn("password_file_argument", source)
+        self.assertIn('"password", ticket', source)
+
+    def test_clipboard_thread_shutdown_is_bounded_and_guarded(self) -> None:
+        """入口契约；实际线程、子进程取消与迟到事件由 C 运行测试覆盖。"""
+        source = (PROJECT_ROOT / "tools/spice_client/ctflab_spicy.c").read_text()
+        quit_start = source.index("static void request_client_quit")
+        quit_body = source[quit_start:source.index("gtk_main_quit();", quit_start)]
+        self.assertLess(quit_body.index("host_clipboard_stop_new_work();"),
+                        quit_body.index("spice_session_disconnect(session);"))
+        # 入口主体在 client_activate（GtkApplication 外壳）；顺序契约不变。
+        main_source = source[source.index("static void client_activate"):]
+        self.assertLess(main_source.index('g_object_set(session, "uri", uri'),
+                        main_source.index('g_object_set(session, "password", ticket, NULL);'))
+        self.assertIn("if (allow_clipboard) {\n        host_clipboard_start", main_source)
+        self.assertGreater(main_source.index("host_clipboard_shutdown();"),
+                           main_source.index("gtk_main();"))
+
     def test_spice_client_clipboard_requires_explicit_flag(self) -> None:
         endpoint = pathlib.Path("/tmp/ctflab/display.sock")
         disabled = ctflab.spice_client_command("/tmp/spicy", endpoint)
@@ -552,6 +648,47 @@ class SpiceDisplayCliTests(unittest.TestCase):
         self.assertIn("context->session", source)
         self.assertIn("qemu_watch.source_id", source)
         self.assertNotIn("GINT_TO_POINTER((gint)qemu_pid)", source)
+
+    def test_spice_client_window_memory_arguments(self) -> None:
+        endpoint = pathlib.Path("/tmp/ctflab/display.sock")
+        state = pathlib.Path("/tmp/ctflab/kali-arm64/spice/client-window.txt")
+        plain = ctflab.spice_client_command("/tmp/spicy", endpoint)
+        memorized = ctflab.spice_client_command("/tmp/spicy", endpoint, state_file=state)
+        sized = ctflab.spice_client_command("/tmp/spicy", endpoint, geometry="1280x800")
+        self.assertNotIn("--state-file", plain)
+        self.assertNotIn("--geometry", plain)
+        self.assertEqual(memorized[-2:], ["--state-file", str(state)])
+        self.assertEqual(sized[sized.index("--geometry") + 1], "1280x800")
+        for bad in ("100x100", "0x800", "1280", "99999x800", "1280x800;touch", "-10x800",
+                    "1280x299"):
+            with self.subTest(bad=bad):
+                with self.assertRaisesRegex(ctflab.CTFLabError, "窗口几何"):
+                    ctflab.spice_client_command("/tmp/spicy", endpoint, geometry=bad)
+        # 非受控客户端与 clipboard 参数同例：静默忽略窗口记忆参数。
+        other = ctflab.spice_client_command("/usr/bin/remote-viewer", endpoint,
+                                            geometry="1280x800", state_file=state)
+        self.assertEqual(other, ["/usr/bin/remote-viewer",
+                                 "spice+unix:///tmp/ctflab/display.sock"])
+        source = (PROJECT_ROOT / "tools/spice_client/ctflab_spicy.c").read_text()
+        self.assertIn("state_file_argument", source)
+        self.assertIn("window_state_save(state_file_path", source)
+        self.assertIn("input_release_pressed_keys(g_input_context)", source)
+        # runner 必须把节点级窗口记忆文件传给受控客户端（真实链路由 TCP E2E 验证）。
+        runner = (PROJECT_ROOT / "tools/ctflab.py").read_text()
+        self.assertIn("state_file=client_window_state", runner)
+        self.assertIn('"client-window.txt"', runner)
+        # 显示偏好（第 3/6 项）：两种模式都真实跟随分辨率，仅像素密度不同。
+        smooth = ctflab.spice_client_command("/tmp/spicy", endpoint,
+                                             display_quality="smooth")
+        self.assertEqual(smooth[smooth.index("--display-quality") + 1], "smooth")
+        with self.assertRaisesRegex(ctflab.CTFLabError, "显示质量"):
+            ctflab.spice_client_command("/tmp/spicy", endpoint, display_quality="4k")
+        self.assertNotIn("--display-quality",
+                         ctflab.spice_client_command("/usr/bin/remote-viewer",
+                                                     endpoint, display_quality="smooth"))
+        client_source = (PROJECT_ROOT / "tools/spice_client/ctflab_spicy.c").read_text()
+        self.assertIn("pixel_multiplier", client_source)
+        self.assertIn("display-quality=%s", client_source)
         self.assertIn("spice_main_channel_request_mouse_mode", source)
         self.assertIn('"notify::mouse-mode"', source)
         self.assertIn("absolute_mouse_ready", source)
@@ -863,6 +1000,244 @@ class Task63AKaliAcceptanceDocsTests(unittest.TestCase):
         self.assertIn("/opt/homebrew", flat)
         self.assertTrue("CTFLAB_RUNTIME_ROOT" in flat or "runtime" in flat)
         self.assertIn("runtime/bin/qemu-system-aarch64", flat)
+
+
+class BootStageReportTests(unittest.TestCase):
+    """启动四阶段与超时诊断：`status --json` 不再用统一“运行中”掩盖进度。"""
+
+    def _manager(self, directory: str) -> ctflab.LabManager:
+        return ctflab.LabManager(pathlib.Path(directory))
+
+    def _write_state(self, manager: ctflab.LabManager, overrides: dict) -> None:
+        state = {
+            "schema": 1,
+            "profile_id": "kali-arm64",
+            "pid": 4242,
+            "qmp_path": str(manager.runtime_dir / "kali-arm64" / "qmp.sock"),
+            "log_path": str(manager.logs_dir / "kali-arm64.log"),
+            "started_at": "2026-10-05T00:00:00+00:00",
+            "display_backend": "spice",
+            "spice_client_pid": 5151,
+            "spice_client_log_path": str(manager.logs_dir / "kali-arm64-spice-client.log"),
+        }
+        state.update(overrides)
+        ctflab.write_json(manager.runtime_state_path("kali-arm64"), state)
+
+    def _patch_alive(self, pids: set[int]):
+        return mock.patch.object(ctflab, "bool_pid_alive",
+                                 side_effect=lambda pid: pid in pids)
+
+    def test_stopped_profile_has_no_boot_section(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            report = ctflab._status_report(self._manager(directory))
+            kali = next(item for item in report["profiles"] if item["id"] == "kali-arm64")
+            self.assertFalse(kali["running"])
+            self.assertIsNone(kali["boot"])
+
+    def test_ready_node_reports_all_stages_and_network_phase(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = self._manager(directory)
+            client_log = manager.logs_dir / "kali-arm64-spice-client.log"
+            client_log.parent.mkdir(parents=True, exist_ok=True)
+            client_log.write_text("CTFLAB_SPICE_STATE display-ready=1\n", encoding="utf-8")
+            self._write_state(manager, {"started_at": ctflab.now_iso()})
+            health = [
+                {"name": "process", "ok": True, "detail": "PID 4242"},
+                {"name": "dhcp", "ok": True, "detail": "192.168.242.10"},
+                {"name": "ssh:22", "ok": True, "detail": "SSH-2.0-OpenSSH"},
+            ]
+            with self._patch_alive({4242, 5151}), \
+                    mock.patch.object(ctflab.LabManager, "health",
+                                      return_value=health) as fake_health:
+                report = ctflab._status_report(manager)
+            fake_health.assert_called()
+            boot = next(item for item in report["profiles"]
+                        if item["id"] == "kali-arm64")["boot"]
+            self.assertEqual(boot["phase"], "network")
+            self.assertEqual(boot["phase_label"], "网络就绪")
+            self.assertEqual(boot["overall"], "ready")
+            self.assertNotIn("diagnosis", boot)
+            stages = {stage["name"]: stage["ok"] for stage in boot["stages"]}
+            self.assertEqual(stages, {"process": True, "guest-boot": True,
+                                      "display": True, "network": True})
+
+    def test_booting_node_stops_at_process_phase_and_marks_display_pending(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = self._manager(directory)
+            client_log = manager.logs_dir / "kali-arm64-spice-client.log"
+            client_log.parent.mkdir(parents=True, exist_ok=True)
+            client_log.write_text("CTFLAB_SPICE_STATE agent=0 mouse-mode=0\n", encoding="utf-8")
+            self._write_state(manager, {"started_at": ctflab.now_iso()})
+            health = [
+                {"name": "process", "ok": True, "detail": "PID 4242"},
+                {"name": "dhcp", "ok": None, "detail": "启动中（5s/240s）：尚未获得固定实验地址"},
+                {"name": "ssh:22", "ok": None, "detail": "启动中（5s/240s）：timeout"},
+            ]
+            with self._patch_alive({4242, 5151}), \
+                    mock.patch.object(ctflab.LabManager, "health", return_value=health):
+                report = ctflab._status_report(manager)
+            boot = next(item for item in report["profiles"]
+                        if item["id"] == "kali-arm64")["boot"]
+            self.assertEqual(boot["phase"], "process")
+            self.assertEqual(boot["overall"], "booting")
+            stages = {stage["name"]: stage["ok"] for stage in boot["stages"]}
+            self.assertFalse(stages["display"])
+            self.assertFalse(stages["network"])
+
+    def test_timeout_adds_diagnosis_with_single_node_recovery_hint(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = self._manager(directory)
+            self._write_state(manager, {"started_at": "2026-10-05T00:00:00+00:00",
+                                        "display_backend": "cocoa"})
+            health = [
+                {"name": "process", "ok": True, "detail": "PID 4242"},
+                {"name": "dhcp", "ok": False, "detail": "尚未获得固定实验地址"},
+                {"name": "ssh:22", "ok": False, "detail": "Connection refused"},
+            ]
+            with self._patch_alive({4242}), \
+                    mock.patch.object(ctflab.LabManager, "health", return_value=health):
+                report = ctflab._status_report(manager)
+            boot = next(item for item in report["profiles"]
+                        if item["id"] == "kali-arm64")["boot"]
+            self.assertEqual(boot["overall"], "timeout")
+            diagnosis = boot["diagnosis"]
+            self.assertEqual(diagnosis["failed_checks"], ["dhcp", "ssh:22"])
+            self.assertIn("log_path", diagnosis)
+            self.assertIn("不影响其他节点", diagnosis["hint"])
+            self.assertIn("不会自动重置磁盘", diagnosis["hint"])
+
+    def test_cocoa_backend_marks_display_stage_not_applicable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = self._manager(directory)
+            self._write_state(manager, {"started_at": ctflab.now_iso(),
+                                        "display_backend": "cocoa"})
+            health = [
+                {"name": "process", "ok": True, "detail": "PID 4242"},
+                {"name": "dhcp", "ok": True, "detail": "192.168.242.10"},
+                {"name": "ssh:22", "ok": True, "detail": "SSH-2.0-OpenSSH"},
+            ]
+            with self._patch_alive({4242}), \
+                    mock.patch.object(ctflab.LabManager, "health", return_value=health):
+                boot = ctflab.boot_stage_summary(
+                    manager, "kali-arm64", manager.runtime_state("kali-arm64"))
+            display = next(stage for stage in boot["stages"] if stage["name"] == "display")
+            self.assertIsNone(display["ok"])
+            self.assertEqual(boot["phase"], "network")
+
+    def test_spice_client_field_tracks_process_and_display(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = self._manager(directory)
+            client_log = manager.logs_dir / "kali-arm64-spice-client.log"
+            client_log.parent.mkdir(parents=True, exist_ok=True)
+            client_log.write_text("CTFLAB_SPICE_STATE agent=1\n"
+                                  "CTFLAB_SPICE_STATE display-ready=1\n", encoding="utf-8")
+            self._write_state(manager, {"started_at": ctflab.now_iso()})
+            health = [
+                {"name": "process", "ok": True, "detail": "PID 4242"},
+                {"name": "dhcp", "ok": True, "detail": "192.168.242.10"},
+                {"name": "ssh:22", "ok": True, "detail": "SSH-2.0-OpenSSH"},
+            ]
+            with self._patch_alive({4242, 5151}), \
+                    mock.patch.object(ctflab.LabManager, "health", return_value=health):
+                node = next(item for item in ctflab._status_report(manager)["profiles"]
+                            if item["id"] == "kali-arm64")
+            self.assertEqual(node["spice_client"],
+                             {"pid": 5151, "alive": True, "display_ready": True})
+            # 客户端进程消失后：alive=False 且不再读取日志判定 display。
+            with self._patch_alive({4242}), \
+                    mock.patch.object(ctflab.LabManager, "health", return_value=health):
+                node = next(item for item in ctflab._status_report(manager)["profiles"]
+                            if item["id"] == "kali-arm64")
+            self.assertEqual(node["spice_client"],
+                             {"pid": 5151, "alive": False, "display_ready": False})
+
+    def test_spice_client_field_absent_for_stopped_and_cocoa(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = self._manager(directory)
+            self._write_state(manager, {"started_at": ctflab.now_iso(),
+                                        "display_backend": "cocoa"})
+            health = [{"name": "process", "ok": True, "detail": "PID 4242"}]
+            with self._patch_alive({4242}), \
+                    mock.patch.object(ctflab.LabManager, "health", return_value=health):
+                report = ctflab._status_report(manager)
+            node = next(item for item in report["profiles"] if item["id"] == "kali-arm64")
+            self.assertIsNone(node["spice_client"])
+            with tempfile.TemporaryDirectory() as empty_dir:
+                stopped = next(item for item in ctflab._status_report(
+                    self._manager(empty_dir))["profiles"]
+                    if item["id"] == "kali-arm64")
+            self.assertIsNone(stopped["spice_client"])
+
+
+class DiagnosticsExportTests(unittest.TestCase):
+    """第 12 项：诊断包必须脱敏、包含启动阶段，且落盘为 0600。"""
+
+    def _manager_with_node(self, directory: str):
+        manager = ctflab.LabManager(pathlib.Path(directory))
+        qemu_log = manager.logs_dir / "kali-arm64.log"
+        client_log = manager.logs_dir / "kali-arm64-spice-client.log"
+        qemu_log.parent.mkdir(parents=True, exist_ok=True)
+        qemu_log.write_text("boot line A\n", encoding="utf-8")
+        client_log.write_text(
+            "CTFLAB_SPICE_STATE display-ready=1\n"
+            "CTFLAB_SPICE_STATE auth password=hunter2 leaked\n"
+            "CTFLAB_SPICE_STATE ticket=abcd1234\n"
+            "CTFLAB_SPICE_STATE resize-target logical=1000x700\n",
+            encoding="utf-8")
+        ctflab.write_json(manager.runtime_state_path("kali-arm64"), {
+            "schema": 1, "profile_id": "kali-arm64", "pid": 4242,
+            "qmp_path": str(manager.runtime_dir / "kali-arm64" / "qmp.sock"),
+            "log_path": str(qemu_log),
+            "started_at": ctflab.now_iso(),
+            "display_backend": "spice",
+            "spice_client_pid": 5151,
+            "spice_client_log_path": str(client_log),
+        })
+        health = [
+            {"name": "process", "ok": True, "detail": "PID 4242"},
+            {"name": "dhcp", "ok": True, "detail": "192.168.242.10"},
+            {"name": "ssh:22", "ok": True, "detail": "SSH-2.0-OpenSSH"},
+        ]
+        return manager, health
+
+    def test_report_redacts_secret_lines_and_keeps_stage(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager, health = self._manager_with_node(directory)
+            with mock.patch.object(ctflab, "bool_pid_alive",
+                                   side_effect=lambda pid: pid in {4242, 5151}), \
+                    mock.patch.object(ctflab.LabManager, "health", return_value=health):
+                report = ctflab.diagnostics_report(manager)
+        kali = next(item for item in report["profiles"] if item["id"] == "kali-arm64")
+        self.assertIsNotNone(kali.get("boot"))
+        self.assertEqual(kali["boot"]["phase"], "network")
+        tail = kali["log_tail"]["spice_client"]
+        joined = "\n".join(tail)
+        self.assertIn("display-ready=1", joined)
+        self.assertIn("resize-target", joined)
+        self.assertNotIn("hunter2", joined)
+        self.assertNotIn("abcd1234", joined)
+        self.assertEqual(joined.count("已脱敏"), 2)
+
+    def test_write_diagnostics_uses_owner_only_permissions(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager, health = self._manager_with_node(directory)
+            target = pathlib.Path(directory) / "diag" / "report.json"
+            with mock.patch.object(ctflab, "bool_pid_alive",
+                                   side_effect=lambda pid: pid in {4242, 5151}), \
+                    mock.patch.object(ctflab.LabManager, "health", return_value=health):
+                exported = ctflab.write_diagnostics(manager, target)
+            self.assertEqual(exported, target)
+            self.assertEqual(target.stat().st_mode & 0o777, 0o600)
+            payload = json.loads(target.read_text(encoding="utf-8"))
+            self.assertEqual(payload["schema"], 1)
+            self.assertIn("capabilities", payload)
+
+    def test_doctor_cli_wires_diagnostics_flag(self) -> None:
+        parser = ctflab.build_parser()
+        parsed = parser.parse_args(["doctor", "--diagnostics", "/tmp/x.json"])
+        self.assertEqual(str(parsed.diagnostics), "/tmp/x.json")
+        source = (PROJECT_ROOT / "tools/ctflab.py").read_text(encoding="utf-8")
+        self.assertIn("write_diagnostics(manager", source)
 
 
 if __name__ == "__main__":

@@ -95,6 +95,25 @@ class RateLimiterTests(unittest.TestCase):
 
 
 class PcapTests(unittest.TestCase):
+    def test_quota_never_writes_partial_record_and_reports_loss(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory)/'bounded.pcap'
+            writer=PcapWriter(path,max_bytes=24+16+10)
+            writer.write(b'1234567890',timestamp=1)
+            writer.write(b'next-frame',timestamp=2)
+            self.assertEqual(writer.summary()['frames_dropped_quota'],1)
+            writer.close()
+            self.assertEqual(path.stat().st_size,50)
+            metadata=json.loads(path.with_suffix('.pcap.capture.json').read_text())
+            self.assertEqual(metadata['frames_written'],1)
+            self.assertEqual(metadata['upstream_loss'],'unknown')
+
+    def test_existing_capture_preserved(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory)/'retained.pcap';path.write_bytes(b'original')
+            with self.assertRaises(FileExistsError):PcapWriter(path)
+            self.assertEqual(path.read_bytes(),b'original')
+
     def test_writer_creates_ethernet_pcap(self) -> None:
         frame = ethernet_frame("ff:ff:ff:ff:ff:ff", "52:54:00:00:00:01")
         with tempfile.TemporaryDirectory() as directory:

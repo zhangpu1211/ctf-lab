@@ -1,94 +1,106 @@
-# CTFLab 基盘分发指南（路线 A：网盘 / 课程资料区）
+# CTFLab 镜像制作与分发指南
 
-> 状态：2026-09-16 实现并在真实基盘上验证（见 §6）。适用于"老师把压缩基盘放到网盘或课程
-> 资料区，学生下载后用 `CTFLab.app` 导入"的交付方式。签名/公证不在本流程内（学生首次打开
-> App 需在"系统设置 → 隐私与安全性"手动放行一次）。
+> 2026-10-11 整理。当前使用与发布状态见[当前状态](ctflab-current-status.md)；历史测量见[2026-09-16 分发链验证](verification-distribution-2026-09-16.md)，历史基盘文件名与旧构建路径不再作为操作入口。
 
-## 1. 要分发的文件
+## 1. 完整分发的含义
 
-| 文件 | 来源 | 大小（压缩后） | 用途 |
-|---|---|---|---|
-| `kali-arm64-base.qcow2` | `base-80718f780e3b-installed.qcow2`（本机已导入基盘） | 约 8.3GB | Kali 实验机基盘 |
-| `kali-arm64-uefi-vars.fd` | `uefi-vars-80718f780e3b.fd` | 64MB | Kali 的 UEFI NVRAM 模板（**必须与基盘配对**） |
-| `smoke-base.qcow2` | `base-b3112d219743-netfix1.qcow2` | 约 0.1GB | Smoke 靶机基盘 |
-| `basic-pentesting-2-base.qcow2` | `base-c68a185c1bb3-netfix1.qcow2` | 约 0.8GB | Basic Pentesting 2 基盘 |
-| `DISTRIBUTION.json` / `SHA256SUMS` / `README.md` | `ctflab dist prepare` 生成 | 数 KB | 清单与校验 |
-| `CTFLab.app` | `app build` 产物（自带 `.sha256` 旁车） | 约 302MB | 运行器（含 QEMU + Python + 可选 SPICE，无需另装） |
+接收者使用 Apple Silicon Mac、macOS 26.0+，获得 App ZIP 和一个完整镜像包，选择镜像包目录后校验、导入缺失节点，再选中启动。App 与镜像分别交付；软件不包含虚拟磁盘。
 
-压缩产物是**标准 qcow2**（zstd 压缩簇），`qemu-img` 与 CTFLab 都能直接读，学生不需要解包。
+当前统一镜像库为 `/Users/pufei/Downloads/CTFLab-Library`。已处理的三节点包位于 `02-已处理`，软件位于 `03-软件`；原始输入位于 `01-待处理`。接收者可复制到任意路径。GUI 只读所选目录顶层，不递归找全库的分发清单。
 
-## 2. 老师：生成分发目录
+一份已制作镜像包应包含：
 
-```bash
-# 每个 profile 一次；同一 --out 目录会自动合并清单
-python3 tools/ctflab.py dist prepare --profile kali-arm64 --out ~/Downloads/ctflab-dist
-python3 tools/ctflab.py dist prepare --profile smoke      --out ~/Downloads/ctflab-dist
-python3 tools/ctflab.py dist prepare --profile basic-pentesting-2 --out ~/Downloads/ctflab-dist
+- 磁盘与配套 NVRAM（UEFI 时按 profile/清单配对）；
+- DISTRIBUTION.json、SHA256SUMS 和人读说明；
+- 与接收端匹配的 profile：架构、固件、白名单控制器、网卡、服务和网络边界；
+- 原始来源、许可、校验、实际验收范围，不包含公开密码或私人数据。
 
-# 上传前复核（逐文件大小与 SHA-256 与清单一致）
-python3 tools/ctflab.py dist verify --dir ~/Downloads/ctflab-dist
-```
+当前三节点包使用内置 profile。DISTRIBUTION.json 只登记文件，不自动安装任意自定义硬件配置。需要随包分发自定义 profile 时，使用下文的目录式内容包（schema 2）：配置随包提供并受白名单校验，导入不依赖 App 内置配置。仅有 QCOW2 不构成完整适配。
 
-要点：
+## 2b. 目录式内容包（schema 2）：自定义 profile 随包分发
 
-- `--source` 缺省取该 profile **当前已导入的基盘**（即验证记录里那份）；需要换来源时显式指定；
-- aarch64 profile 必须登记 UEFI NVRAM 模板（缺省取 `image.json` 里登记的 `uefi_vars_path`，
-  或用 `--nvram` 指定）；确实不要时用 `--no-nvram` 明确跳过——**不推荐**，跳过的是已验证的启动路径；
-- 压缩流程自带两道校验：`qemu-img check`（结构）+ 容量一致 + `qemu-img compare`（非严格：
-  来宾可见内容逐字节一致）。注意**不能**用严格模式 `-s`：它会比较块的分配布局，而压缩必然重排
-  布局，必然误报 `block status mismatch`；反过来非严格模式对容量不一致只警告不报错，所以容量用
-  `qemu-img info` 显式核对。任一项不过直接失败，不发布产物。条目的
-  `content_verified: qemu-img-compare-equal` 就是这项证据；
-- 清单里每个基盘条目带 `source_base_sha256`：它是该 profile 已导入基盘（老师侧原始文件）的哈希，
-  用于老师确认"发出去的确实是验证过的那份"；条目里的 `sha256` 才是学生下载要核对的文件哈希；
-- 压缩默认开启（`--no-compress` 仅用于小镜像或诊断）。
+适用场景：把"配置 + 基盘 + 必要固件 + 使用说明"作为一个自包含目录交付，接收者一条命令完成校验和导入，无需手工复制 YAML。
 
-## 3. 学生：下载与导入
+### 制作
 
 ```bash
-# 1) 校验下载完整性（与文件同目录执行）
-shasum -a 256 -c SHA256SUMS
-
-# 2) 导入：清单会强制核对基盘哈希，并自动套用配套的 NVRAM 模板
-CTFLab.app/Contents/Resources/bin/CTFLab import kali-arm64 ~/Downloads/kali-arm64-base.qcow2 \
-  --manifest ~/Downloads/DISTRIBUTION.json
-
-# 3) 启动
-CTFLab.app/Contents/Resources/bin/CTFLab run kali-arm64
+./tools/ctflab dist make-pack --out /path/to/内容包目录 \
+  --pack-id my-course-pack --name "课程包显示名" --version 1.0.0 \
+  --profile /path/to/my-node.yaml --base /path/to/base.qcow2 \
+  --nvram /path/to/uefi-vars.fd --doc /path/to/说明.md
+./tools/ctflab dist verify --dir /path/to/内容包目录 --conflicts
 ```
 
-- 哈希不一致时导入**直接失败**并打印期望值与实际值：重新下载，不要绕过；
-- 没有清单也可以导入（`--expect-sha256 <哈希>` 手工指定，或不校验、仅记录 `source_sha256`）；
-  校验结果会写进 `image.json` 的 `source_verification` 字段，便于事后审计；
-- 重复导入同一文件是幂等的：不会覆盖已验证的基盘，只更新校验记录；
-- 学生侧拿到的保证链条：下载哈希与清单一致（传输完整） + 该清单由老师在同一份"验证过的基盘"上
-  生成且 `content_verified = qemu-img-compare-equal`（内容等价）。学生导入后生成的基盘是重新编码的
-  qcow2，文件哈希与老师的原始基盘不同，这是正常的。
+`--nvram` 与 `--doc` 可选；`--doc` 可重复给出多个说明文件。
 
-## 4. 网盘与资料区的注意事项
+约束（制作前自查，导入端同样强制）：
 
-- **单文件大小限制**：部分网盘对免费用户限制单文件上传大小（如 4GB）。若受限，用分卷压缩
-  （`split -b 3900m kali-arm64-base.qcow2 kali-arm64-base.qcow2.part-`），并在 `README.md`
-  里注明重组命令（`cat kali-arm64-base.qcow2.part-* > kali-arm64-base.qcow2`）——
-  **重组后必须重新 `shasum -a 256` 比对 `SHA256SUMS`**；
-- **不要依赖网盘的"秒传/在线预览"**判断文件是否正确，只认本地实测哈希；
-- 上传后自己下载一次并跑 `ctflab dist verify`（或 `shasum -a 256 -c`），确认上传没有损坏；
-- 资料区建议与 `CTFLab.app` 放在同一层级，并置顶学生步骤（可直接用生成的 `README.md`）。
+- 节点配置 YAML 按 `tools/ctflab_profiles/*.yaml` 的 schema 编写，文件名必须是 `<id>.yaml`；
+- 内容包只允许四类角色：`base`（基盘）、`nvram`（UEFI 变量模板）、`profile`（节点配置）、`doc`（md/txt/pdf/png/jpg 说明）；不接受脚本、钩子或任意 QEMU 参数；
+- 包必须自包含：每个 base/nvram 引用的 profile 必须随包带 YAML；配置 id 不得与内置课程同名；
+- 配置不得声明联网（`internet: true`）或非 `lab` 网段；端口映射只到 127.0.0.1（运行器本身强制）；
+- `requires_runner`（默认 `>=当前版本`）声明最低运行器要求，接收端版本不足时拒绝导入；
+- 清单登记每个文件的大小与 SHA-256；文件平铺在包目录内，不允许子目录、绝对路径或符号链接；
+- 配置/清单中的 `verification` 段是制作者声明，仅供参考；它不会也不应被写成接收方已验收。
 
-## 5. 安全与合规
+### 接收者导入
 
-- **分发前清理基盘**：检查 `~/.ssh`、shell 历史、浏览器 profile、代理/凭据文件；确认
-  `/etc/ssh` host key 可以被全班共享（教学环境通常可接受，但要有意识地接受）；
-- **第三方镜像条款**：Smoke / Basic Pentesting 2 来自 VulnHub 等第三方，再分发条款需逐个确认；
-  拿不准就改为"学生自行到原页面下载 + 提供已知哈希"（`--expect-sha256` 同样适用）；
-- 镜像与发布包**不得提交进任何 Git 仓库**（沿用既有规则）；课程资料区仅面向本课程学生；
-- 来宾口令属于实验机凭据，只用于本地隔离实验网。
+```bash
+ctflab dist install --dir /path/to/内容包目录
+ctflab run smoke-mini
+```
 
-## 6. 实现与验证
+- 导入前整体校验：缺件、哈希/大小不符、非法配置、版本不满足时**不做任何导入**并逐项报错；
+- 配置以排他方式装入用户状态目录（默认 `~/Library/Application Support/CTFLab/profiles`）：内置同名一律拒绝；已有同名候选且内容不同默认不覆盖，需要人工决定；内容相同则幂等跳过；
+- 导入后配置、基盘、说明都由状态目录管理；内容包目录移走或删除后已导入节点仍可启动；
+- 导入失败或取消会回滚本轮写入（半安装配置、说明副本、包记录），已完成的节点如实保留；原包不被修改；
+- GUI：选中内容包目录后同样先校验（显示节点、资源需求、冲突与声明），导入按钮走同一条 `dist install`。
 
-- 命令：`tools/ctflab.py dist prepare|verify`（模块 `tools/ctflab_dist.py`）；
-  导入校验：`ctflab import --expect-sha256/--manifest/--nvram`；
-- 单元测试：`tools/tests/test_ctflab_distribution.py`（清单合并、压缩参数、篡改检测、
-  导入校验与冲突拒绝、幂等重复导入）；
-- 真实测量：Kali 基盘 19.15GB → 8.29GB（zstd，2.3x）；真实分发目录生成 + 复核 + smoke
-  基盘的"下载→`--manifest` 导入"全流程已在本机跑通（见验证记录）。
+### 与三节点分发目录的关系
+
+旧 `DISTRIBUTION.json`（schema 1，无 `pack` 对象）行为不变：profile 仍须接收端已存在，逐节点 `import --manifest`。两种格式共存；`dist verify` 同时兼容，`dist install` 只接受 schema 2 内容包。
+
+## 2. 制作已处理包
+
+源码维护环境，在已导入并完成对应验收的基盘上生成全新目录：
+
+```bash
+./tools/ctflab dist prepare --profile kali-arm64 --out /path/to/new-distribution
+./tools/ctflab dist prepare --profile smoke --out /path/to/new-distribution
+./tools/ctflab dist prepare --profile basic-pentesting-2 --out /path/to/new-distribution
+./tools/ctflab dist verify --dir /path/to/new-distribution
+```
+
+缺省来源为该 profile 当前登记基盘；更换来源需显式指定。不要硬编码已清理的旧 base 文件名。
+
+QCOW2 默认压缩。转换需结构 check、虚拟容量一致及非严格 compare 内容一致：压缩可能改变块分配布局，不能把严格分配布局比较用于内容等价判断；非严格 compare 不负责拒绝尺寸不同，因此容量单独核对。内容等价不代表磁盘启动、服务或网络验收通过。
+
+UEFI 基盘应随附已配对的 NVRAM 模板；不能把不同安装实例的变量文件混用。镜像原件只读，修改在可恢复副本上完成。
+
+## 3. 接收者使用
+
+推荐图形流程见[使用教程](ctflab-student-distribution-tutorial.md)。命令行排障入口：
+
+```bash
+/path/to/CTFLab.app/Contents/Resources/bin/ctflab-cli dist verify --dir /path/to/new-distribution
+/path/to/CTFLab.app/Contents/Resources/bin/ctflab-cli import smoke /path/to/new-distribution/smoke-base.qcow2 --manifest /path/to/new-distribution/DISTRIBUTION.json
+/path/to/CTFLab.app/Contents/Resources/bin/ctflab-cli run smoke
+```
+
+下载后在分发目录中检查 SHA256SUMS。缺文件或哈希不一致应重新下载，不能绕过清单。导入独立基盘与运行 overlay，原分发包保持不变；重复导入不应静默信任被改写的已登记基盘。
+
+## 4. 多个已处理靶场如何存放
+
+当前三节点清单仍在 `02-已处理` 顶层。以后新制作的包放在其独立子目录，例如 `02-已处理/课程B`，接收者选择该子目录，不选择包的上级根目录。不要把未登记镜像任意混入已有清单；普通文件扫描会触发候选导入，并不继承现有包的硬件设置。
+
+本库的 WebServer 原始 OVA 与未完整验收的派生副本均已按用户要求删除，库外课程资料原件未动。以后重新制作需取得来源并重新识别、转换、验收，不将旧 DHCP/PXE 候选事件视作磁盘引导成功。
+
+## 5. 完整性、许可与迁移
+
+- 分发哈希只证明字节完整；来源原盘哈希、导出盘哈希、E2E 后可写盘哈希不得混用。
+- 基盘包含私密历史、凭据、SSH 资料时，清理后重新验收；不在公开说明中放口令。
+- 项目代码 MIT；App 第三方文本/SBOM/源码要约按实际包校验。第三方靶机再分发权限是独立问题。
+- App 当前 ad-hoc、未公证；接收者可能需系统手动放行。不得描述为 Developer ID 正式签名。
+- 镜像、日志、PCAP、凭据不进 Git；公共 Release 仅发合规软件产物。
+- 镜像库可以整目录迁移，运行进度不在库内。保留进度需正常关机后独立备份状态及 NVRAM，不能复制运行盘冒充一致备份。
+- 跨 Mac 与最低 macOS 实机验收未覆盖时明确标记，不承诺任意机器保证可用。

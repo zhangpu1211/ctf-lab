@@ -1,0 +1,21 @@
+{
+  "name": "ctflab-desktop",
+  "version": "0.1.4",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1 --port 1420 --strictPort",
+    "build": "vite build",
+    "test": "node --test src/model.test.mjs src/graph-model.test.mjs src/remote-model.test.mjs src/version-model.test.mjs src/admin-model.test.mjs src/external-attach-model.test.mjs",
+    "tauri": "tauri"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "2.12.4",
+    "react": "19.3.1",
+    "react-dom": "19.3.1"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "2.12.4",
+    "vite": "8.3.5"
+  }
+}

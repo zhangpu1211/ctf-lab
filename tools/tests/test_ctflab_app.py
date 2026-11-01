@@ -233,6 +233,10 @@ class AppTestCase(unittest.TestCase):
         cls._class_temp.cleanup()
 
     def setUp(self) -> None:
+        # 模拟 App 使用固定版本；真实发布版本由 CLI 与实际构建验收。
+        version_patch = mock.patch.object(ctflab_app, "ctflab_version", return_value="0.1.0")
+        version_patch.start()
+        self.addCleanup(version_patch.stop)
         self.temp = tempfile.TemporaryDirectory()
         self.out = pathlib.Path(self.temp.name) / "out"
 
@@ -257,6 +261,26 @@ class AppTestCase(unittest.TestCase):
 
 
 class StructureTests(AppTestCase):
+    def test_native_display_bundle_and_runtime_references(self) -> None:
+        result = self.build(spice_client=self.fake_runtime / "bin" / "qemu-img")
+        app = pathlib.Path(result["app"])
+        binary = app / ctflab_app.DISPLAY_EXECUTABLE_REL
+        self.assertTrue(binary.is_file())
+        info = plistlib.loads((app / ctflab_app.DISPLAY_BUNDLE_REL / "Contents/Info.plist").read_bytes())
+        self.assertEqual(info["CFBundleIdentifier"], "local.ctflab.display")
+        self.assertEqual(info["CFBundleExecutable"], "spicy")
+        self.assertEqual(result["manifest"]["runtime"]["spice_client"], ctflab_app.DISPLAY_EXECUTABLE_REL)
+        self.assertEqual(ctflab_app.verify_runtime_references(app), [])
+        component = next(item for item in result["sbom"]["components"] if item.get("name") == "spicy")
+        self.assertIn(ctflab_app.DISPLAY_EXECUTABLE_REL, [entry["file"] for entry in component["binaries"]])
+        ctflab_app.verify_app(app)
+
+    def test_native_display_bundle_signature(self) -> None:
+        result = self.build(spice_client=self.fake_runtime / "bin" / "qemu-img", unsigned=False)
+        app = pathlib.Path(result["app"])
+        self.assertEqual(ctflab_app.codesign_verify(app / ctflab_app.DISPLAY_BUNDLE_REL)["verify_returncode"], 0)
+        ctflab_app.verify_app(app)
+
     def test_required_structure_and_info_plist(self) -> None:
         result = self.build()
         app = pathlib.Path(result["app"])
@@ -312,6 +336,22 @@ class StructureTests(AppTestCase):
 
 
 class RuntimeClosureTests(AppTestCase):
+    def test_loader_relative_source_runtime_can_be_rebundled(self) -> None:
+        source = pathlib.Path(self.temp.name) / "relocated-runtime"
+        shutil.copytree(self.fake_runtime, source)
+        libraries = {path.name: path for path in (source / "lib").iterdir()}
+        binaries = [source / "bin" / name for name in ctflab_app.QEMU_BINARIES]
+        ctflab_app._rewrite_install_names(binaries, libraries)
+        # install_name_tool 修改了来源签名，先重签才能运行版本探测。
+        for path in [*libraries.values(), *binaries]:
+            ctflab_app.codesign_path(path, "-")
+        result = self.build(qemu_root=source)
+        app = pathlib.Path(result["app"])
+        ctflab_app.verify_app(app, check_signature=False)
+        binary = app / ctflab_app.RUNTIME_REL / "bin/qemu-img"
+        output = subprocess.run([str(binary)], check=True, capture_output=True, text=True)
+        self.assertEqual(output.stdout.strip(), "42")
+
     def test_dylib_closure_copied_inside_app(self) -> None:
         result = self.build()
         app = pathlib.Path(result["app"])
@@ -894,7 +934,7 @@ class RuntimeSelectionTests(unittest.TestCase):
             fake_tools = app / "Contents" / "Resources" / "ctflab" / "tools"
             fake_tools.mkdir(parents=True)
             for name in ("ctflab.py", "ctflab_inspect.py", "ctflab_network.py",
-                         "ctflab_utm.py", "ctflab_utm_fixture.json"):
+                         "ctflab_utm.py", "ctflab_utm_fixture.json", "ctflab_platform.py"):
                 shutil.copy2(TOOLS_DIR / name, fake_tools / name)
             shutil.copytree(TOOLS_DIR / "ctflab_profiles", fake_tools / "ctflab_profiles")
             fake_module = fake_tools / "ctflab.py"
@@ -978,6 +1018,30 @@ class CliSurfaceTests(unittest.TestCase):
             app_choices.update(action.choices)
         self.assertEqual(set(app_choices), {"build", "verify"})
 
+    def test_packaged_sources_execute_scenario_without_repository_imports(self) -> None:
+        # 从实际复制后的目录运行，避免源码 sys.path 掩盖发布依赖遗漏。
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            packaged = root / "packaged"
+            ctflab_app._copy_ctflab_sources(PROJECT_ROOT, packaged)
+            env = {key: value for key, value in os.environ.items()
+                   if key not in ("PYTHONPATH", "PYTHONHOME")}
+            for arguments in (("status", "--json"), ("start", "--help"),
+                              ("stop", "--help"), ("reset", "--help"),
+                              ("recover", "--help"), ("release", "--help")):
+                result = subprocess.run(
+                    [sys.executable, "-E", str(packaged / "tools/ctflab.py"),
+                     "--state-dir", str(root / "state"), "scenario", *arguments],
+                    cwd=root, env=env, capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+            modules = sorted(path.stem for path in (PROJECT_ROOT / "tools").glob("ctflab_scenario*.py"))
+            result = subprocess.run(
+                [sys.executable, "-I", "-c",
+                 "import sys; sys.path.insert(0, " + repr(str(packaged / "tools")) +
+                 "); " + "; ".join("import " + name for name in modules)],
+                cwd=root, env=env, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_source_release_contains_app_module_used_by_cli(self) -> None:
         self.assertIn("tools/ctflab_app.py", ctflab_package.RELEASE_TOOL_FILES)
         with tempfile.TemporaryDirectory() as temp:
@@ -989,6 +1053,82 @@ class CliSurfaceTests(unittest.TestCase):
             self.assertIn("tools/ctflab_app.py", paths)
             ctflab_package.verify_release_bundle(pathlib.Path(result["bundle"]))
 
+    def test_packaged_w01_driver_selftest_without_repository_imports(self) -> None:
+        # 验证三份新模块确实随源码复制；只运行无 VM 的独立自检。
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            packaged = root / "packaged"
+            ctflab_app._copy_ctflab_sources(PROJECT_ROOT, packaged)
+            result = subprocess.run(
+                [sys.executable, "-I", str(packaged / "tools/ctflab_windows_probe.py"), "--self-test"],
+                cwd=root, capture_output=True, text=True, timeout=20)
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+            report = json.loads(result.stdout)
+            self.assertEqual(report["scope"], "synthetic-only")
+            self.assertFalse(report["g0_passed"])
+            adapter = subprocess.run(
+                [sys.executable, "-I", str(packaged / "tools/ctflab_local_adapter.py"), "--help"],
+                cwd=root, capture_output=True, text=True, timeout=10)
+            self.assertEqual(adapter.returncode, 0, adapter.stderr)
+
+
+class GenericRuntimeTests(AppTestCase):
+    def licenses(self):
+        import json
+        root=pathlib.Path(self.temp.name);entries={}
+        for name in ('cryptography','tcl','tk'):
+            path=root/(name+'.LICENSE');path.write_text('test-only license fixture '+name)
+            entries[name]={'path':str(path),'sha256':ctflab_app.sha256_file(path),'license':'test-fixture'}
+        manifest=root/'generic.json';manifest.write_text(json.dumps({'schema':1,'licenses':entries}))
+        return manifest
+
+    def test_generic_runtime_preserves_tk_and_records_dependency_proof_and_licenses(self):
+        import json
+        proof={'imports_from_bundle':True,'cryptography':'46.0.5','tcl':'8.6','tk':'8.6','tcl_library':'lib/tcl8.6','window_opened':False}
+        with mock.patch.object(ctflab_app,'probe_generic_runtime',return_value=proof) as probe:
+            result=self.build(generic_runtime_manifest=self.licenses())
+            report=ctflab_app.verify_app(pathlib.Path(result['app']),check_signature=False)
+        self.assertTrue(probe.called)
+        self.assertTrue(report['runtime']['python']['generic']['imports_from_bundle'])
+        self.assertEqual(set(report['runtime']['python']['generic']['licenses']),{'cryptography','tcl','tk'})
+        self.assertFalse(report['runtime']['python']['generic']['native_display_verified'])
+        self.assertTrue(any(c.get('name')=='cryptography' for c in result['sbom']['components']))
+        self.assertTrue(any(p.name=='tkinter' for p in (pathlib.Path(result['app'])/ctflab_app.PYTHON_RUNTIME_REL).rglob('tkinter')))
+
+    def test_generic_runtime_refuses_missing_or_tampered_license_before_probe(self):
+        import json
+        manifest=self.licenses();value=json.loads(manifest.read_text());value['licenses']['tk']['sha256']='0'*64;manifest.write_text(json.dumps(value))
+        destination=pathlib.Path(self.temp.name)/'licenses';destination.mkdir()
+        with self.assertRaises(ctflab_app.AppBuildError):ctflab_app.generic_runtime_licenses(manifest,destination)
+        self.assertFalse(self.out.exists())
+
+    def test_generic_probe_accepts_real_builtin_but_rejects_foreign_files_and_fake_builtin(self):
+        import ast, sys
+        from types import SimpleNamespace
+        with mock.patch.object(ctflab_app.subprocess,'run',return_value=SimpleNamespace(returncode=1,stdout='',stderr='')) as call:
+            with self.assertRaises(ctflab_app.AppBuildError):ctflab_app.probe_generic_runtime(pathlib.Path(self.temp.name))
+        script=call.call_args.args[0][-1]
+        function=next(n for n in ast.parse(script).body if isinstance(n,ast.FunctionDef) and n.name=='module_from_bundle')
+        root=pathlib.Path(self.temp.name).resolve();scope={'sys':sys,'Path':pathlib.Path,'root':root}
+        exec(compile(ast.Module(body=[function],type_ignores=[]),'probe-under-test','exec'),scope)
+        belongs=scope['module_from_bundle']
+        self.assertTrue(belongs(sys))
+        self.assertTrue(belongs(SimpleNamespace(__file__=str(root/'module.so'))))
+        self.assertFalse(belongs(SimpleNamespace(__file__='/outside/module.so')))
+        self.assertFalse(belongs(SimpleNamespace(__name__='not_a_builtin',__spec__=SimpleNamespace(origin='built-in'))))
+        self.assertFalse(belongs(SimpleNamespace(__name__='sys',__spec__=SimpleNamespace(origin='frozen'))))
+
+    def test_mac_sources_include_entire_shared_desktop_runtime(self):
+        from ctflab_desktop_package import TOOLS
+        self.assertTrue(set(TOOLS)<=set(ctflab_package.RELEASE_TOOL_FILES))
+
+    def test_generic_runtime_probe_is_isolated_and_rejects_foreign_imports(self):
+        from types import SimpleNamespace
+        root=pathlib.Path(self.temp.name)/'python'
+        with mock.patch.object(ctflab_app.subprocess,'run',return_value=SimpleNamespace(returncode=1,stdout='',stderr='private failure')) as call:
+            with self.assertRaises(ctflab_app.AppBuildError):ctflab_app.probe_generic_runtime(root)
+        self.assertIn('-I',call.call_args.args[0]);self.assertIn('-B',call.call_args.args[0])
+        self.assertNotIn('PYTHONPATH',call.call_args.kwargs['env'])
 
 if __name__ == "__main__":
     unittest.main()
