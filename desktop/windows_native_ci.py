@@ -77,6 +77,32 @@ def snapshot_files(archive):
 
 
 
+def checkout_archive_files(raw):
+    """仅接受固定提交的Git归档；拒绝链接、别名与不相关目录。"""
+    import io
+    payload = {}
+    with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+        entries = archive.infolist()
+        if len(entries) > 4096 or sum(e.file_size for e in entries) > 64 * 1024**2:
+            raise ValueError('提交归档超过边界')
+        names = set()
+        for entry in entries:
+            path = PurePosixPath(entry.filename)
+            if (path.is_absolute() or '..' in path.parts or '\\' in entry.filename
+                    or ':' in entry.filename or stat.S_ISLNK(entry.external_attr >> 16)
+                    or any(p.endswith((' ', '.')) for p in path.parts)
+                    or entry.filename.casefold() in names):
+                raise ValueError('提交归档路径/类型不符')
+            names.add(entry.filename.casefold())
+            if entry.is_dir(): continue
+            if (path.parts[0] in ('tools', 'desktop', 'gui', 'docs')
+                    or entry.filename in ('README.md', 'LICENSE', 'AGENTS.md', '.gitignore')):
+                payload[entry.filename] = archive.read(entry)
+    if not {'desktop/Build-Windows.ps1', 'tools/ctflab.py', 'desktop/src-tauri/src/main.rs'} <= payload.keys():
+        raise ValueError('提交归档缺少必要源码')
+    return payload
+
+
 def apply_native_overlay(source, results):
     # Windows首轮已复现cp1252无法输出中文；只对已发布的精确Rust源施加这一处候选补丁。
     path = source/'desktop/src-tauri/src/main.rs'
@@ -284,15 +310,17 @@ def run():
     root = Path(os.environ['RUNNER_TEMP'])/f'ctflab-native-{run_id}-{attempt}'
     root.mkdir();results=root/'results';results.mkdir()
     record(results/'scope.json', {'os':platform.platform(),'root':str(root),'vm_operations':False,'public_release':False})
-    source_zip=root/'source.zip';download(SOURCE_URL, source_zip, SOURCE_SHA256, limit=8*1024**2)
-    files=snapshot_files(source_zip);source=root/'source';source.mkdir()
+    checkout = Path(os.environ['GITHUB_WORKSPACE'])
+    expected_sha = os.environ['GITHUB_SHA']
+    archive = subprocess.run(['git', '-C', str(checkout), 'archive', '--format=zip', expected_sha],
+                             check=True, capture_output=True).stdout
+    files = checkout_archive_files(archive)
+    source=root/'source';source.mkdir()
     for name,raw in files.items():
         target=source/name;target.parent.mkdir(parents=True,exist_ok=True)
         with target.open('xb') as stream:stream.write(raw)
-    apply_native_overlay(source, results)
-    apply_inventory_overlay(source, results)
-    apply_pe_overlay(source, results)
-    apply_build_overlay(source, results)
+    record(results/'build-source-manifest.json', {'commit': expected_sha,
+           'files': {name: hashlib.sha256(raw).hexdigest() for name, raw in files.items()}})
     pyroot=root/'python';prepare_python(Path(sys.executable).parent, pyroot)
     requirements=Path(__file__).with_name('requirements-windows-native-ci.txt')
     command([sys.executable,'-I','-m','pip','install','--only-binary=:all:','--require-hashes','--no-deps',
@@ -311,7 +339,7 @@ def run():
                                 or item.name.lower().startswith(('copying','license','readme'))))
                 or item.is_dir() and item.name in ('share','etc','lib','licenses')):
             copy_plain(item,qroot/item.name)
-    record(results/'input-provenance.json', {'source_sha256':digest(source_zip),'qemu_installer_sha512':digest(archive,'sha512'),
+    record(results/'input-provenance.json', {'source_commit':expected_sha, 'source_archive_sha256':hashlib.sha256(archive).hexdigest(),'qemu_installer_sha512':digest(archive,'sha512'),
           'qemu_binary_sha256':digest(qroot/'qemu-system-x86_64.exe'),'python':sys.version.split()[0],
           'python_setup_action_pinned':True,'source_signature_verified':False})
     timestamp_probe(qroot/'qemu-system-x86_64.exe', results)

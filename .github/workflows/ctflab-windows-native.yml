@@ -1,8 +1,8 @@
 name: CTFLab Windows 原生候选构建与安装检查
-# 仅独立审查分支；不加入默认分支、不发布Release、不使用签名凭据。
+# 构建精确提交；安装器由获授权的发布流程另行上传，不使用签名凭据。
 on:
   push:
-    branches: [codex/windows-native-acceptance-20261030]
+    branches: [codex/windows-native-acceptance-20261030, codex/release-0.1.1-preview-20261010]
 permissions:
   contents: read
 concurrency:

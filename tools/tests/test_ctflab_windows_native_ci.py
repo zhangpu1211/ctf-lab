@@ -134,6 +134,20 @@ class NativePreparationTests(unittest.TestCase):
         self.assertEqual(path.read_bytes(), b'changed-source')
         self.assertEqual(list(results.iterdir()), [])
 
+    def test_checkout_archive_uses_current_source_and_rejects_links(self):
+        files = {'desktop/Build-Windows.ps1': b'current-build', 'tools/ctflab.py': b'current-core',
+                 'desktop/src-tauri/src/main.rs': b'current-rust', '.github/private': b'excluded'}
+        stream = io.BytesIO()
+        with zipfile.ZipFile(stream, 'w') as archive:
+            for name, raw in files.items(): archive.writestr(name, raw)
+        result = ci.checkout_archive_files(stream.getvalue())
+        self.assertEqual(result['tools/ctflab.py'], b'current-core')
+        self.assertNotIn('.github/private', result)
+        with zipfile.ZipFile(stream, 'a') as archive:
+            info = zipfile.ZipInfo('tools/link.py'); info.external_attr = (stat.S_IFLNK | 0o777) << 16
+            archive.writestr(info, '../outside')
+        with self.assertRaises(ValueError): ci.checkout_archive_files(stream.getvalue())
+
     def test_non_windows_cannot_create_run_directory(self):
         if os.name == 'nt': self.skipTest('本用例验证非Windows拒绝边界')
         with patch.dict(os.environ, {'GITHUB_ACTIONS': 'true', 'RUNNER_OS': 'Windows', 'RUNNER_TEMP': str(self.root)}):
