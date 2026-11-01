@@ -312,9 +312,9 @@ def run():
     record(results/'scope.json', {'os':platform.platform(),'root':str(root),'vm_operations':False,'public_release':False})
     checkout = Path(os.environ['GITHUB_WORKSPACE'])
     expected_sha = os.environ['GITHUB_SHA']
-    archive = subprocess.run(['git', '-C', str(checkout), 'archive', '--format=zip', expected_sha],
+    source_archive = subprocess.run(['git', '-C', str(checkout), 'archive', '--format=zip', expected_sha],
                              check=True, capture_output=True).stdout
-    files = checkout_archive_files(archive)
+    files = checkout_archive_files(source_archive)
     source=root/'source';source.mkdir()
     for name,raw in files.items():
         target=source/name;target.parent.mkdir(parents=True,exist_ok=True)
@@ -339,7 +339,7 @@ def run():
                                 or item.name.lower().startswith(('copying','license','readme'))))
                 or item.is_dir() and item.name in ('share','etc','lib','licenses')):
             copy_plain(item,qroot/item.name)
-    record(results/'input-provenance.json', {'source_commit':expected_sha, 'source_archive_sha256':hashlib.sha256(archive).hexdigest(),'qemu_installer_sha512':digest(archive,'sha512'),
+    record(results/'input-provenance.json', {'source_commit':expected_sha, 'source_archive_sha256':hashlib.sha256(source_archive).hexdigest(),'qemu_installer_sha512':digest(archive,'sha512'),
           'qemu_binary_sha256':digest(qroot/'qemu-system-x86_64.exe'),'python':sys.version.split()[0],
           'python_setup_action_pinned':True,'source_signature_verified':False})
     timestamp_probe(qroot/'qemu-system-x86_64.exe', results)
