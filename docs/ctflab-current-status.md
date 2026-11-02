@@ -3148,3 +3148,21 @@ SPICE 客户端动态库，但随包 `qemu-system-aarch64 -machine none -display
 发布包内真实 QEMU/SPICE 后端与客户端闭包，未启动用户 VM。SPICE 动态分辨率的
 真实来宾窗口跟随仍以 2026-09-18 历史人工验收为证据，本 hotfix 不把协议能力探测
 冒充为新的来宾分辨率 E2E。正式 Mac 发布仍需用户在本机导入镜像后做一次启动确认。
+
+**GitHub 发布**：已创建 Mac 预发布
+<https://github.com/zhangpu1211/ctf-lab/releases/tag/v0.1.4-preview.20261102-spice-hotfix>，
+标签目标为 `bcaabb7bbbb860c015dce0ee5c19f6eff970e065`。发布资产：
+
+- `CTFLab-0.1.4-preview.20261102-macos-arm64-spice-hotfix.zip`，62,315,654
+  字节，SHA-256 `499d9f95615fa0e82d66e4e47f2fcd2c8c9332017b7c85da40ff42f8d822ca68`；
+- `CTFLab-0.1.4-preview.20261102-spice-hotfix-source.zip`，SHA-256
+  `d51da2cf44d22c00af34d96dc2375db55f02d3a5127e03352b17dc6e6c341e96`；
+- `CTFLab-0.1.4-preview.20261102-spice-evidence.zip`，SHA-256
+  `56f75cabf6f1d2b9623ab2722940101f0209b17e533e63c48822f73ac75c856d`；
+- `SHA256SUMS.txt`。
+
+三个资产已从 GitHub 重新下载并通过 `shasum -a 256 -c`；远端 Mac ZIP 解压后的
+App 再次通过 `app verify`、`codesign --verify --deep --strict` 及三项 SPICE
+能力探测。Windows 安装器本轮没有代码变化，继续使用
+`v0.1.4-preview.20261101` 发布中的
+`CTFLab_0.1.4_x64-setup.exe`。
