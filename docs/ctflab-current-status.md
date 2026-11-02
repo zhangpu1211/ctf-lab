@@ -3187,11 +3187,31 @@ XFCE 或 Xrandr 故障。
 已单独回收。新 App 为
 `/Users/pufei/Downloads/ctf-lab/output/spice-display-client-hotfix-20261102/mac-final-r2/CTFLab.app`，
 ZIP 为
-`CTFLab-0.1.4-preview.20261102-macos-arm64-spice-client-hotfix.zip`，62,368,041
-字节，SHA-256 `67ff67e66742f8d2f483dc8382801f652df5f8e3d58692d482b882e875c862ac`。
+`CTFLab-0.1.4-preview.20261102-macos-arm64-spice-client-hotfix.zip`，61,765,130
+字节，SHA-256 `519b7b83674edfb272051cde1a304ffb96507d55e3ebb69504837a23b1ef5cae`。
 `app verify`、双客户端能力探针、严格代码签名校验、ZIP 解压回测均通过；App、
 客户端输入和 UX 共 123 项测试通过。新发布包中的最终客户端没有在虚拟机停止后再次
 连接新来宾，不能把能力/回读验证冒充新的完整动态分辨率 E2E。
+
+**发布收口**：修复提交为
+`28fec274d4c6a520cbaee27e5bd558ad8f0df37a`，已推送开发分支和 `main`。已发布预览
+<https://github.com/zhangpu1211/ctf-lab/releases/tag/v0.1.4-preview.20261102-spice-client-hotfix>，
+标签指向同一提交，包含4项资产：
+
+- Mac ZIP：61,765,130字节，SHA-256
+  `519b7b83674edfb272051cde1a304ffb96507d55e3ebb69504837a23b1ef5cae`；
+- `CTFLab-0.1.4-preview.20261102-spice-client-hotfix-source.zip`，3,147,131字节，
+  SHA-256 `5f7de38d858111df21d15cbbc166b55ba8a740a220889d64c357078830f56465`；
+- `CTFLab-0.1.4-preview.20261102-spice-client-evidence.zip`，14,877字节，SHA-256
+  `86524251af2ab73d7c736e739d38dceb1e21b03df1fb137b732ee7d9393e5673`；
+- `SHA256SUMS.txt`。
+
+第一次上传后的远端回读发现 Mac ZIP 顶层漏带`CTFLab.app.sha256`，因此严格
+`app verify` 无法通过；App 本体、签名和客户端探针当时正常。该缺旁车包已保留在
+本地`invalid-zip-missing-sidecar/`，未作为交付。重打后的同一版本 ZIP 在顶层包含
+旁车；4项资产重新上传后再次从 GitHub 下载，`shasum -a 256 -c`、原生解包、
+`app verify`、严格签名及两处客户端能力探针全部通过。源码包内修复文件与当前提交
+逐字一致；证据包记录的源码提交与当前提交一致。
 
 详见[验证记录](verification-mac-spice-client-hotfix-2026-11-02.md)。发布页：
 <https://github.com/zhangpu1211/ctf-lab/releases/tag/v0.1.4-preview.20261102-spice-client-hotfix>。

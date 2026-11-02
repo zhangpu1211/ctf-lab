@@ -50,9 +50,10 @@ CTFLAB_SPICE_STATE display-ready=1
 | 项目 | 值 |
 | --- | --- |
 | App | `/Users/pufei/Downloads/ctf-lab/output/spice-display-client-hotfix-20261102/mac-final-r2/CTFLab.app` |
-| ZIP | `/Users/pufei/Downloads/ctf-lab/output/spice-display-client-hotfix-20261102/CTFLab-0.1.4-preview.20261102-macos-arm64-spice-client-hotfix.zip` |
-| ZIP 字节 | 62,368,041 |
-| ZIP SHA-256 | `67ff67e66742f8d2f483dc8382801f652df5f8e3d58692d482b882e875c862ac` |
+| ZIP | `/Users/pufei/Downloads/ctf-lab/output/spice-display-client-hotfix-20261102/release-assets/CTFLab-0.1.4-preview.20261102-macos-arm64-spice-client-hotfix.zip` |
+| ZIP 字节 | 61,765,130 |
+| ZIP SHA-256 | `519b7b83674edfb272051cde1a304ffb96507d55e3ebb69504837a23b1ef5cae` |
+| 源码提交 | `28fec274d4c6a520cbaee27e5bd558ad8f0df37a` |
 | 版本 | `0.1.4` |
 | 登记文件 | 1301 |
 | 动态库 | 70 |
@@ -75,7 +76,8 @@ CTFLAB_SPICE_STATE display-ready=1
 - `app verify` 通过 1301 个登记文件、运行时引用、QEMU SPICE 门禁、受控客户端
   门禁、许可证与旁车摘要。
 - `codesign --verify --deep --strict --verbose=2` 通过。
-- ZIP 解压后将旁车放在 App 同级，再次执行 `app verify` 通过；两个客户端探针均通过。
+- 最终 ZIP 顶层包含 `CTFLab.app.sha256`；解压后直接执行 `app verify` 通过，
+  两个客户端探针均通过。
 - `tools.tests.test_ctflab_app`、`test_ctflab_client_input` 与
   `test_ctflab_ux` 合计 123 项通过。测试日志中
   `FAIL guest-password` 是未提供 Kali 口令时的预期环境门禁输出，不是 unittest 失败。
@@ -84,17 +86,29 @@ CTFLAB_SPICE_STATE display-ready=1
 - 用新 `app verify` 校验上一个错误 hotfix 包，按预期在
   `runtime/bin/spicy` 处以“不支持 `--ctflab-capabilities`”失败。
 
+首轮重打的 ZIP 在远端回读时发现漏带 App 顶层旁车，导致严格 `app verify`
+无法完成；该文件已移至本地 `invalid-zip-missing-sidecar/` 留档，没有作为交付。
+补入旁车后，最终 ZIP 重新上传并从 GitHub 回下载，三个ZIP的SHA-256、
+原生解包、`app verify`、严格签名和两处客户端探针均通过。源码包中的
+`tools/ctflab_app.py` 与 `tools/spice_client/ctflab_spicy.c` 和当前提交逐字一致。
+
 ## 证据位置
 
 - `output/spice-display-client-hotfix-20261102/build-r2.log`
-- `output/spice-display-client-hotfix-20261102/app-verify-r2.log`
-- `output/spice-display-client-hotfix-20261102/test-targeted.log`
+- `output/spice-display-client-hotfix-20261102/app-verify-r3.log`
+- `output/spice-display-client-hotfix-20261102/test-targeted-r3.log`
+- `output/spice-display-client-hotfix-20261102/test-status-docs-r3.log`
 - `output/spice-display-client-hotfix-20261102/negative-generic-client-verify.log`
 - `output/spice-display-client-hotfix-20261102/mac-final-r2/CTFLab.app.sha256`
-- `output/spice-display-client-hotfix-20261102/zip-check/`
+- `output/spice-display-client-hotfix-20261102/local-corrected-zip-check/`
+- `output/spice-display-client-hotfix-20261102/github-readback-r2/`
+- `output/spice-display-client-hotfix-20261102/github-readback-extracted-r3/`
 
 ## 边界
 
 新包为 ad-hoc 签名且未公证。最终包中的客户端没有在虚拟机随后停止后再次建立真实
 来宾显示；真实来宾动态分辨率仍沿用 2026-09-18 的人工历史验收。Windows 安装器
-本轮没有代码变化。正式发布页和远端回下载复核结果在本文件对应 Release 资产中记录。
+本轮没有代码变化。发布页为
+<https://github.com/zhangpu1211/ctf-lab/releases/tag/v0.1.4-preview.20261102-spice-client-hotfix>；
+远端回下载复核结果见上文，标签指向源码提交
+`28fec274d4c6a520cbaee27e5bd558ad8f0df37a`。
