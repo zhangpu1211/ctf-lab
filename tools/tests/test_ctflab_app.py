@@ -40,6 +40,21 @@ int main(int argc, char **argv) {
     printf("QEMU emulator version 11.1.0\\n");
     return 0;
   }
+  for (int i = 1; i + 1 < argc; i++) {
+    if (strcmp(argv[i + 1], "help") == 0 &&
+        (strcmp(argv[i], "-display") == 0 ||
+         strcmp(argv[i], "-chardev") == 0 ||
+         strcmp(argv[i], "-device") == 0)) {
+      if (strcmp(argv[i], "-display") == 0) {
+        printf("Available display backend types:\\nspice-app\\n");
+      } else if (strcmp(argv[i], "-chardev") == 0) {
+        printf("  spicevmc\\n");
+      } else {
+        printf("name \\\"virtserialport\\\", bus virtio-serial-bus\\n");
+      }
+      return 0;
+    }
+  }
   printf("%d\\n", stub_answer());
   return 0;
 }
@@ -270,10 +285,44 @@ class StructureTests(AppTestCase):
         self.assertEqual(info["CFBundleIdentifier"], "local.ctflab.display")
         self.assertEqual(info["CFBundleExecutable"], "spicy")
         self.assertEqual(result["manifest"]["runtime"]["spice_client"], ctflab_app.DISPLAY_EXECUTABLE_REL)
+        capabilities = result["manifest"]["runtime"]["spice_capabilities"]
+        self.assertTrue(capabilities["verified"])
+        self.assertTrue(capabilities["spice_display"])
+        self.assertTrue(capabilities["spicevmc"])
+        self.assertTrue(capabilities["virtserialport"])
+        self.assertEqual(
+            capabilities["qemu"],
+            f"{ctflab_app.RUNTIME_REL}/bin/qemu-system-aarch64",
+        )
         self.assertEqual(ctflab_app.verify_runtime_references(app), [])
         component = next(item for item in result["sbom"]["components"] if item.get("name") == "spicy")
         self.assertIn(ctflab_app.DISPLAY_EXECUTABLE_REL, [entry["file"] for entry in component["binaries"]])
         ctflab_app.verify_app(app)
+
+    def test_spice_client_refuses_qemu_without_spice_backend(self) -> None:
+        capabilities = {
+            "qemu": "/fixture/qemu",
+            "spice_display": False,
+            "spicevmc": False,
+            "virtserialport": True,
+            "verified": False,
+            "errors": ["QEMU spice 显示后端不可用", "QEMU spicevmc chardev 不可用"],
+        }
+        with mock.patch.object(
+            ctflab_app, "probe_qemu_spice_support", return_value=capabilities
+        ):
+            with self.assertRaises(ctflab_app.AppBuildError) as raised:
+                self.build(spice_client=self.fake_runtime / "bin" / "qemu-img")
+        self.assertIn("--spice-client", str(raised.exception))
+        self.assertIn("QEMU spice 显示后端不可用", str(raised.exception))
+        self.assertFalse((self.out / "CTFLab.app").exists())
+
+    def test_spice_capability_probe_reads_real_qemu_help_output(self) -> None:
+        capabilities = ctflab_app.probe_qemu_spice_support(
+            self.fake_runtime / "bin" / "qemu-system-aarch64"
+        )
+        self.assertTrue(capabilities["verified"], capabilities)
+        self.assertEqual(capabilities["errors"], [])
 
     def test_native_display_bundle_signature(self) -> None:
         result = self.build(spice_client=self.fake_runtime / "bin" / "qemu-img", unsigned=False)

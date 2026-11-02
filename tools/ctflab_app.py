@@ -367,6 +367,65 @@ def detect_qemu_root() -> Path:
     return root
 
 
+def probe_qemu_spice_support(qemu: Path) -> dict[str, Any]:
+    """验证 QEMU 二进制本身具备 CTFLab 动态分辨率所需的 SPICE 能力。
+
+    仅检查命令行帮助，不启动来宾，也不依赖宿主机安装的 QEMU。构建器与发布校验都调用
+    此函数，确保“随包 spicy 客户端”不会与“无 SPICE 的 QEMU”组合发布。
+    """
+    qemu = Path(qemu)
+    result: dict[str, Any] = {
+        "qemu": str(qemu),
+        "spice_display": False,
+        "spicevmc": False,
+        "virtserialport": False,
+        "verified": False,
+        "errors": [],
+    }
+    probes = {
+        "display": ["-display", "help"],
+        "chardev": ["-chardev", "help"],
+        "device": ["-device", "help"],
+    }
+    outputs: dict[str, str] = {}
+    for name, arguments in probes.items():
+        try:
+            completed = subprocess.run(
+                [str(qemu), "-machine", "none", *arguments],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            result["errors"].append(f"{name} 能力探测失败：{exc}")
+            continue
+        outputs[name] = f"{completed.stdout}\n{completed.stderr}"
+        if completed.returncode != 0:
+            result["errors"].append(f"{name} 帮助命令退出码 {completed.returncode}")
+
+    result["spice_display"] = bool(
+        re.search(r"(?mi)^\s*spice(?:-app)?\s*$", outputs.get("display", ""))
+    )
+    result["spicevmc"] = bool(
+        re.search(r"(?mi)^\s*spicevmc\s*$", outputs.get("chardev", ""))
+        or re.search(r"(?mi)^\s*spicevmc\b", outputs.get("chardev", ""))
+    )
+    result["virtserialport"] = bool(
+        re.search(r"(?mi)^\s*name\s+\"virtserialport\"", outputs.get("device", ""))
+    )
+    result["verified"] = all(
+        result[key] for key in ("spice_display", "spicevmc", "virtserialport")
+    )
+    if not result["spice_display"]:
+        result["errors"].append("QEMU spice 显示后端不可用")
+    if not result["spicevmc"]:
+        result["errors"].append("QEMU spicevmc chardev 不可用")
+    if not result["virtserialport"]:
+        result["errors"].append("QEMU virtserialport 设备不可用")
+    return result
+
+
 def copy_qemu_share(source_root: Path, destination: Path,
                     share_files: Iterable[str] | None = None) -> list[str]:
     share_src = source_root / "share" / "qemu"
@@ -1351,6 +1410,15 @@ def build_app(
         spice_client = Path(spice_client).expanduser().resolve()
         _expect(spice_client.is_file() and os.access(spice_client, os.X_OK),
                 f"SPICE 客户端不存在或不可执行：{spice_client}")
+    source_qemu = Path(qemu_root) / "bin" / "qemu-system-aarch64"
+    _expect(source_qemu.is_file() and os.access(source_qemu, os.X_OK),
+            f"缺少可执行的 QEMU 系统程序：{source_qemu}")
+    source_spice_capabilities = None
+    if spice_client is not None:
+        source_spice_capabilities = probe_qemu_spice_support(source_qemu)
+        _expect(source_spice_capabilities["verified"],
+                "请求了 --spice-client，但 QEMU 运行时缺少 SPICE 动态分辨率能力："
+                + "；".join(source_spice_capabilities["errors"]))
     _expect(python_runtime,
             "缺少 --python-runtime：app 必须内置 Python 运行时（python-build-standalone "
             "install_only_stripped 的 .tar.gz 或解包目录），不回退系统 Python。")
@@ -1474,7 +1542,17 @@ def build_app(
                 bundled_entitlements[name] = actual
 
         display_binary = None
+        bundled_spice_capabilities = None
         if spice_client is not None:
+            bundled_spice_capabilities = probe_qemu_spice_support(
+                runtime_bin / "qemu-system-aarch64"
+            )
+            _expect(bundled_spice_capabilities["verified"],
+                    "打包后的 QEMU 未能通过 SPICE 能力复核："
+                    + "；".join(bundled_spice_capabilities["errors"]))
+            bundled_spice_capabilities["qemu"] = (
+                f"{RUNTIME_REL}/bin/qemu-system-aarch64"
+            )
             display_binary = build_display_bundle(temp_app, version,
                                                    None if unsigned else sign_identity or "-",
                                                    source_entitlements.get(SPICE_CLIENT_NAME))
@@ -1596,6 +1674,7 @@ def build_app(
                 "spice_client": (DISPLAY_EXECUTABLE_REL
                                   if spice_client is not None else None),
                 "display_bundle": DISPLAY_BUNDLE_REL if spice_client is not None else None,
+                "spice_capabilities": bundled_spice_capabilities,
                 "share_files": copied_share,
                 "qemu_version": _qemu_version(qemu_root / "bin" / "qemu-system-aarch64"),
                 "source": qemu_source_description(qemu_root),
@@ -1864,6 +1943,19 @@ def verify_app(app_path: Path, *, check_signature: bool = True) -> dict[str, Any
                 "MANIFEST.runtime.spice_client 缺失或不可执行。")
         _expect(SPICE_CLIENT_NAME in runtime_binaries,
                 "MANIFEST.runtime.binaries 必须登记内置 spicy。")
+        spice_capabilities = probe_qemu_spice_support(
+            app_path / RUNTIME_REL / "bin" / "qemu-system-aarch64"
+        )
+        _expect(spice_capabilities["verified"],
+                "App 内含 SPICE 客户端，但随包 QEMU 缺少动态分辨率能力："
+                + "；".join(spice_capabilities["errors"]))
+        recorded_capabilities = runtime_section.get("spice_capabilities")
+        _expect(
+            isinstance(recorded_capabilities, dict)
+            and all(recorded_capabilities.get(key) is True for key in
+                    ("spice_display", "spicevmc", "virtserialport", "verified")),
+            "MANIFEST.runtime.spice_capabilities 未登记完整的 SPICE 验证结果。",
+        )
         if spice_client_rel == DISPLAY_EXECUTABLE_REL:
             _expect(runtime_section.get("display_bundle") == DISPLAY_BUNDLE_REL,
                     "显示应用包必须登记固定路径。")

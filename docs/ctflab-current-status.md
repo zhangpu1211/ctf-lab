@@ -3108,3 +3108,43 @@ r4/r5验收与清理核验：daemon inactive、r4目录/netns全清、ctflab-att
 **本轮验证**：最终全量`output/release-20261101/full-regression-release.log`为2364项、0失败、23项条件跳过（389.916秒）；前端81项、Windows构建准备器18项、桌面包专项20项通过。Windows CI报告`installed_payload_matches=true`、`visible_native_window_observed=true`、`gui_normal_exit=true`、`uninstall_program_removed=true`、`application_data_sentinels_preserved=true`。
 
 **实际限制**：Windows构建环境是Windows Server 2025 x64，不是Windows 11用户机；`windows_11_verified`、`whpx_or_vm_or_course_verified`、`manual_ui_verified`均为false，Mac ad-hoc且未公证、Windows Authenticode NotSigned。G0/G1、干净机升级回退、真实WHPX/来宾/课程及用户试点继续开放。本轮未启动或停止用户VM、未连接真实网络、未删除用户资产。可恢复入口：后续在获准Windows x64实机按`docs/ctflab-g0-acceptance-plan-2026-11-01.md`验收并补签。
+
+## 180. Mac SPICE 发布包修复：QEMU 后端硬门禁与 0.1.4 hotfix（2026-11-02）
+
+用户复现 v0.1.4 Mac 包启动 Kali 时报错：缺少 QEMU SPICE 显示后端与
+`spicevmc` chardev。现场核对确认，原发布包的 `CTFLab.app` 虽包含 `spicy` 及
+SPICE 客户端动态库，但随包 `qemu-system-aarch64 -machine none -display help`
+仅列出 `none/curses/cocoa/dbus`，且二进制未链接 `libspice-server`。这是 Mac
+发布运行时组合缺陷，不是镜像导入问题。
+
+**代码修复**：`tools/ctflab_app.py` 新增 `probe_qemu_spice_support()`。构建器在
+请求 `--spice-client` 时，必须先在源 QEMU 上确认 `spice`/`spice-app` 显示后端、
+`spicevmc` chardev 与 `virtserialport` 设备；复制和重签名后再对 App 内 QEMU
+复核一次。`app verify` 同样执行真实帮助命令，并核对
+`MANIFEST.runtime.spice_capabilities`。缺任一项时构建或校验直接失败，不再允许
+“有客户端、无服务端”的组合进入发布。
+
+**修复包**：
+`/Users/pufei/Downloads/ctf-lab/output/spice-hotfix-20261102/mac-final-r2/CTFLab.app`。
+构建使用 QEMU 11.1.0 SPICE 运行时、同包 `spicy`、Python 3.12.15 与 PyYAML 6.0.3；
+清单 1301 个文件、70 个动态库、50 个 QEMU 运行时资源。`app verify` 通过，许可证
+文本完整，ad-hoc 签名严格校验通过但未公证。
+
+**本轮实际验证**：
+
+- App 内 `qemu-system-aarch64 -machine none -display help`：`spice-app` 存在；
+- App 内 `-machine none -chardev help`：`spicevmc` 存在；
+- App 内 `-machine none -device help`：`virtserialport` 存在；
+- `otool -L`：QEMU 链接 `@loader_path/../lib/libspice-server.1.dylib`；
+- 使用真实 App 运行时执行 `LabManager.probe_spice()`：
+  `spice_display=true`、`spicevmc=true`、`virtserialport=true`、`client=true`、
+  `supported=true`；
+- 以旧无 SPICE v0.1.4 运行时作为输入执行新构建：按预期失败，错误为
+  “QEMU 运行时缺少 SPICE 动态分辨率能力”，且没有生成输出目录；
+- `python3 -m unittest tools.tests.test_ctflab_app -v`：70 项通过。
+
+**证据与边界**：日志位于 `output/spice-hotfix-20261102/build-r2.log`、
+`app-verify-r2.log`、`test-ctflab-app.log`、`negative-no-spice.log`。本轮验证了
+发布包内真实 QEMU/SPICE 后端与客户端闭包，未启动用户 VM。SPICE 动态分辨率的
+真实来宾窗口跟随仍以 2026-09-18 历史人工验收为证据，本 hotfix 不把协议能力探测
+冒充为新的来宾分辨率 E2E。正式 Mac 发布仍需用户在本机导入镜像后做一次启动确认。
