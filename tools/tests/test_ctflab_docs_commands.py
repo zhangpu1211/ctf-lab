@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""文档命令回归测试：文档里的 ctflab 命令必须能被当前 CLI 正确解析。
+"""README 命令回归测试：文档里的 ctflab 命令必须能被当前 CLI 正确解析。
 
 检查分两层：
 
@@ -30,7 +30,7 @@ import ctflab  # noqa: E402
 FENCED_BLOCK = re.compile(r"```[a-zA-Z0-9]*\n(.*?)```", re.S)
 INLINE_CODE = re.compile(r"`([^`\n]+)`")
 COMMAND = re.compile(r"(?:\./tools/)?ctflab\s+([a-z][a-z0-9-]*)((?:[^\n`#&|;]*))")
-DOC_PATHS = [PROJECT_ROOT / "README.md"] + sorted((PROJECT_ROOT / "docs").glob("*.md"))
+DOC_PATHS = [PROJECT_ROOT / "README.md"]
 
 # 文档示例中尚未 onboard 的候选 profile（inspect/onboard 之后才会存在）。
 # smoke-mini 是内容包验收记录/分发指南中随包分发的示例节点，由内容包导入建立。
@@ -170,7 +170,7 @@ class DocumentedCommandTests(unittest.TestCase):
                 for flag in re.findall(r"(?<![\w-])--?[A-Za-z][A-Za-z0-9-]*", tail):
                     if flag not in allowed:
                         problems.append(f"{path.name}: ctflab {name} 不支持 {flag}")
-        self.assertGreater(seen, 20, "文档中应能找到足够多的命令样例")
+        self.assertGreater(seen, 10, "README 中应能找到足够多的命令样例")
         self.assertEqual(problems, [])
 
     def test_fenced_commands_parse_with_positional_arguments(self) -> None:
@@ -201,7 +201,7 @@ class DocumentedCommandTests(unittest.TestCase):
                 found += extra_rules(name, rest)
                 for problem in found:
                     problems.append(f"{path.name}: ctflab {name}：{problem}")
-        self.assertGreater(seen, 15, "代码块中应能找到足够多的可执行命令样例")
+        self.assertGreater(seen, 6, "README 代码块中应能找到足够多的可执行命令样例")
         self.assertEqual(problems, [])
 
     def test_checker_rejects_known_bad_commands(self) -> None:
@@ -228,14 +228,6 @@ class DocumentedCommandTests(unittest.TestCase):
         problems = check_command(self.subcommands["stop"], ["--graceful", "--nonsense"],
                                  self.global_options)
         self.assertIn("不支持的选项 --nonsense", problems)
-
-    def test_ctflab_package_examples_do_not_replace_source_import(self) -> None:
-        """内容包已可校验，但在实施计划的原始镜像示例中不能被误写成 import 源文件。"""
-        plan = (PROJECT_ROOT / "docs" / "ctflab-mac-mvp-implementation-plan.md").read_text(encoding="utf-8")
-        self.assertNotIn("ctflab import smoke-1.0.0.ctflab", plan)
-        self.assertNotIn("ctflab import basic-pentesting-2-1.0.0.ctflab", plan)
-        self.assertIn("Task 6", plan)
-
 
 if __name__ == "__main__":
     unittest.main()

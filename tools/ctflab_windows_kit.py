@@ -14,7 +14,6 @@ FILES = (
     'tools/ctflab_scenario_v2.py', 'tools/ctflab_catalog.py', 'tools/ctflab_external_attach.py',
     'tools/tests/test_ctflab_windows_native.py', 'tools/tests/test_ctflab_windows_probe.py',
     'tools/tests/test_ctflab_scenario_v2.py', 'tools/tests/test_ctflab_catalog.py',
-    'docs/ctflab-windows-prototype-checklist-2026-10-21.md',
 )
 README = '''# Windows 基础验证包（非运行器发布包）
 

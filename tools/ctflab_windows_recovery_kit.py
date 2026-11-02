@@ -21,16 +21,24 @@ FILES = tuple(n for n in CONTROL_FILES if not n.startswith('docs/')) + (
     'tools/ctflab_windows_control_kit.py','tools/ctflab_generation_store.py','tools/ctflab_vmgenid.py',
     'tools/ctflab_local_service.py','tools/ctflab_contract.py','tools/ctflab_scenario_v2.py',
     'tools/tests/test_ctflab_windows_recovery.py',
-    'docs/ctflab-windows-test-steps-2026-10-24.md',
-    'docs/ctflab-windows-recovery-2026-10-23.md',
-    'docs/ctflab-production-driver-2026-10-24.md',
-    'docs/verification-production-driver-2026-10-24.md',
 )
+
+README = '''# Windows 恢复候选源码包
+
+本包用于 Windows 原生控制、QMP、显示恢复与故障路径的源码级验证，不包含运行时、
+镜像、证书、用户清单或安装器。需要 Python 3.10+，在获准的 Windows 测试环境中运行：
+
+```powershell
+python -B -m unittest discover -s tools/tests -v
+```
+
+通过本包测试不等于 G0/G1、WHPX、真实来宾、课程或正式安装包已经通过。
+'''
 
 def build(source,destination):
     source=Path(source);destination=Path(destination)
     data={n:(source/n).read_bytes() for n in FILES}
-    data['README.md']=data['docs/ctflab-windows-test-steps-2026-10-24.md']
+    data['README.md']=README.encode('utf-8')
     data['MANIFEST.json']=json.dumps({'schema':1,'kind':'windows-recovery-candidate',
         'g0_passed':False,'files':{n:hashlib.sha256(v).hexdigest() for n,v in sorted(data.items())}},sort_keys=True,indent=2).encode()
     with zipfile.ZipFile(destination,'x',compression=zipfile.ZIP_DEFLATED) as archive:

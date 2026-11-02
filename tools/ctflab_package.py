@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """CTFLab Task 6.1：可分发安装包（release bundle）与 `.ctflab` 内容包。
 
-设计见 `docs/ctflab-task6-packaging-design.md`。核心约束：
+发行包只携带根目录 `README.md` 和 `PACKAGING.md` 作为项目说明与安全门禁。核心约束：
 
 - 白名单构建：只收集明确列出的源码/配置/文档路径；任何磁盘、凭据、日志、缓存一律排除，
   显式命中时直接拒绝构建；
@@ -169,10 +169,7 @@ RELEASE_TOOL_FILES += (
 RELEASE_DOC_FILES = (
     "LICENSE",
     "README.md",
-    "docs/ctflab-phase1-quickstart.md",
-    "docs/ctflab-mac-mvp-implementation-plan.md",
-    "docs/ctflab-dynamic-resolution-design.md",
-    "docs/ctflab-task6-packaging-design.md",
+    "PACKAGING.md",
 )
 
 # 硬性排除：即使被显式列入白名单也不允许打包（防呆）。

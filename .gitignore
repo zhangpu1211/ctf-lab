@@ -3,6 +3,7 @@
 !/.gitignore
 !/AGENTS.md
 !/README.md
+!/PACKAGING.md
 !/LICENSE
 !/docs/
 !/tools/
@@ -23,6 +24,7 @@
 !/docs/ctflab-documentation-review-2026-10-11.md
 !/docs/verification-import-review-2026-10-11.md
 !/docs/ctflab-mac-mvp-implementation-plan.md
+!/docs/ctflab-mac-packaging-runbook.md
 !/docs/ctflab-wintermute-scenario-design.md
 !/docs/ctflab-ux-2026-10-08.md
 !/docs/ctflab-phase1-quickstart.md
@@ -560,3 +562,8 @@ probes/
 !/docs/verification-independent-review-r2-2026-10-31.md
 
 !/docs/ctflab-a03-t02-w05-u04-20261031.md
+
+!/tools/tests/test_ctflab_readme.py
+
+# docs/ 已移除，不再纳入版本库或发布包。
+/docs/

@@ -107,16 +107,12 @@ FILES=tuple(sorted(set(RECOVERY_FILES)|set(OFFLINE_FILES)|set(MAC_TOOL_FILES)|{
 }))
 
 
-def build(source,destination,*,guide='docs/ctflab-integrated-candidate-2026-10-25.md'):
-    if guide not in ('docs/ctflab-integrated-candidate-2026-10-25.md','docs/ctflab-managed-guest-2026-10-25.md',
-                     'docs/ctflab-maintenance-remote-evidence-2026-10-25.md','docs/ctflab-remote-assets-2026-10-25.md',
-                     'docs/ctflab-oci-routing-2026-10-25.md','docs/ctflab-remote-leases-2026-10-25.md',
-                     'docs/ctflab-remote-audit-2026-10-25.md','docs/ctflab-worker-audit-2026-10-25.md',
-                     'docs/ctflab-audit-review-2026-10-25.md','docs/ctflab-desktop-remote-2026-10-25.md',
-                     'docs/ctflab-desktop-leases-2026-10-25.md','docs/ctflab-version-launcher-2026-10-26.md','docs/ctflab-remaining-development-2026-10-26.md','docs/ctflab-storage-boundary-2026-10-26.md','docs/ctflab-mac-parity-2026-10-26.md','docs/ctflab-mac-remote-2026-10-26.md'):
-        raise ValueError('交付说明不在白名单')
-    data={n:(Path(source)/n).read_bytes() for n in FILES}
-    data['README.md']=data[guide]
+def build(source,destination,*,guide='README.md'):
+    if guide != 'README.md':
+        raise ValueError('交付说明只允许使用根目录 README.md')
+    source=Path(source)
+    data={n:(source/n).read_bytes() for n in FILES if not n.startswith('docs/')}
+    data['README.md']=(source/'README.md').read_bytes()
     data['MANIFEST.json']=json.dumps({'schema':1,'kind':'integrated-source-candidate',
         'g0_passed':False,'g1_passed':False,'installer_included':False,'readme_source':guide,
         'files':{n:hashlib.sha256(v).hexdigest() for n,v in sorted(data.items())}},sort_keys=True,indent=2).encode()
@@ -129,10 +125,4 @@ def build(source,destination,*,guide='docs/ctflab-integrated-candidate-2026-10-2
 
 if __name__=='__main__':
     parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('destination',type=Path)
-    parser.add_argument('--guide',choices=('docs/ctflab-integrated-candidate-2026-10-25.md','docs/ctflab-managed-guest-2026-10-25.md',
-                                        'docs/ctflab-maintenance-remote-evidence-2026-10-25.md','docs/ctflab-remote-assets-2026-10-25.md',
-                                        'docs/ctflab-oci-routing-2026-10-25.md','docs/ctflab-remote-leases-2026-10-25.md',
-                     'docs/ctflab-remote-audit-2026-10-25.md','docs/ctflab-worker-audit-2026-10-25.md',
-                     'docs/ctflab-audit-review-2026-10-25.md','docs/ctflab-desktop-remote-2026-10-25.md',
-                     'docs/ctflab-desktop-leases-2026-10-25.md','docs/ctflab-version-launcher-2026-10-26.md','docs/ctflab-remaining-development-2026-10-26.md','docs/ctflab-storage-boundary-2026-10-26.md','docs/ctflab-mac-parity-2026-10-26.md','docs/ctflab-mac-remote-2026-10-26.md'),default='docs/ctflab-integrated-candidate-2026-10-25.md')
-    args=parser.parse_args();print(build(Path(__file__).resolve().parents[1],args.destination,guide=args.guide))
+    args=parser.parse_args();print(build(Path(__file__).resolve().parents[1],args.destination))

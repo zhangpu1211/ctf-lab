@@ -429,36 +429,17 @@ class GuiAppBuildTests(unittest.TestCase):
 
 
 class GuiDocsGuardTests(unittest.TestCase):
-    """图形入口文档：必须写明学生可双击完成导入启动、CLI 仍保留、以及未验证项。"""
+    """README 必须同时说明图形入口、平台范围和保留的 CLI 入口。"""
 
-    RECORD = PROJECT_ROOT / "docs" / "verification-gui-2026-09-16.md"
-    TUTORIAL = PROJECT_ROOT / "docs" / "ctflab-student-distribution-tutorial.md"
     README = PROJECT_ROOT / "README.md"
-
-    def test_record_distinguishes_clicked_and_unit_only(self) -> None:
-        text = self.RECORD.read_text(encoding="utf-8")
-        self.assertIn("实际点击验证", text)
-        self.assertIn("仅单元测试覆盖", text)
-        self.assertIn("未验证", text)
-        self.assertIn("开发者 ID", text.replace("Developer ID", "开发者 ID"))
-        self.assertIn("公证", text)
-        self.assertIn("签名/公证流水线", text)
-
-    def test_tutorial_leads_with_gui_and_keeps_cli(self) -> None:
-        text = self.TUTORIAL.read_text(encoding="utf-8")
-        gui_section = text.index("## 2. 推荐图形流程")
-        cli_section = text.index("## 4. CLI 排障")
-        self.assertLess(gui_section, cli_section, "图形流程必须排在命令行之前")
-        for needle in ("打开 CTFLab.app", "校验后导入缺失节点", "启动所选节点", "健康检查", "重置",
-                       "未知镜像向导", "只读识别", "矩阵结果"):
-            self.assertIn(needle, text)
-        self.assertIn("Contents/Resources/bin/ctflab-cli", text)
 
     def test_readme_mentions_gui_entry_and_cli_kept(self) -> None:
         text = self.README.read_text(encoding="utf-8")
-        self.assertIn("## 图形入口", text)
+        self.assertIn("Mac SwiftUI", text)
+        self.assertIn("Windows Tauri/React", text)
+        self.assertIn("## 快速开始", text)
         self.assertIn("CTFLab.app/Contents/Resources/bin/ctflab-cli", text)
-        self.assertIn("默认联网", text)
+        self.assertIn("Kali 默认通过 user-mode NAT 联网", text)
 
 
 if __name__ == "__main__":
