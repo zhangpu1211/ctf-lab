@@ -3166,3 +3166,34 @@ App 再次通过 `app verify`、`codesign --verify --deep --strict` 及三项 SP
 能力探测。Windows 安装器本轮没有代码变化，继续使用
 `v0.1.4-preview.20261101` 发布中的
 `CTFLab_0.1.4_x64-setup.exe`。
+
+## 181. Kali 无图形窗口：受控 SPICE 客户端误装修复（2026-11-02）
+
+用户打开自带 Kali 后仍无图形窗口。现场确认 QEMU/SPICE 服务端正常，显示客户端
+日志为 `option parsing failed: Unknown option --clipboard`。上一个 hotfix 包内
+`spicy` 实际是 Homebrew 通用 `spice-gtk` 客户端，不能接收 CTFLab 的剪贴板、
+QEMU PID、窗口状态与显示质量参数，因此在参数解析阶段退出。不是 Kali 镜像、
+XFCE 或 Xrandr 故障。
+
+**修复**：受控客户端源码新增 `--ctflab-capabilities` 只读探针；
+`tools/ctflab_app.py` 在构建源、重签名后的 `runtime/bin/spicy` 和
+`CTFLabDisplay.app` 副本三处强制验证 `ctflab-spicy` 身份及参数清单，并把结果写入
+`MANIFEST.runtime.spice_client_capabilities`。`app verify` 对两个实际副本重新
+探测。通用 Homebrew `spicy` 现在会在输出目录生成前直接失败。
+
+**当前现场与验证**：使用受控客户端连接用户仍在运行的既有 SPICE socket 后，
+日志到达 `display-ready=1`、`guest-monitors=1512x917`；本轮没有重启、停止或重置
+虚拟机。随后虚拟机由外部操作停止，状态文件和 QEMU 进程消失，残留手工显示客户端
+已单独回收。新 App 为
+`/Users/pufei/Downloads/ctf-lab/output/spice-display-client-hotfix-20261102/mac-final-r2/CTFLab.app`，
+ZIP 为
+`CTFLab-0.1.4-preview.20261102-macos-arm64-spice-client-hotfix.zip`，62,368,041
+字节，SHA-256 `67ff67e66742f8d2f483dc8382801f652df5f8e3d58692d482b882e875c862ac`。
+`app verify`、双客户端能力探针、严格代码签名校验、ZIP 解压回测均通过；App、
+客户端输入和 UX 共 123 项测试通过。新发布包中的最终客户端没有在虚拟机停止后再次
+连接新来宾，不能把能力/回读验证冒充新的完整动态分辨率 E2E。
+
+详见[验证记录](verification-mac-spice-client-hotfix-2026-11-02.md)。发布页：
+<https://github.com/zhangpu1211/ctf-lab/releases/tag/v0.1.4-preview.20261102-spice-client-hotfix>。
+Windows 安装器本轮没有代码变化。当前未发现 Kali/Target QEMU 运行；用户从新包重新
+启动 Kali 是下一步真实窗口确认入口。

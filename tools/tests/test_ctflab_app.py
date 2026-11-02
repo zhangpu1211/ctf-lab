@@ -73,6 +73,28 @@ int main(int argc, char **argv) {
 BUNDLE_C = "int stub_bundle(void) { return 7; }\n"
 LIB_C = "int stub_answer(void) { return 42; }\n"
 LIB2_C = "int stub_answer(void); int layer2(void) { return stub_answer() + 1; }\n"
+SPICE_CLIENT_C = """#include <stdio.h>
+#include <string.h>
+int main(int argc, char **argv) {
+  if (argc == 2 && strcmp(argv[1], "--ctflab-capabilities") == 0) {
+    puts("{\\"schema\\":1,\\"client\\":\\"ctflab-spicy\\","
+         "\\"state_protocol\\":\\"CTFLAB_SPICE_STATE\\","
+         "\\"capabilities\\":[\\"clipboard\\",\\"display-quality\\","
+         "\\"file-transfer\\",\\"fullscreen\\",\\"geometry\\","
+         "\\"password-file\\",\\"qemu-pid\\",\\"state-file\\",\\"uri\\"]}");
+    return 0;
+  }
+  return 2;
+}
+"""
+GENERIC_SPICE_CLIENT_C = """#include <stdio.h>
+int main(int argc, char **argv) {
+  (void)argc;
+  (void)argv;
+  fputs("option parsing failed: Unknown option --ctflab-capabilities\\n", stderr);
+  return 1;
+}
+"""
 
 
 class FakePythonRuntime:
@@ -235,11 +257,35 @@ class AppTestCase(unittest.TestCase):
         cls.fake_pyyaml = make_fake_pyyaml(base / "pyyaml-6.0.3-cp312-cp312-macosx_11_0_arm64.whl")
         # 预编译的 GUI 入口替身：避免每个用例都调用 swiftc（真实编译路径由专门的用例覆盖）。
         cls.fake_gui = base / "CTFLabGUI-stub"
+        cls.fake_spice_client = base / "ctflab-spicy-stub"
+        cls.fake_generic_spicy = base / "generic-spicy-stub"
         with tempfile.TemporaryDirectory() as temp:
             stub_c = pathlib.Path(temp) / "gui.c"
+            spice_client_c = pathlib.Path(temp) / "spice_client.c"
+            generic_spice_client_c = pathlib.Path(temp) / "generic_spicy.c"
             stub_c.write_text("int main(void) { return 0; }\n", encoding="utf-8")
+            spice_client_c.write_text(SPICE_CLIENT_C, encoding="utf-8")
+            generic_spice_client_c.write_text(
+                GENERIC_SPICE_CLIENT_C, encoding="utf-8"
+            )
             result = subprocess.run([CLANG, "-mmacosx-version-min=26.0", "-o", str(cls.fake_gui), str(stub_c)],
                                     capture_output=True, text=True)
+            if result.returncode != 0:
+                raise RuntimeError(result.stderr)
+            result = subprocess.run(
+                [CLANG, "-mmacosx-version-min=26.0", "-o",
+                 str(cls.fake_generic_spicy), str(generic_spice_client_c)],
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode != 0:
+                raise RuntimeError(result.stderr)
+            result = subprocess.run(
+                [CLANG, "-mmacosx-version-min=26.0", "-o",
+                 str(cls.fake_spice_client), str(spice_client_c)],
+                capture_output=True,
+                text=True,
+            )
             if result.returncode != 0:
                 raise RuntimeError(result.stderr)
 
@@ -277,7 +323,7 @@ class AppTestCase(unittest.TestCase):
 
 class StructureTests(AppTestCase):
     def test_native_display_bundle_and_runtime_references(self) -> None:
-        result = self.build(spice_client=self.fake_runtime / "bin" / "qemu-img")
+        result = self.build(spice_client=self.fake_spice_client)
         app = pathlib.Path(result["app"])
         binary = app / ctflab_app.DISPLAY_EXECUTABLE_REL
         self.assertTrue(binary.is_file())
@@ -293,6 +339,15 @@ class StructureTests(AppTestCase):
         self.assertEqual(
             capabilities["qemu"],
             f"{ctflab_app.RUNTIME_REL}/bin/qemu-system-aarch64",
+        )
+        client_capabilities = result["manifest"]["runtime"][
+            "spice_client_capabilities"
+        ]
+        self.assertTrue(client_capabilities["verified"])
+        self.assertEqual(client_capabilities["client"], "ctflab-spicy")
+        self.assertEqual(
+            set(client_capabilities["capabilities"]),
+            set(ctflab_app.SPICE_CLIENT_CAPABILITIES),
         )
         self.assertEqual(ctflab_app.verify_runtime_references(app), [])
         component = next(item for item in result["sbom"]["components"] if item.get("name") == "spicy")
@@ -312,7 +367,7 @@ class StructureTests(AppTestCase):
             ctflab_app, "probe_qemu_spice_support", return_value=capabilities
         ):
             with self.assertRaises(ctflab_app.AppBuildError) as raised:
-                self.build(spice_client=self.fake_runtime / "bin" / "qemu-img")
+                self.build(spice_client=self.fake_spice_client)
         self.assertIn("--spice-client", str(raised.exception))
         self.assertIn("QEMU spice 显示后端不可用", str(raised.exception))
         self.assertFalse((self.out / "CTFLab.app").exists())
@@ -324,8 +379,22 @@ class StructureTests(AppTestCase):
         self.assertTrue(capabilities["verified"], capabilities)
         self.assertEqual(capabilities["errors"], [])
 
+    def test_spice_client_refuses_generic_spicy(self) -> None:
+        with self.assertRaises(ctflab_app.AppBuildError) as raised:
+            self.build(spice_client=self.fake_generic_spicy)
+        self.assertIn("不是 CTFLab 受控显示客户端", str(raised.exception))
+        self.assertIn("--ctflab-capabilities", str(raised.exception))
+        self.assertFalse((self.out / "CTFLab.app").exists())
+
+    def test_spice_client_capability_probe_accepts_controlled_client(self) -> None:
+        capabilities = ctflab_app.probe_spice_client_support(
+            self.fake_spice_client
+        )
+        self.assertTrue(capabilities["verified"], capabilities)
+        self.assertEqual(capabilities["errors"], [])
+
     def test_native_display_bundle_signature(self) -> None:
-        result = self.build(spice_client=self.fake_runtime / "bin" / "qemu-img", unsigned=False)
+        result = self.build(spice_client=self.fake_spice_client, unsigned=False)
         app = pathlib.Path(result["app"])
         self.assertEqual(ctflab_app.codesign_verify(app / ctflab_app.DISPLAY_BUNDLE_REL)["verify_returncode"], 0)
         ctflab_app.verify_app(app)

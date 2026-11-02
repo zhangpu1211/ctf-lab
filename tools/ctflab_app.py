@@ -115,6 +115,18 @@ SPICE_CLIENT_NAME = "spicy"
 DISPLAY_BUNDLE_REL = f"{RUNTIME_REL}/CTFLabDisplay.app"
 DISPLAY_EXECUTABLE_REL = f"{DISPLAY_BUNDLE_REL}/Contents/MacOS/{SPICE_CLIENT_NAME}"
 DISPLAY_BUNDLE_IDENTIFIER = "local.ctflab.display"
+SPICE_CLIENT_CAPABILITIES = (
+    "clipboard",
+    "display-quality",
+    "file-transfer",
+    "fullscreen",
+    "geometry",
+    "password-file",
+    "qemu-pid",
+    "state-file",
+    "uri",
+)
+SPICE_CLIENT_STATE_PROTOCOL = "CTFLAB_SPICE_STATE"
 # 只随包实际需要的固件/ROM/keymaps（aarch64 virt UEFI + x86_64 pc BIOS/UEFI 与三种网卡）。
 QEMU_SHARE_FILES = (
     "edk2-aarch64-code.fd",   # aarch64 virt 的 UEFI 固件代码
@@ -423,6 +435,78 @@ def probe_qemu_spice_support(qemu: Path) -> dict[str, Any]:
         result["errors"].append("QEMU spicevmc chardev 不可用")
     if not result["virtserialport"]:
         result["errors"].append("QEMU virtserialport 设备不可用")
+    return result
+
+
+def probe_spice_client_support(client: Path) -> dict[str, Any]:
+    """验证客户端是 CTFLab 受控版本，而不是只能显示画面的通用 spicy。
+
+    Homebrew 的通用 ``spicy`` 接受 ``--uri``，但遇到运行器必传的
+    ``--clipboard``、``--qemu-pid`` 或窗口状态参数时会立即退出，造成 SPICE
+    服务端已启动却没有图形窗口。客户端必须自行声明稳定的能力清单；构建源二
+    进制、重签名后的运行时副本和显示应用副本都要通过此探针。
+    """
+    client = Path(client)
+    result: dict[str, Any] = {
+        "schema": None,
+        "client": None,
+        "state_protocol": None,
+        "capabilities": [],
+        "verified": False,
+        "errors": [],
+    }
+    try:
+        completed = subprocess.run(
+            [str(client), "--ctflab-capabilities"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        result["errors"].append(f"无法执行 SPICE 客户端能力探针：{exc}")
+        return result
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout).strip()
+        result["errors"].append(
+            "SPICE 客户端不支持 --ctflab-capabilities"
+            + (f"：{detail}" if detail else "")
+        )
+        return result
+    try:
+        payload = json.loads(completed.stdout.strip())
+    except (TypeError, ValueError):
+        result["errors"].append("SPICE 客户端能力响应不是有效 JSON。")
+        return result
+    if not isinstance(payload, dict):
+        result["errors"].append("SPICE 客户端能力响应必须是 JSON 对象。")
+        return result
+    for key in ("schema", "client", "state_protocol", "capabilities"):
+        if key in payload:
+            result[key] = payload[key]
+    if payload.get("schema") != 1:
+        result["errors"].append("SPICE 客户端能力 schema 必须为 1。")
+    if payload.get("client") != "ctflab-spicy":
+        result["errors"].append("SPICE 客户端身份不是 ctflab-spicy。")
+    if payload.get("state_protocol") != SPICE_CLIENT_STATE_PROTOCOL:
+        result["errors"].append(
+            f"SPICE 客户端状态协议必须为 {SPICE_CLIENT_STATE_PROTOCOL}。"
+        )
+    capabilities = payload.get("capabilities")
+    if not isinstance(capabilities, list) or not all(
+            isinstance(item, str) for item in capabilities):
+        result["errors"].append("SPICE 客户端 capabilities 必须是字符串数组。")
+    else:
+        missing = sorted(set(SPICE_CLIENT_CAPABILITIES) - set(capabilities))
+        unexpected = sorted(set(capabilities) - set(SPICE_CLIENT_CAPABILITIES))
+        if missing:
+            result["errors"].append(
+                "SPICE 客户端缺少受控参数：" + ", ".join(missing)
+            )
+        if unexpected:
+            result["errors"].append(
+                "SPICE 客户端声明了未知能力：" + ", ".join(unexpected)
+            )
+    result["verified"] = not result["errors"]
     return result
 
 
@@ -1280,7 +1364,8 @@ def build_sbom(*, version: str, generated_at: str, qemu_root: Path, libs: dict[s
             "version": _formula_version(client_formula),
             "license": KNOWN_LICENSES["spice-gtk"],
             "bundled": True,
-            "source": f"Homebrew formula {client_formula}",
+            "source": "CTFLab controlled display client built from "
+                      "tools/spice_client/ctflab_spicy.c",
             "binaries": [{
                 "file": f"{RUNTIME_REL}/bin/{SPICE_CLIENT_NAME}",
                 "version": _formula_version(client_formula),
@@ -1410,6 +1495,14 @@ def build_app(
         spice_client = Path(spice_client).expanduser().resolve()
         _expect(spice_client.is_file() and os.access(spice_client, os.X_OK),
                 f"SPICE 客户端不存在或不可执行：{spice_client}")
+        source_client_capabilities = probe_spice_client_support(spice_client)
+        _expect(
+            source_client_capabilities["verified"],
+            "请求了 --spice-client，但客户端不是 CTFLab 受控显示客户端："
+            + "；".join(source_client_capabilities["errors"]).rstrip("。")
+            + "。Homebrew 通用 spicy 不能接收 CTFLab 的剪贴板、窗口状态和 QEMU "
+            "绑定参数，必须使用 tools/spice_client/ctflab_spicy.c 编译的客户端。",
+        )
     source_qemu = Path(qemu_root) / "bin" / "qemu-system-aarch64"
     _expect(source_qemu.is_file() and os.access(source_qemu, os.X_OK),
             f"缺少可执行的 QEMU 系统程序：{source_qemu}")
@@ -1543,6 +1636,7 @@ def build_app(
 
         display_binary = None
         bundled_spice_capabilities = None
+        bundled_spice_client_capabilities = None
         if spice_client is not None:
             bundled_spice_capabilities = probe_qemu_spice_support(
                 runtime_bin / "qemu-system-aarch64"
@@ -1553,9 +1647,28 @@ def build_app(
             bundled_spice_capabilities["qemu"] = (
                 f"{RUNTIME_REL}/bin/qemu-system-aarch64"
             )
+            runtime_client_capabilities = probe_spice_client_support(
+                runtime_bin / SPICE_CLIENT_NAME
+            )
+            _expect(
+                runtime_client_capabilities["verified"],
+                "重签名后的随包 SPICE 客户端未通过受控能力复核："
+                + "；".join(runtime_client_capabilities["errors"]),
+            )
             display_binary = build_display_bundle(temp_app, version,
                                                    None if unsigned else sign_identity or "-",
                                                    source_entitlements.get(SPICE_CLIENT_NAME))
+            display_client_capabilities = probe_spice_client_support(display_binary)
+            _expect(
+                display_client_capabilities["verified"],
+                "显示应用包中的 SPICE 客户端未通过受控能力复核："
+                + "；".join(display_client_capabilities["errors"]),
+            )
+            _expect(
+                runtime_client_capabilities == display_client_capabilities,
+                "运行时目录与显示应用中的 SPICE 客户端能力声明不一致。",
+            )
+            bundled_spice_client_capabilities = display_client_capabilities
 
         # 6) 许可证文本与合规文件（licenses/ 已在 4.5 创建：PyYAML 许可证已就位）
         import ctflab_package  # noqa: PLC0415  函数内导入，避免循环依赖
@@ -1675,6 +1788,7 @@ def build_app(
                                   if spice_client is not None else None),
                 "display_bundle": DISPLAY_BUNDLE_REL if spice_client is not None else None,
                 "spice_capabilities": bundled_spice_capabilities,
+                "spice_client_capabilities": bundled_spice_client_capabilities,
                 "share_files": copied_share,
                 "qemu_version": _qemu_version(qemu_root / "bin" / "qemu-system-aarch64"),
                 "source": qemu_source_description(qemu_root),
@@ -1949,6 +2063,27 @@ def verify_app(app_path: Path, *, check_signature: bool = True) -> dict[str, Any
         _expect(spice_capabilities["verified"],
                 "App 内含 SPICE 客户端，但随包 QEMU 缺少动态分辨率能力："
                 + "；".join(spice_capabilities["errors"]))
+        runtime_client_path = app_path / RUNTIME_REL / "bin" / SPICE_CLIENT_NAME
+        runtime_client_capabilities = probe_spice_client_support(runtime_client_path)
+        _expect(
+            runtime_client_capabilities["verified"],
+            "App 运行时目录中的 SPICE 客户端不是 CTFLab 受控客户端："
+            + "；".join(runtime_client_capabilities["errors"]),
+        )
+        display_client_capabilities = probe_spice_client_support(spice_client_path)
+        _expect(
+            display_client_capabilities["verified"],
+            "App 显示应用中的 SPICE 客户端不是 CTFLab 受控客户端："
+            + "；".join(display_client_capabilities["errors"]),
+        )
+        recorded_client_capabilities = runtime_section.get(
+            "spice_client_capabilities"
+        )
+        _expect(
+            recorded_client_capabilities == runtime_client_capabilities
+            and recorded_client_capabilities == display_client_capabilities,
+            "MANIFEST.runtime.spice_client_capabilities 缺失或与实际客户端能力不一致。",
+        )
         recorded_capabilities = runtime_section.get("spice_capabilities")
         _expect(
             isinstance(recorded_capabilities, dict)

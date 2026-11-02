@@ -898,6 +898,16 @@ static gboolean file_transfer_argument(int argc, char **argv)
     return FALSE;
 }
 
+static gboolean capabilities_argument(int argc, char **argv)
+{
+    for (int index = 1; index < argc; index++) {
+        if (strcmp(argv[index], "--ctflab-capabilities") == 0) {
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
 static const char *password_file_argument(int argc, char **argv)
 {
     for (int index = 1; index < argc - 1; index++) {
@@ -2664,6 +2674,14 @@ static void client_activate(GtkApplication *app, gpointer user_data)
 
 int main(int argc, char **argv)
 {
+    if (capabilities_argument(argc, argv)) {
+        puts("{\"schema\":1,\"client\":\"ctflab-spicy\","
+             "\"state_protocol\":\"CTFLAB_SPICE_STATE\","
+             "\"capabilities\":[\"clipboard\",\"display-quality\","
+             "\"file-transfer\",\"fullscreen\",\"geometry\","
+             "\"password-file\",\"qemu-pid\",\"state-file\",\"uri\"]}");
+        return 0;
+    }
     const char *uri = uri_argument(argc, argv);
     gboolean allow_clipboard = clipboard_argument(argc, argv);
     gboolean allow_file_transfer = file_transfer_argument(argc, argv);
